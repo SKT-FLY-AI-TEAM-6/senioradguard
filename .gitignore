@@ -16,3 +16,7 @@ local.properties
 build/
 .kotlin/
 .claude/
+
+# 실기기 검증 중 생기는 임시 산출물 (스크린샷, uiautomator 덤프)
+/*.png
+/*.xml

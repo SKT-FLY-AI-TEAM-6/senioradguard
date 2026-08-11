@@ -2,6 +2,8 @@ package com.senioradguard
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -30,6 +32,7 @@ import androidx.compose.ui.unit.sp
 import com.senioradguard.detector.BlacklistUpdateWorker
 import com.senioradguard.notification.KakaoNotifier
 import com.senioradguard.ui.BatteryOptimizationGuide
+import com.senioradguard.ui.ServiceStatus
 import com.senioradguard.ui.SetupActivity
 import com.senioradguard.ui.theme.SeniorAdGuardTheme
 
@@ -37,6 +40,11 @@ class MainActivity : ComponentActivity() {
 
     /** 배터리 예외 상태. 설정 화면에서 허용하고 돌아오면 onResume이 갱신한다. */
     private var batteryExempt by mutableStateOf(true)
+
+    /** 접근성 서비스 상태. 설정 화면에서 켜고 돌아와도 onResume이 갱신한다. */
+    private var serviceState by mutableStateOf(ServiceStatus.State.RUNNING)
+
+    private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,6 +60,7 @@ class MainActivity : ComponentActivity() {
             SeniorAdGuardTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     HomeScreen(
+                        serviceState = serviceState,
                         batteryExempt = batteryExempt,
                         modifier = Modifier.padding(innerPadding)
                     )
@@ -63,11 +72,35 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         batteryExempt = BatteryOptimizationGuide.isExempt(this)
+        refreshServiceState()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        handler.removeCallbacksAndMessages(null)
+    }
+
+    /**
+     * 앱을 막 켠 직후에는 접근성 서비스가 아직 붙는 중일 수 있다. 그 짧은 순간을
+     * "죽었다"고 잘못 알리지 않도록, 죽은 것으로 보이면 잠시 뒤 다시 확인한다.
+     */
+    private fun refreshServiceState() {
+        handler.removeCallbacksAndMessages(null)
+        serviceState = ServiceStatus.current(this)
+        if (serviceState != ServiceStatus.State.ENABLED_BUT_DEAD) return
+
+        listOf(1_500L, 3_000L).forEach { delay ->
+            handler.postDelayed({ serviceState = ServiceStatus.current(this) }, delay)
+        }
     }
 }
 
 @Composable
-private fun HomeScreen(batteryExempt: Boolean, modifier: Modifier = Modifier) {
+private fun HomeScreen(
+    serviceState: ServiceStatus.State,
+    batteryExempt: Boolean,
+    modifier: Modifier = Modifier
+) {
     val context = LocalContext.current
 
     Column(
@@ -82,27 +115,54 @@ private fun HomeScreen(batteryExempt: Boolean, modifier: Modifier = Modifier) {
             fontWeight = FontWeight.Bold
         )
 
-        if (batteryExempt) {
-            Text(
-                text = "광고를 지켜보고 있어요.",
-                fontSize = 20.sp
+        // 서비스가 꺼져 있으면 배터리 안내보다 이게 먼저다 — 아예 감시가 없는 상태다.
+        when (serviceState) {
+            ServiceStatus.State.DISABLED -> WarningCard(
+                title = "⚠️ 광고 감시가 꺼져 있어요",
+                body = "지금은 광고가 나와도 알려드리지 못합니다.\n\n" +
+                    "아래 버튼을 누른 뒤 목록에서 '광고 지킴이'를 찾아 켜주세요.",
+                buttonText = "광고 감시 켜기",
+                onClick = { ServiceStatus.openAccessibilitySettings(context) }
             )
-        } else {
-            BatteryWarningCard(
-                onFixClick = { BatteryOptimizationGuide.requestExemption(context) }
+
+            ServiceStatus.State.ENABLED_BUT_DEAD -> WarningCard(
+                title = "⚠️ 광고 감시가 멈췄어요",
+                body = "켜져 있다고 되어 있지만 실제로는 동작하지 않고 있습니다.\n\n" +
+                    "아래 버튼을 누른 뒤 '광고 지킴이'를 껐다가 다시 켜주세요.",
+                buttonText = "광고 감시 다시 켜기",
+                onClick = { ServiceStatus.openAccessibilitySettings(context) }
             )
+
+            ServiceStatus.State.RUNNING ->
+                if (batteryExempt) {
+                    Text(text = "광고를 지켜보고 있어요.", fontSize = 20.sp)
+                } else {
+                    WarningCard(
+                        title = "⚠️ 광고 감시가 멈출 수 있어요",
+                        body = "휴대폰이 배터리를 아끼려고 이 앱을 잠재웁니다.\n" +
+                            "그러면 광고가 나와도 알려드리지 못합니다.\n\n" +
+                            "아래 버튼을 누르고 '허용'을 선택해주세요.",
+                        buttonText = "배터리 설정 허용하기",
+                        onClick = { BatteryOptimizationGuide.requestExemption(context) }
+                    )
+                }
         }
     }
 }
 
 /**
- * 배터리 최적화 예외가 없을 때만 표시하는 경고.
+ * 보호가 끊긴 상태를 알리는 경고 카드.
  *
- * 노인 사용자 기준: 큰 글씨, 버튼 하나, 빨간 경고색. 기술 용어 대신
- * "잠재웁니다 / 못 잡습니다"처럼 결과로 설명한다.
+ * 노인 사용자 기준: 큰 글씨, 버튼 하나, 빨간 경고색. 기술 용어("접근성 서비스",
+ * "배터리 최적화") 대신 "못 알려드립니다"처럼 결과로 설명한다.
  */
 @Composable
-private fun BatteryWarningCard(onFixClick: () -> Unit) {
+private fun WarningCard(
+    title: String,
+    body: String,
+    buttonText: String,
+    onClick: () -> Unit
+) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE))
@@ -114,27 +174,25 @@ private fun BatteryWarningCard(onFixClick: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Text(
-                text = "⚠️ 광고 감시가 멈출 수 있어요",
+                text = title,
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color(0xFFC62828)
             )
             Text(
-                text = "휴대폰이 배터리를 아끼려고 이 앱을 잠재웁니다.\n" +
-                    "그러면 광고가 나와도 알려드리지 못합니다.\n\n" +
-                    "아래 버튼을 누르고 '허용'을 선택해주세요.",
+                text = body,
                 fontSize = 19.sp,
                 color = Color(0xFF3E2723)
             )
             Button(
-                onClick = onFixClick,
+                onClick = onClick,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(68.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
             ) {
                 Text(
-                    text = "배터리 설정 허용하기",
+                    text = buttonText,
                     fontSize = 22.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.White

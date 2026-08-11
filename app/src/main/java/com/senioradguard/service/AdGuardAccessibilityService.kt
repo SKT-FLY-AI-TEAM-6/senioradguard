@@ -102,6 +102,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
     }
 
     override fun onServiceConnected() {
+        isConnected = true
         serviceInfo = AccessibilityServiceInfo().apply {
             // 전체 이벤트를 받으면 모든 앱의 모든 UI 변화가 IPC로 배달된다.
             // 실제로 쓰는 세 종류만 남긴다 (VIEW_CLICKED는 Layer 3용).
@@ -172,10 +173,25 @@ class AdGuardAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        isConnected = false
         handler.removeCallbacks(recheck)
         scope.cancel()
         borderOverlay.dismissAll()
         overlayManager.dismiss()
         super.onDestroy()
+    }
+
+    companion object {
+        /**
+         * 서비스가 지금 시스템에 연결돼 있는지. 설정 화면의 "켜짐" 표시와 별개다 —
+         * 설정에는 켜짐으로 남은 채 서비스만 죽는 경우를 구분하려고 둔다
+         * (ServiceStatus 참고).
+         *
+         * 프로세스가 통째로 죽으면 이 값도 함께 사라지고 false로 시작한다.
+         * MainActivity가 같은 프로세스라 그 상태를 그대로 읽는다.
+         */
+        @Volatile
+        var isConnected: Boolean = false
+            private set
     }
 }

@@ -52,9 +52,9 @@ class AdLabelRulesTest {
     // 웹 광고는 문구 사이에 폭 0 문자를 끼워 차단을 회피한다
     @Test
     fun `폭 0 문자가 끼어 있어도 인식한다`() {
-        assertTrue(AdLabelRules.isAdLabel("광​고"))
-        assertTrue(AdLabelRules.isAdLabel("Spon‌sored"))
-        assertTrue(AdLabelRules.isAdLabel("﻿광고"))
+        assertTrue(AdLabelRules.isAdLabel("광\u200b고"))
+        assertTrue(AdLabelRules.isAdLabel("Spon\u200csored"))
+        assertTrue(AdLabelRules.isAdLabel("\ufeff광고"))
     }
 
     @Test

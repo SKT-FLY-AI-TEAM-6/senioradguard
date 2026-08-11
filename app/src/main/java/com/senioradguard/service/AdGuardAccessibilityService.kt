@@ -29,7 +29,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
     )
 
     private val scanner = AdRegionScanner()
-    private val borderOverlay by lazy { AdBorderOverlay(applicationContext) }
+    // TYPE_ACCESSIBILITY_OVERLAY 창은 접근성 서비스 자신의 컨텍스트로 추가해야 한다.
+    // applicationContext를 쓰면 창 토큰이 없어 addView가 BadTokenException으로 죽는다
+    // ("token null is not valid") — 광고를 감지하는 순간마다 앱이 크래시한다.
+    private val borderOverlay by lazy { AdBorderOverlay(this) }
     private val handler = Handler(Looper.getMainLooper())
 
     private var lastScan = 0L
@@ -45,6 +48,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
     }
 
     override fun onServiceConnected() {
+        Log.e("SAG_DEBUG", "onServiceConnected")
         serviceInfo = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPES_ALL_MASK
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
@@ -58,6 +62,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val pkg = event.packageName?.toString() ?: return
+        Log.e("SAG_DEBUG", "EVT pkg=$pkg type=${event.eventType} target=${pkg in targetApps} root=${rootInActiveWindow != null}")
 
         if (pkg !in targetApps) {
             // 다른 앱 화면으로 전환되면 테두리 해제
@@ -75,7 +80,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         val root = rootInActiveWindow ?: return
         val regions = scanner.scan(root)
-        Log.d("SAG_DEBUG", "event scan pkg=$pkg regions=$regions")
+        Log.e("SAG_DEBUG", "event scan pkg=$pkg regions=$regions")
         debugDump(root, 0)
         applyLayer1(regions)
     }
@@ -86,8 +91,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         val cd = node.contentDescription?.toString() ?: ""
         if (t.contains("광고") || cd.contains("광고")) {
             val b = Rect().also { node.getBoundsInScreen(it) }
-            Log.d(
-                "SAG_DEBUG",
+            Log.e("SAG_DEBUG",
                 "MATCH depth=$depth text='$t' cd='$cd' vis=${node.isVisibleToUser} bounds=$b id=${node.viewIdResourceName}"
             )
         }
@@ -97,7 +101,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
     }
 
     private fun applyLayer1(regions: List<Rect>) {
-        Log.d("SAG_DEBUG", "applyLayer1 regions=$regions")
+        Log.e("SAG_DEBUG", "applyLayer1 regions=$regions")
         handler.removeCallbacks(recheck)
         if (regions.isNotEmpty()) handler.postDelayed(recheck, 1000)
         borderOverlay.show(AdMarkStyle.CONFIRMED, regions)

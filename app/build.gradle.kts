@@ -90,4 +90,7 @@ dependencies {
 
     // WorkManager (블랙리스트 주 1회 업데이트)
     implementation(libs.androidx.work.runtime.ktx)
+
+    androidTestImplementation(libs.androidx.room.testing)
+    androidTestImplementation(libs.kotlinx.coroutines.test)
 }

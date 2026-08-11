@@ -11,6 +11,9 @@
     <!-- AdBorderOverlay가 광고 감지 시 진동으로 알린다. 없으면 vibrate() 호출이
          SecurityException으로 앱을 죽인다 (감지 성공 직후 크래시). -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 배터리 최적화 예외 요청. 없으면 제조사(삼성 Freecess 등)가 백그라운드라는
+         이유로 프로세스를 얼려(FZ) 접근성 이벤트 처리가 조용히 멈춘다. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- Android 11+ 패키지 가시성: 카카오톡 설치 여부 확인용 -->
     <queries>

@@ -98,9 +98,7 @@ class AdDetector(private val context: Context) {
         val domains = getCachedDomains()
         for (url in urls) {
             val domain = extractDomain(url) ?: continue
-            if (domains.any { blocked -> domain.endsWith(blocked) }) {
-                return 1.0f
-            }
+            if (DomainMatcher.isBlocked(domain, domains)) return 1.0f
         }
         return 0f
     }

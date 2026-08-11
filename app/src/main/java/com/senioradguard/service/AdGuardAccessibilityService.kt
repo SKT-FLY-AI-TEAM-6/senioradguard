@@ -7,8 +7,10 @@ import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import com.senioradguard.guard.InstallGuard
 import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.AdMarkStyle
+import com.senioradguard.overlay.OverlayManager
 import com.senioradguard.region.AdRegionScanner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,7 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  *   Layer 1  공식 광고 라벨 감지  → 비차단 테두리 (AdBorderOverlay)
  *   Layer 2  LLM 판별            → Phase 2에서 추가
- *   Layer 3  설치 유도 감지       → 차단 경고 (Task 8에서 추가)
+ *   Layer 3  설치 유도 감지       → 차단 경고 (InstallGuard)
  *
  * 부하 관리 (실기기에서 ServiceANR이 관측되어 도입):
  *   - 시스템이 관심 있는 이벤트/패키지만 배달하도록 좁힌다 (eventTypes, packageNames)
@@ -46,7 +48,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // 다른 브라우저를 추가할 때도 이 방법으로 먼저 노출 여부를 확인할 것.
     )
 
-    /** Layer 3(설치 유도 감지)이 감시할 스토어. Task 8에서 사용한다. */
+    /**
+     * Layer 3이 감시할 스토어. 시스템 이벤트 필터(packageNames)에 넣기 위한 목록이고,
+     * 실제 판정은 InstallGuard.isStorePackage가 한다.
+     */
     private val storePackages = setOf(
         "com.android.vending",
         "com.sec.android.app.samsungapps"
@@ -58,6 +63,19 @@ class AdGuardAccessibilityService : AccessibilityService() {
     // applicationContext를 쓰면 창 토큰이 없어 addView가 BadTokenException으로 죽는다
     // ("token null is not valid") — 광고를 감지하는 순간마다 앱이 크래시한다.
     private val borderOverlay by lazy { AdBorderOverlay(this) }
+
+    // Layer 3의 경고창은 TYPE_APPLICATION_OVERLAY(SYSTEM_ALERT_WINDOW)라 창 토큰이
+    // 필요 없다. 위 테두리 오버레이와 달리 applicationContext로 붙여도 안전하다.
+    private val overlayManager by lazy { OverlayManager(applicationContext) }
+
+    private val installGuard by lazy {
+        InstallGuard(
+            overlayManager = overlayManager,
+            onBack = { performGlobalAction(GLOBAL_ACTION_BACK) },
+            onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) },
+            currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() }
+        )
+    }
 
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -102,8 +120,26 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val pkg = event.packageName?.toString() ?: return
+
+        // ── Layer 3: 설치 유도 감지 ──
+        // 스토어는 targetApps가 아니므로 아래 필터보다 먼저 처리해야 한다.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            installGuard.isStorePackage(pkg)
+        ) {
+            installGuard.onStoreRedirect(pkg)
+            return
+        }
+
         if (pkg !in targetApps) return
-        if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) return
+
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
+            val clickedText = event.contentDescription?.toString()
+                ?: event.text.joinToString(separator = " ")
+            installGuard.onClick(clickedText, pkg)
+            // 클릭만으로는 화면이 바뀌지 않아 Layer 1이 다시 스캔할 게 없다.
+            // (화면이 바뀌면 CONTENT_CHANGED가 따로 온다)
+            return
+        }
 
         val root = rootInActiveWindow ?: return
         scanAsync(root)
@@ -139,6 +175,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         handler.removeCallbacks(recheck)
         scope.cancel()
         borderOverlay.dismissAll()
+        overlayManager.dismiss()
         super.onDestroy()
     }
 }

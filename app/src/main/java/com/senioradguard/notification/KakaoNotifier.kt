@@ -42,11 +42,23 @@ class KakaoNotifier(context: Context) {
         blocked: Boolean
     ) = withContext(Dispatchers.IO) {
 
-        val accessToken = prefs.getString("kakao_access_token", null) ?: return@withContext
+        prefs.getString("kakao_access_token", null) ?: return@withContext
         val guardianUuid = prefs.getString("guardian_uuid", null) ?: return@withContext
 
-        val message = buildMessage(eventType, detail, blocked)
-        sendKakaoMessage(accessToken, guardianUuid, message)
+        val message = buildMessage(eventType, detail, blocked).toString()
+
+        if (!sendRaw(guardianUuid, message)) {
+            PendingNotificationQueue.enqueue(guardianUuid, message)
+            return@withContext
+        }
+
+        // 전송이 되는 상태임이 방금 확인됐으니, 이전에 실패해 쌓인 알림을 함께 보낸다.
+        // (기존에는 enqueue만 있고 drain을 부르는 곳이 없어 영구히 쌓이기만 했다)
+        // sendRaw는 enqueue를 하지 않으므로 재귀 적재나 무한 루프가 생기지 않는다.
+        PendingNotificationQueue.drain().forEach { (uuid, templateJson) ->
+            val resent = runCatching { sendRaw(uuid, templateJson) }.getOrDefault(false)
+            if (!resent) PendingNotificationQueue.enqueue(uuid, templateJson)
+        }
     }
 
     // ──────────────────────────────────────
@@ -93,12 +105,16 @@ class KakaoNotifier(context: Context) {
     // 카카오 메시지 API 호출
     // ──────────────────────────────────────
 
-    private fun sendKakaoMessage(
-        accessToken: String,
-        guardianUuid: String,
-        templateObject: JSONObject
-    ) {
-        try {
+    /**
+     * HTTP 전송만 한다. 실패해도 큐에 넣지 않는다 — 재전송 경로가 이 함수를 다시
+     * 쓰기 때문에, 여기서 적재하면 재전송이 곧 재적재가 되어버린다. 적재 여부는
+     * 호출부가 정한다.
+     *
+     * @return 200 응답을 받았으면 true
+     */
+    private fun sendRaw(guardianUuid: String, templateObjectJson: String): Boolean {
+        val accessToken = prefs.getString("kakao_access_token", null) ?: return false
+        return try {
             val url = URL(MESSAGE_API)
             val connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
@@ -111,22 +127,25 @@ class KakaoNotifier(context: Context) {
             val body = buildString {
                 append("receiver_uuids=%5B%22$guardianUuid%22%5D")  // URL encoded ["uuid"]
                 append("&template_object=")
-                append(java.net.URLEncoder.encode(templateObject.toString(), "UTF-8"))
+                append(java.net.URLEncoder.encode(templateObjectJson, "UTF-8"))
             }
 
             connection.outputStream.use { it.write(body.toByteArray()) }
 
             val responseCode = connection.responseCode
-            if (responseCode != 200) {
-                // 토큰 만료 시 갱신 필요
-                if (responseCode == 401) refreshAccessToken()
-            }
-
             connection.disconnect()
 
+            // 토큰이 만료됐으면 갱신만 해두고 이번 건은 실패로 돌린다.
+            // 호출부가 큐에 넣으므로 다음 전송 때 새 토큰으로 함께 재전송된다.
+            if (responseCode == 401) {
+                refreshAccessToken()
+                return false
+            }
+            responseCode == 200
+
         } catch (e: Exception) {
-            // 네트워크 오류 시 로컬 큐에 저장 후 재시도
-            PendingNotificationQueue.enqueue(guardianUuid, templateObject.toString())
+            // 네트워크 오류. 호출부가 큐에 넣어 다음 성공 시점에 재전송한다.
+            false
         }
     }
 

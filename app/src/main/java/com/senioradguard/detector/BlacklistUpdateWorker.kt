@@ -21,6 +21,7 @@ class BlacklistUpdateWorker(
     override suspend fun doWork(): Result {
         val repository = BlacklistRepository(applicationContext)
         val updated = repository.refreshFromRemote(BLACKLIST_SOURCES)
+        if (updated) BlacklistCache.invalidate()
         return if (updated) Result.success() else Result.retry()
     }
 

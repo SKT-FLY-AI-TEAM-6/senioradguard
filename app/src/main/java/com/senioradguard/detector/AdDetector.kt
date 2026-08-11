@@ -5,8 +5,6 @@ import android.graphics.Bitmap
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
@@ -44,8 +42,6 @@ class AdDetector(private val context: Context) {
 
     // 도메인 블랙리스트 (Room DB 캐시, WorkManager가 주 1회 원격 목록으로 갱신)
     private val blacklistRepository = BlacklistRepository(context)
-    private val blacklistCacheMutex = Mutex()
-    private var blacklistedDomainsCache: Set<String>? = null
 
     private val textRecognizer = TextRecognition.getClient(
         KoreanTextRecognizerOptions.Builder().build()
@@ -95,25 +91,12 @@ class AdDetector(private val context: Context) {
      */
     suspend fun scoreByBlacklist(urls: List<String>): Float {
         if (urls.isEmpty()) return 0f
-        val domains = getCachedDomains()
+        val domains = BlacklistCache.domains { blacklistRepository.getDomains() }
         for (url in urls) {
             val domain = extractDomain(url) ?: continue
             if (DomainMatcher.isBlocked(domain, domains)) return 1.0f
         }
         return 0f
-    }
-
-    /**
-     * 블랙리스트 도메인 집합을 메모리에 캐시해 매 호출마다 DB를 조회하지 않도록 한다.
-     * WorkManager가 원격 갱신을 마치면 다음 프로세스 재시작 시 최신 목록이 반영된다.
-     */
-    private suspend fun getCachedDomains(): Set<String> {
-        blacklistedDomainsCache?.let { return it }
-        return blacklistCacheMutex.withLock {
-            blacklistedDomainsCache ?: blacklistRepository.getDomains().also {
-                blacklistedDomainsCache = it
-            }
-        }
     }
 
     private fun extractDomain(url: String): String? = runCatching {
@@ -143,19 +126,4 @@ class AdDetector(private val context: Context) {
                 }
         }
 
-    // ──────────────────────────────────────
-    // 블랙리스트 업데이트 (백그라운드 워커에서 호출)
-    // ──────────────────────────────────────
-
-    /**
-     * 원격 서버에서 최신 블랙리스트를 다운로드하여 Room DB와 메모리 캐시를 갱신.
-     * WorkManager로 주 1회 실행 (BlacklistUpdateWorker).
-     */
-    suspend fun updateBlacklist(remoteUrl: String): Boolean {
-        val updated = blacklistRepository.refreshFromRemote(remoteUrl)
-        if (updated) {
-            blacklistCacheMutex.withLock { blacklistedDomainsCache = null }
-        }
-        return updated
-    }
 }

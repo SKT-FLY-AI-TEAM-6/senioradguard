@@ -11,8 +11,15 @@ import android.view.accessibility.AccessibilityNodeInfo
  */
 class AdRegionScanner {
 
-    /** 모바일 웹은 화면 구조가 앱과 달라 광고 영역을 다른 방식으로 잡는다 */
-    private val browsers = setOf("com.android.chrome", "com.sec.android.app.sbrowser")
+    /**
+     * 모바일 웹은 화면 구조가 앱과 달라 광고 영역을 다른 방식으로 잡는다.
+     *
+     * 삼성 인터넷은 제외했다 — 웹 콘텐츠를 접근성 트리에 노출하지 않아 감지 자체가
+     * 불가능하다(AdGuardAccessibilityService.targetApps 주석 참고).
+     * 브라우저를 추가할 때는 이 목록과 targetApps 양쪽에 넣어야 한다. 한쪽만
+     * 넣으면 이벤트는 받지만 앱 방식(containerOf)으로 잘못 처리된다.
+     */
+    private val browsers = setOf("com.android.chrome")
     private var inBrowser = false
 
     fun scan(root: AccessibilityNodeInfo): List<Rect> {

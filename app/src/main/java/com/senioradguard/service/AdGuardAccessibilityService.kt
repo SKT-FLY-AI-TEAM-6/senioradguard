@@ -36,8 +36,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
         "com.google.android.youtube",   // 유튜브
         "com.instagram.android",        // 인스타그램
         "com.towneers.www",             // 당근
-        "com.android.chrome",           // 크롬 (모바일 웹)
-        "com.sec.android.app.sbrowser"  // 삼성 인터넷 (모바일 웹)
+        "com.android.chrome"            // 크롬 (모바일 웹)
+        // 삼성 인터넷(com.sec.android.app.sbrowser)은 제외한다.
+        // 실기기 A/B 검증 결과 렌더링된 웹 페이지를 접근성 트리에 전혀 노출하지
+        // 않는다 — 같은 URL에서 크롬은 노드 421개에 본문 텍스트가 나오는 반면
+        // 삼성 인터넷은 노드 20개(주소창·버튼 등 UI 껍데기)에 텍스트가 0개다.
+        // 볼 수 있는 정보가 없어 로직으로는 해결이 불가능하고, 목록에 두면
+        // (1) 보호받는다는 오해를 주고 (2) 아무것도 못 찾을 트리를 계속 순회한다.
+        // 다른 브라우저를 추가할 때도 이 방법으로 먼저 노출 여부를 확인할 것.
     )
 
     /** Layer 3(설치 유도 감지)이 감시할 스토어. Task 8에서 사용한다. */

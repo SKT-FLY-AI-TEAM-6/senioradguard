@@ -5,8 +5,13 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import com.senioradguard.agent.AgentPipeline
+import com.senioradguard.agent.CandidateExtractor
+import com.senioradguard.agent.StubClassifier
+import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.guard.InstallGuard
 import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.AdMarkStyle
@@ -87,6 +92,19 @@ class AdGuardAccessibilityService : AccessibilityService() {
      */
     private val scanning = AtomicBoolean(false)
 
+    /** Layer 2 진행 중 플래그. 판별은 왕복이 길어 겹쳐 돌면 호출만 늘어난다. */
+    private val classifying = AtomicBoolean(false)
+
+    private val extractor = CandidateExtractor()
+
+    private val pipeline by lazy {
+        AgentPipeline(
+            verdictDao = AppDatabase.getInstance(this).adVerdictDao(),
+            // 지금은 규칙 기반 대역. LLM을 붙일 때 이 줄만 바꾸면 된다.
+            classifier = StubClassifier()
+        )
+    }
+
     /**
      * 이벤트가 끊겨도 광고가 아직 화면에 있는지 직접 재확인하고, 사라졌을 때만 표시를 해제.
      * packageNames로 대상 앱 이벤트만 받으므로, 다른 앱으로 나갔을 때 테두리를 지우는
@@ -154,19 +172,95 @@ class AdGuardAccessibilityService : AccessibilityService() {
         if (!scanning.compareAndSet(false, true)) return
         scope.launch {
             try {
-                val regions = scanner.scan(root)
-                withContext(Dispatchers.Main) { applyLayer1(regions) }
+                val confirmed = scanner.scan(root)
+                // 캐시만 보는 Layer 2. 판별기를 부르지 않으므로 화면이 바뀔 때마다
+                // 돌려도 되고, 그래야 점선이 카드를 따라다닌다. 새 판별은 유휴 때만.
+                val guessed = if (isAiEnabled()) {
+                    runCatching {
+                        pipeline.run(extractor.extract(root, confirmed), allowClassify = false)
+                            .regions
+                    }.getOrDefault(emptyList())
+                } else {
+                    emptyList()
+                }
+                withContext(Dispatchers.Main) { apply(confirmed, guessed) }
             } finally {
                 scanning.set(false)
             }
         }
     }
 
-    private fun applyLayer1(regions: List<Rect>) {
+    private fun applyLayer1(regions: List<Rect>) = apply(regions, emptyList())
+
+    private fun apply(confirmed: List<Rect>, guessed: List<Rect>) {
         handler.removeCallbacks(recheck)
-        if (regions.isNotEmpty()) handler.postDelayed(recheck, 1000)
-        borderOverlay.show(AdMarkStyle.CONFIRMED, regions)
+        if (confirmed.isNotEmpty() || guessed.isNotEmpty()) handler.postDelayed(recheck, 1000)
+
+        borderOverlay.show(AdMarkStyle.CONFIRMED, confirmed)
+        borderOverlay.show(AdMarkStyle.AI_GUESS, guessed)
+
+        confirmedRegions = confirmed
+        scheduleLayer2()
     }
+
+    // ──────────────────────────────────────────────────────────
+    // Layer 2 — AI 판별 파이프라인
+    // ──────────────────────────────────────────────────────────
+
+    /**
+     * 화면이 바뀔 때마다 증가. 파이프라인은 왕복에 수 초가 걸릴 수 있어, 결과가
+     * 돌아왔을 때 화면이 이미 넘어갔으면 표시하지 않는다 (판정은 DB에 남아 다음에
+     * 같은 카드가 나오면 캐시로 즉시 뜬다).
+     */
+    private var screenGeneration = 0
+    private var confirmedRegions: List<Rect> = emptyList()
+
+    private val runLayer2 = Runnable {
+        if (!isAiEnabled()) return@Runnable
+        val root = rootInActiveWindow ?: return@Runnable
+        if (root.packageName?.toString() !in targetApps) return@Runnable
+        if (!classifying.compareAndSet(false, true)) return@Runnable
+
+        val generation = screenGeneration
+        val excluded = confirmedRegions
+        scope.launch {
+            try {
+                val candidates = extractor.extract(root, excluded)
+                val result = pipeline.run(candidates)
+                // 유휴 1회에 한 줄. 이벤트마다가 아니라 스크롤이 멈췄을 때만 찍히므로
+                // 부담이 없고, 캐시가 실제로 듣는지 눈으로 볼 수 있는 유일한 창이다.
+                Log.i(
+                    TAG,
+                    "layer2 출처=${candidates.firstOrNull()?.sourceKey ?: "-"} " +
+                        "후보=${candidates.size} 캐시=${result.cacheHits} " +
+                        "판별=${result.classified} 보류=${result.skippedByLimit} " +
+                        "표시=${result.regions.size}"
+                )
+                withContext(Dispatchers.Main) {
+                    // 결과가 늦게 왔고 그 사이 화면이 바뀌었으면 버린다
+                    if (generation == screenGeneration) {
+                        borderOverlay.show(AdMarkStyle.AI_GUESS, result.regions)
+                    }
+                }
+            } finally {
+                classifying.set(false)
+            }
+        }
+    }
+
+    /**
+     * 스크롤이 멈춘 뒤에만 돌린다. 스크롤 중에는 화면이 계속 바뀌어 판별해봐야
+     * 표시할 자리가 사라지고, 호출만 낭비된다.
+     */
+    private fun scheduleLayer2() {
+        screenGeneration++
+        handler.removeCallbacks(runLayer2)
+        if (isAiEnabled()) handler.postDelayed(runLayer2, LAYER2_IDLE_MS)
+    }
+
+    /** 기본 OFF 옵트인. 화면 텍스트가 외부로 나가므로 사용자가 켜야만 동작한다. */
+    private fun isAiEnabled(): Boolean =
+        getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_AI_CLASSIFY, false)
 
     override fun onInterrupt() {
         applyLayer1(emptyList())
@@ -175,6 +269,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         isConnected = false
         handler.removeCallbacks(recheck)
+        handler.removeCallbacks(runLayer2)
         scope.cancel()
         borderOverlay.dismissAll()
         overlayManager.dismiss()
@@ -182,6 +277,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+        private const val TAG = "AdGuard"
+
+        /** 스크롤이 이만큼 멈춰 있어야 Layer 2를 돌린다. */
+        private const val LAYER2_IDLE_MS = 600L
+
+        /** "settings" prefs — AI 광고 판별 옵트인 키. MainActivity 토글과 공유한다. */
+        const val PREF_AI_CLASSIFY = "ai_classify"
+
         /**
          * 서비스가 지금 시스템에 연결돼 있는지. 설정 화면의 "켜짐" 표시와 별개다 —
          * 설정에는 켜짐으로 남은 채 서비스만 죽는 경우를 구분하려고 둔다

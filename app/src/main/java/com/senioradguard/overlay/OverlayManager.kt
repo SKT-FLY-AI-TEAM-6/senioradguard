@@ -23,11 +23,6 @@ import android.widget.TextView
  *   1단계: 즉시 GLOBAL_ACTION_BACK 실행
  *   2단계: 1.5초 후에도 같은 패키지가 여전히 포그라운드면 (뒤로가기가 안 먹힌 경우)
  *          GLOBAL_ACTION_HOME을 자동 실행해 강제로 빠져나옴
- *
- * 유튜브/인스타그램처럼 정상적인 광고가 섞여 나오는 앱에서는 차단 팝업 대신
- * [showAdInfoBanner]로 화면 상단에 "광고가 재생 중입니다" 안내만 짧게 띄운다
- * (영상 재생/터치는 방해하지 않고, 3초 후 자동으로 사라짐). showWarning()의
- * 경고 팝업과는 완전히 별개의 오버레이 창으로 동작한다.
  */
 class OverlayManager(private val context: Context) {
 
@@ -36,9 +31,6 @@ class OverlayManager(private val context: Context) {
 
     private val handler = Handler(Looper.getMainLooper())
     private var homeFallbackRunnable: Runnable? = null
-
-    private var bannerView: View? = null
-    private var bannerDismissRunnable: Runnable? = null
 
     fun showWarning(
         message: String,
@@ -75,34 +67,6 @@ class OverlayManager(private val context: Context) {
     private fun cancelHomeFallback() {
         homeFallbackRunnable?.let { handler.removeCallbacks(it) }
         homeFallbackRunnable = null
-    }
-
-    /**
-     * 유튜브/인스타그램 등에서 광고 레이블 텍스트 감지 시 표시하는 상단 정보 배너.
-     * 차단하지 않고 정보만 알려주는 용도라 터치를 가로채지 않으며(FLAG_NOT_TOUCHABLE),
-     * 3초 후 자동으로 사라진다. 이미 떠 있으면 중복 표시하지 않는다.
-     */
-    fun showAdInfoBanner() {
-        if (bannerView != null) return
-
-        val banner = buildAdInfoBanner()
-        val params = buildBannerWindowParams()
-
-        bannerView = banner
-        windowManager.addView(banner, params)
-
-        val runnable = Runnable { dismissAdInfoBanner() }
-        bannerDismissRunnable = runnable
-        handler.postDelayed(runnable, AD_BANNER_DURATION_MS)
-    }
-
-    fun dismissAdInfoBanner() {
-        bannerDismissRunnable?.let { handler.removeCallbacks(it) }
-        bannerDismissRunnable = null
-        bannerView?.let {
-            runCatching { windowManager.removeView(it) }
-            bannerView = null
-        }
     }
 
     // ──────────────────────────────────────
@@ -216,36 +180,6 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    // ──────────────────────────────────────
-    // 광고 정보 배너 (유튜브/인스타그램)
-    // ──────────────────────────────────────
-
-    private fun buildAdInfoBanner(): View =
-        TextView(context).apply {
-            text = "📢 광고가 재생 중입니다"
-            textSize = 16f
-            setTextColor(0xFFFFFFFF.toInt())
-            setBackgroundColor(0xAA000000.toInt()) // 반투명 검정 배경
-            gravity = Gravity.CENTER
-            setPadding(32, 28, 32, 28)
-        }
-
-    private fun buildBannerWindowParams(): WindowManager.LayoutParams {
-        val type = overlayWindowType()
-
-        return WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or // 터치를 가로채지 않음 — 영상은 계속 재생/조작 가능
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP
-        }
-    }
-
     private fun overlayWindowType(): Int =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -256,6 +190,5 @@ class OverlayManager(private val context: Context) {
 
     companion object {
         private const val HOME_FALLBACK_DELAY_MS = 1500L
-        private const val AD_BANNER_DURATION_MS = 3000L
     }
 }

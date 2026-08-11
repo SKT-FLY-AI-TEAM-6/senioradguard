@@ -2,228 +2,114 @@ package com.senioradguard.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
-import android.content.Intent
-import android.graphics.Bitmap
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
-import kotlinx.coroutines.*
-import com.senioradguard.detector.AdDetector
-import com.senioradguard.detector.ScreenCaptureHelper
-import com.senioradguard.logger.AdEventLogger
-import com.senioradguard.overlay.OverlayManager
+import com.senioradguard.overlay.AdBorderOverlay
+import com.senioradguard.overlay.AdMarkStyle
+import com.senioradguard.region.AdRegionScanner
 
 /**
- * AdGuardAccessibilityService
+ * 단일 진입점. 이벤트를 받아 루트 노드를 한 번만 가져오고 각 레이어에 배분한다.
  *
- * 항상 백그라운드에서 실행되며 4가지 방식으로 광고를 감지합니다:
- *   1) UI 이벤트 패턴 매칭 (팝업 텍스트, 버튼 위치)
- *   2) Intent 인터셉트 (Play Store 강제 이동)
- *   3) 도메인 블랙리스트 조회
- *   4) AI 이미지 분석 (의심 팝업 발견 시 트리거)
+ *   Layer 1  공식 광고 라벨 감지  → 비차단 테두리 (AdBorderOverlay)
+ *   Layer 2  LLM 판별            → Phase 2에서 추가
+ *   Layer 3  설치 유도 감지       → 차단 경고 (Task 8에서 추가)
  */
 class AdGuardAccessibilityService : AccessibilityService() {
 
-    private val detector by lazy { AdDetector(applicationContext) }
-    private val overlayManager by lazy { OverlayManager(applicationContext) }
+    private val targetApps = setOf(
+        "com.google.android.youtube",   // 유튜브
+        "com.instagram.android",        // 인스타그램
+        "com.towneers.www",             // 당근
+        "com.android.chrome",           // 크롬 (모바일 웹)
+        "com.sec.android.app.sbrowser"  // 삼성 인터넷 (모바일 웹)
+    )
+
+    private val scanner = AdRegionScanner()
+    private val borderOverlay by lazy { AdBorderOverlay(applicationContext) }
     private val handler = Handler(Looper.getMainLooper())
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // 광고성 키워드 (한국어 + 영어)
-    private val adKeywords = setOf(
-        "설치하기", "지금 설치", "무료 다운로드", "앱 다운로드",
-        "install now", "free download", "get app",
-        "광고", "이벤트 참여", "지금 받기", "혜택 받기"
-    )
+    private var lastScan = 0L
 
-    // Play Store / 외부 앱 패키지명 패턴
-    private val storePackages = setOf(
-        "com.android.vending",       // Google Play Store
-        "com.sec.android.app.samsungapps" // Samsung Galaxy Store
-    )
+    // 이벤트가 끊겨도 광고가 아직 화면에 있는지 직접 재확인하고, 사라졌을 때만 표시를 해제
+    private val recheck = Runnable {
+        val root = rootInActiveWindow
+        if (root != null && root.packageName?.toString() in targetApps) {
+            applyLayer1(scanner.scan(root))
+        } else {
+            applyLayer1(emptyList())
+        }
+    }
 
     override fun onServiceConnected() {
         serviceInfo = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPES_ALL_MASK
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
-                    AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
+                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS or
+                AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
             notificationTimeout = 100
         }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        val packageName = event.packageName?.toString() ?: return
+        val pkg = event.packageName?.toString() ?: return
 
-        when (event.eventType) {
-            // 창이 바뀔 때 — Play Store 이동 감지
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                if (packageName in storePackages) {
-                    handleStoreRedirect(packageName)
-                }
+        if (pkg !in targetApps) {
+            // 다른 앱 화면으로 전환되면 테두리 해제
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+                pkg != "com.android.systemui" && pkg != packageName
+            ) {
+                applyLayer1(emptyList())
             }
-
-            // 창 내용이 바뀔 때 — 팝업/광고 배너 감지
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                scope.launch {
-                    val rootNode = rootInActiveWindow ?: return@launch
-                    if (detector.isAdLabelPackage(packageName)) {
-                        // 유튜브/인스타그램: 차단 팝업 대신 정보 배너만
-                        checkAdLabel(rootNode, packageName)
-                    } else {
-                        analyzeWindowContent(rootNode, packageName)
-                    }
-                }
-            }
-
-            // 클릭 이벤트 — 위험 버튼 사전 경고
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                val clickedText = event.contentDescription?.toString()
-                    ?: event.text.joinToString()
-                if (isAdTriggerText(clickedText)) {
-                    // 클릭 직후 경고 (설치가 실행되기 전)
-                    handler.postDelayed({
-                        overlayManager.showWarning(
-                            message = "광고일 수 있습니다!\n'$clickedText' 버튼을 눌렀어요.\n앱이 설치될 수 있으니 확인해주세요.",
-                            packageName = packageName,
-                            onConfirm = { /* 사용자가 허용 */ },
-                            onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
-                            currentForegroundPackage = { currentForegroundPackage() },
-                            onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) }
-                        )
-                    }, 50)
-                }
-            }
+            return
         }
+
+        val now = System.currentTimeMillis()
+        if (now - lastScan < 200) return
+        lastScan = now
+
+        val root = rootInActiveWindow ?: return
+        val regions = scanner.scan(root)
+        Log.d("SAG_DEBUG", "event scan pkg=$pkg regions=$regions")
+        debugDump(root, 0)
+        applyLayer1(regions)
     }
 
-    /**
-     * 화면 전체 노드를 재귀 탐색하여 광고 패턴 검사
-     */
-    private suspend fun analyzeWindowContent(
-        node: AccessibilityNodeInfo,
-        packageName: String
-    ) {
-        val textContents = mutableListOf<String>()
-        collectTexts(node, textContents)
-        val fullText = textContents.joinToString(" ")
-
-        // 1단계: 키워드 패턴 매칭 (빠름)
-        val keywordScore = detector.scoreByKeywords(fullText)
-
-        // 2단계: URL 블랙리스트 (링크 포함 시)
-        val urls = extractUrls(fullText)
-        val blacklistScore = if (urls.isNotEmpty()) detector.scoreByBlacklist(urls) else 0f
-
-        val combinedScore = keywordScore * 0.4f + blacklistScore * 0.6f
-
-        // combinedScore만으로는 URL 없는 순수 키워드 매칭이 0.5를 절대 못 넘으므로
-        // keywordScore 자체가 높은 경우도 AI 재검사 대상에 포함시킨다.
-        if (combinedScore > 0.5f || keywordScore >= 0.4f) {
-            // 3단계: AI 이미지 분석 — 키워드 신뢰도가 일정 수준 이상일 때만 실제 화면 캡처
-            val aiScore = if (keywordScore >= 0.4f) {
-                val screenshot = captureScreen()
-                if (screenshot != null) {
-                    val score = detector.scoreByAI(screenshot)
-                    screenshot.recycle()
-                    score
-                } else 0f
-            } else 0f
-
-            val finalScore = combinedScore * 0.6f + aiScore * 0.4f
-
-            if (finalScore >= 0.6f) {
-                withContext(Dispatchers.Main) {
-                    overlayManager.showWarning(
-                        message = buildWarningMessage(finalScore, keywordScore, blacklistScore),
-                        packageName = packageName,
-                        onConfirm = { /* 사용자가 무시 */ },
-                        onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
-                        currentForegroundPackage = { currentForegroundPackage() },
-                        onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) }
-                    )
-                }
-                AdEventLogger.log(packageName, finalScore)
-            }
+    private fun debugDump(node: android.view.accessibility.AccessibilityNodeInfo, depth: Int) {
+        if (depth > 60) return
+        val t = node.text?.toString() ?: ""
+        val cd = node.contentDescription?.toString() ?: ""
+        if (t.contains("광고") || cd.contains("광고")) {
+            val b = Rect().also { node.getBoundsInScreen(it) }
+            Log.d(
+                "SAG_DEBUG",
+                "MATCH depth=$depth text='$t' cd='$cd' vis=${node.isVisibleToUser} bounds=$b id=${node.viewIdResourceName}"
+            )
         }
-    }
-
-    /**
-     * 유튜브/인스타그램의 네이티브 광고 레이블 텍스트 감지.
-     * 차단 팝업이 아니라 화면 상단 정보 배너만 짧게 띄운다 (영상은 계속 재생).
-     */
-    private suspend fun checkAdLabel(node: AccessibilityNodeInfo, packageName: String) {
-        val textContents = mutableListOf<String>()
-        collectTexts(node, textContents)
-
-        if (detector.matchesAdLabel(packageName, textContents)) {
-            withContext(Dispatchers.Main) {
-                overlayManager.showAdInfoBanner()
-            }
-        }
-    }
-
-    /**
-     * Play Store 강제 이동 감지 — 즉시 차단 or 경고
-     */
-    private fun handleStoreRedirect(storePackage: String) {
-        overlayManager.showWarning(
-            message = "앱 설치 화면으로 이동했어요!\n광고로 인한 이동일 수 있습니다.\n뒤로 돌아갈까요?",
-            packageName = storePackage,
-            onConfirm = { /* 사용자 선택으로 설치 허용 */ },
-            onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
-            currentForegroundPackage = { currentForegroundPackage() },
-            onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) }
-        )
-        AdEventLogger.logStoreRedirect(storePackage)
-    }
-
-    private fun currentForegroundPackage(): String? =
-        rootInActiveWindow?.packageName?.toString()
-
-    private fun isAdTriggerText(text: String): Boolean =
-        adKeywords.any { keyword -> text.contains(keyword, ignoreCase = true) }
-
-    private fun collectTexts(node: AccessibilityNodeInfo, result: MutableList<String>) {
-        node.text?.let { result.add(it.toString()) }
-        node.contentDescription?.let { result.add(it.toString()) }
         for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { collectTexts(it, result) }
+            node.getChild(i)?.let { debugDump(it, depth + 1) }
         }
     }
 
-    private fun extractUrls(text: String): List<String> {
-        val urlRegex = Regex("""https?://[^\s]+""")
-        return urlRegex.findAll(text).map { it.value }.toList()
-    }
-
-    private fun captureScreen(): Bitmap? = ScreenCaptureHelper.getLatestFrame()
-
-    private fun buildWarningMessage(
-        finalScore: Float,
-        keywordScore: Float,
-        blacklistScore: Float
-    ): String {
-        val level = when {
-            finalScore > 0.85f -> "거의 확실한"
-            finalScore > 0.7f -> "의심스러운"
-            else -> "주의가 필요한"
-        }
-        return "⚠️ $level 광고가 감지됐어요!\n" +
-               "광고 같은 문구나 버튼이 있습니다.\n" +
-               "뒤로 가거나 가족에게 물어보세요."
+    private fun applyLayer1(regions: List<Rect>) {
+        Log.d("SAG_DEBUG", "applyLayer1 regions=$regions")
+        handler.removeCallbacks(recheck)
+        if (regions.isNotEmpty()) handler.postDelayed(recheck, 1000)
+        borderOverlay.show(AdMarkStyle.CONFIRMED, regions)
     }
 
     override fun onInterrupt() {
-        scope.cancel()
+        applyLayer1(emptyList())
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(recheck)
+        borderOverlay.dismissAll()
         super.onDestroy()
-        scope.cancel()
-        overlayManager.dismiss()
-        overlayManager.dismissAdInfoBanner()
     }
 }

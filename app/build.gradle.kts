@@ -77,9 +77,6 @@ dependencies {
     implementation("com.kakao.sdk:v2-user:2.24.0")
     implementation("com.kakao.sdk:v2-friend:2.24.0")
 
-    // ML Kit (AI 이미지 분석)
-    implementation("com.google.mlkit:text-recognition-korean:16.0.1")
-
     // 코루틴
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
 

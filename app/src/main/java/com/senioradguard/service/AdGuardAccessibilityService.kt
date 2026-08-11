@@ -5,11 +5,18 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.AdMarkStyle
 import com.senioradguard.region.AdRegionScanner
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 단일 진입점. 이벤트를 받아 루트 노드를 한 번만 가져오고 각 레이어에 배분한다.
@@ -17,6 +24,11 @@ import com.senioradguard.region.AdRegionScanner
  *   Layer 1  공식 광고 라벨 감지  → 비차단 테두리 (AdBorderOverlay)
  *   Layer 2  LLM 판별            → Phase 2에서 추가
  *   Layer 3  설치 유도 감지       → 차단 경고 (Task 8에서 추가)
+ *
+ * 부하 관리 (실기기에서 ServiceANR이 관측되어 도입):
+ *   - 시스템이 관심 있는 이벤트/패키지만 배달하도록 좁힌다 (eventTypes, packageNames)
+ *   - 트리 순회는 백그라운드 스레드에서 수행하고 결과 반영만 메인으로 돌린다
+ *   - 스캔이 진행 중이면 새 이벤트는 버린다 (큐가 쌓이지 않게)
  */
 class AdGuardAccessibilityService : AccessibilityService() {
 
@@ -28,80 +40,86 @@ class AdGuardAccessibilityService : AccessibilityService() {
         "com.sec.android.app.sbrowser"  // 삼성 인터넷 (모바일 웹)
     )
 
+    /** Layer 3(설치 유도 감지)이 감시할 스토어. Task 8에서 사용한다. */
+    private val storePackages = setOf(
+        "com.android.vending",
+        "com.sec.android.app.samsungapps"
+    )
+
     private val scanner = AdRegionScanner()
+
     // TYPE_ACCESSIBILITY_OVERLAY 창은 접근성 서비스 자신의 컨텍스트로 추가해야 한다.
     // applicationContext를 쓰면 창 토큰이 없어 addView가 BadTokenException으로 죽는다
     // ("token null is not valid") — 광고를 감지하는 순간마다 앱이 크래시한다.
     private val borderOverlay by lazy { AdBorderOverlay(this) }
+
     private val handler = Handler(Looper.getMainLooper())
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    private var lastScan = 0L
+    /**
+     * 스캔 진행 중 플래그. 트리 순회는 수십 ms가 걸릴 수 있는데 이벤트는 그보다
+     * 빨리 들어오므로, 겹치는 요청은 버린다. AdRegionScanner가 inBrowser 상태를
+     * 들고 있어 동시 실행도 안전하지 않다.
+     */
+    private val scanning = AtomicBoolean(false)
 
-    // 이벤트가 끊겨도 광고가 아직 화면에 있는지 직접 재확인하고, 사라졌을 때만 표시를 해제
+    /**
+     * 이벤트가 끊겨도 광고가 아직 화면에 있는지 직접 재확인하고, 사라졌을 때만 표시를 해제.
+     * packageNames로 대상 앱 이벤트만 받으므로, 다른 앱으로 나갔을 때 테두리를 지우는
+     * 것도 이 재확인이 담당한다.
+     */
     private val recheck = Runnable {
         val root = rootInActiveWindow
         if (root != null && root.packageName?.toString() in targetApps) {
-            applyLayer1(scanner.scan(root))
+            scanAsync(root)
         } else {
             applyLayer1(emptyList())
         }
     }
 
     override fun onServiceConnected() {
-        Log.e("SAG_DEBUG", "onServiceConnected")
         serviceInfo = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPES_ALL_MASK
+            // 전체 이벤트를 받으면 모든 앱의 모든 UI 변화가 IPC로 배달된다.
+            // 실제로 쓰는 세 종류만 남긴다 (VIEW_CLICKED는 Layer 3용).
+            eventTypes = AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                AccessibilityEvent.TYPE_VIEW_CLICKED
+            // 시스템 단계에서 걸러 우리 프로세스를 아예 깨우지 않는다.
+            packageNames = (targetApps + storePackages).toTypedArray()
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
-                AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS or
-                AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
-            notificationTimeout = 100
+                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+            // 코드 쪽에서 다시 스로틀하지 않아도 되도록 시스템 병합 간격을 늘린다.
+            notificationTimeout = 200
         }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val pkg = event.packageName?.toString() ?: return
-        Log.e("SAG_DEBUG", "EVT pkg=$pkg type=${event.eventType} target=${pkg in targetApps} root=${rootInActiveWindow != null}")
-
-        if (pkg !in targetApps) {
-            // 다른 앱 화면으로 전환되면 테두리 해제
-            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-                pkg != "com.android.systemui" && pkg != packageName
-            ) {
-                applyLayer1(emptyList())
-            }
-            return
-        }
-
-        val now = System.currentTimeMillis()
-        if (now - lastScan < 200) return
-        lastScan = now
+        if (pkg !in targetApps) return
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) return
 
         val root = rootInActiveWindow ?: return
-        val regions = scanner.scan(root)
-        Log.e("SAG_DEBUG", "event scan pkg=$pkg regions=$regions")
-        debugDump(root, 0)
-        applyLayer1(regions)
+        scanAsync(root)
     }
 
-    private fun debugDump(node: android.view.accessibility.AccessibilityNodeInfo, depth: Int) {
-        if (depth > 60) return
-        val t = node.text?.toString() ?: ""
-        val cd = node.contentDescription?.toString() ?: ""
-        if (t.contains("광고") || cd.contains("광고")) {
-            val b = Rect().also { node.getBoundsInScreen(it) }
-            Log.e("SAG_DEBUG",
-                "MATCH depth=$depth text='$t' cd='$cd' vis=${node.isVisibleToUser} bounds=$b id=${node.viewIdResourceName}"
-            )
-        }
-        for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { debugDump(it, depth + 1) }
+    /**
+     * 트리 순회를 백그라운드로 넘기고 결과 반영만 메인 스레드에서 한다.
+     * 이전 스캔이 아직 돌고 있으면 이번 이벤트는 버린다.
+     */
+    private fun scanAsync(root: AccessibilityNodeInfo) {
+        if (!scanning.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                val regions = scanner.scan(root)
+                withContext(Dispatchers.Main) { applyLayer1(regions) }
+            } finally {
+                scanning.set(false)
+            }
         }
     }
 
     private fun applyLayer1(regions: List<Rect>) {
-        Log.e("SAG_DEBUG", "applyLayer1 regions=$regions")
         handler.removeCallbacks(recheck)
         if (regions.isNotEmpty()) handler.postDelayed(recheck, 1000)
         borderOverlay.show(AdMarkStyle.CONFIRMED, regions)
@@ -113,6 +131,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         handler.removeCallbacks(recheck)
+        scope.cancel()
         borderOverlay.dismissAll()
         super.onDestroy()
     }

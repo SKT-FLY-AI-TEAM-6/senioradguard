@@ -79,7 +79,27 @@ private fun GuardianScreen(modifier: Modifier = Modifier) {
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Text("보호자 화면", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text("보호자 화면", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+            Button(
+                onClick = {
+                    FirebaseRepo.clearRole(context)
+                    context.startActivity(
+                        android.content.Intent(context, SetupActivity::class.java)
+                            .addFlags(
+                                android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                                    android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK
+                            )
+                    )
+                },
+                colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF757575)
+                )
+            ) { Text("모드 바꾸기", fontSize = 14.sp) }
+        }
 
         if (!FirebaseRepo.isConfigured) {
             Notice(
@@ -112,6 +132,17 @@ private fun GuardianScreen(modifier: Modifier = Modifier) {
         } else {
             LabeledRow("연결된 어르신", partnerId.take(12))
             LabeledRow("기록된 내역", "${events.size}건")
+
+            Button(
+                onClick = {
+                    FirebaseRepo.link(context, "")
+                    partnerId = ""
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF9E9E9E)
+                )
+            ) { Text("연결 해제", fontSize = 16.sp) }
 
             if (events.isEmpty()) {
                 Notice("아직 기록이 없습니다.\n어르신 폰에서 광고가 감지되면 여기에 바로 나타납니다.")

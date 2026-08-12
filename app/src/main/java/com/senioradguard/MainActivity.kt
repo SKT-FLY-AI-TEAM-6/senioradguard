@@ -171,7 +171,70 @@ private fun HomeScreen(
                 AiClassifyToggle()
             }
         }
+
+        // 어떤 상태든 아래 두 가지는 항상 보여준다. 이게 없으면 UI만으로는
+        // 보호자를 연결할 수도, 역할을 바꿔볼 수도 없다.
+        ConnectionCodeCard()
+        ChangeRoleButton()
     }
+}
+
+/**
+ * 보호자가 입력할 연결 코드. 이 기기의 ID를 그대로 쓴다.
+ * 코드를 볼 방법이 없으면 보호자 모드를 실제로 연결해볼 수가 없다.
+ */
+@Composable
+private fun ConnectionCodeCard() {
+    val context = LocalContext.current
+    val code = FirebaseRepo.currentUserId()
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("보호자 연결 코드", fontSize = 19.sp, fontWeight = FontWeight.Bold)
+            Text(
+                text = code.ifBlank { "-" },
+                fontSize = 20.sp,
+                color = Color(0xFF1565C0)
+            )
+            Text(
+                text = "보호자 폰의 '보호자 모드'에 이 코드를 입력하세요.",
+                fontSize = 15.sp,
+                color = Color(0xFF5D4037)
+            )
+            Button(
+                onClick = {
+                    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                        as android.content.ClipboardManager
+                    clipboard.setPrimaryClip(
+                        android.content.ClipData.newPlainText("연결 코드", code)
+                    )
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("코드 복사", fontSize = 17.sp) }
+        }
+    }
+}
+
+/** 역할 재선택. 한 번 고르면 되돌릴 방법이 없어 테스트가 막혔다. */
+@Composable
+private fun ChangeRoleButton() {
+    val context = LocalContext.current
+    Button(
+        onClick = {
+            FirebaseRepo.clearRole(context)
+            context.startActivity(
+                Intent(context, SetupActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            )
+        },
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF757575))
+    ) { Text("모드 바꾸기", fontSize = 17.sp) }
 }
 
 /**

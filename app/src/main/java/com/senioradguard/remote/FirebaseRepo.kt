@@ -116,6 +116,12 @@ object FirebaseRepo {
         ref.child("users").child(userId).child("role").setValue(role.wire)
     }
 
+    /** 역할을 지운다. 테스트나 재설정 때 선택 화면으로 되돌리기 위해 쓴다. */
+    fun clearRole(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().remove(KEY_ROLE).remove(KEY_LINKED_TO).apply()
+    }
+
     fun linkedTo(context: Context): String? =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_LINKED_TO, null)

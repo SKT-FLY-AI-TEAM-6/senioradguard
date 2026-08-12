@@ -14,6 +14,13 @@ val localProperties = Properties().apply {
 }
 val kakaoNativeAppKey: String = localProperties.getProperty("KAKAO_NATIVE_APP_KEY", "")
 
+// Layer 2 판별용 Gemini 키. 비어 있으면 앱이 StubClassifier로 물러나므로,
+// 키가 없는 팀원도 빌드와 실행에는 문제가 없다.
+//
+// ⚠️ 이건 개발용 경로다. APK에 들어간 문자열은 누구나 추출할 수 있으므로
+// 배포 전에는 반드시 우리 서버를 거치는 구현으로 바꿔야 한다 (AdClassifier가 교체점).
+val geminiApiKey: String = localProperties.getProperty("GEMINI_API_KEY", "")
+
 android {
     namespace = "com.senioradguard"
     compileSdk {
@@ -30,6 +37,7 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("String", "KAKAO_NATIVE_APP_KEY", "\"$kakaoNativeAppKey\"")
+        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
         manifestPlaceholders["KAKAO_NATIVE_APP_KEY"] = kakaoNativeAppKey
     }
 

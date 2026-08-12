@@ -27,11 +27,29 @@ class AgentPipeline(
         const val TTL_MS = 30L * 24 * 60 * 60 * 1000
     }
 
+    /**
+     * 판별 1건의 중간값. 로그는 서비스가 찍는다 — 여기서 android.util.Log를 부르면
+     * JVM 단위 테스트에서 "not mocked"로 죽는다(실제로 그렇게 7건이 깨졌다).
+     * 화면 텍스트는 담지 않는다. 마스킹을 거쳤어도 logcat에 쌓을 이유가 없고,
+     * 어떤 카드였는지는 출처와 글자수로 충분히 추적된다.
+     */
+    data class Trace(
+        val sourceKey: String,
+        val chars: Int,
+        val rawIsAd: Boolean,
+        val rawConfidence: Float,
+        val weakSignal: Boolean,
+        val finalConfidence: Float,
+        val marked: Boolean,
+        val reason: String
+    )
+
     data class Result(
         val regions: List<Rect>,
         val cacheHits: Int,
         val classified: Int,
-        val skippedByLimit: Int
+        val skippedByLimit: Int,
+        val traces: List<Trace> = emptyList()
     )
 
     /**
@@ -49,6 +67,7 @@ class AgentPipeline(
         var classified = 0
         var skipped = 0
         var misses = 0
+        val traces = mutableListOf<Trace>()
 
         for (candidate in candidates) {
             val key = CardText.cacheKey(candidate.sourceKey, candidate.texts)
@@ -84,6 +103,19 @@ class AgentPipeline(
             classified++
             val verdict = CrossValidator.adjust(raw, candidate.viewIds)
 
+            traces.add(
+                Trace(
+                    sourceKey = candidate.sourceKey,
+                    chars = candidate.texts.sumOf { it.length },
+                    rawIsAd = raw.isAd,
+                    rawConfidence = raw.confidence,
+                    weakSignal = CrossValidator.hasWeakSignal(candidate.viewIds),
+                    finalConfidence = verdict.confidence,
+                    marked = CrossValidator.shouldMark(verdict),
+                    reason = verdict.reason
+                )
+            )
+
             runCatching {
                 verdictDao.upsert(
                     AdVerdict(
@@ -99,6 +131,6 @@ class AgentPipeline(
             if (CrossValidator.shouldMark(verdict)) regions.add(candidate.rect)
         }
 
-        return Result(regions, hits, classified, skipped)
+        return Result(regions, hits, classified, skipped, traces)
     }
 }

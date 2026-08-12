@@ -8,8 +8,10 @@ import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import com.senioradguard.BuildConfig
 import com.senioradguard.agent.AgentPipeline
 import com.senioradguard.agent.CandidateExtractor
+import com.senioradguard.agent.GeminiClassifier
 import com.senioradguard.agent.StubClassifier
 import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.guard.InstallGuard
@@ -98,10 +100,17 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private val extractor = CandidateExtractor()
 
     private val pipeline by lazy {
+        // 키가 없는 팀원도 빌드·실행이 되도록 스텁으로 물러난다. 판정 품질은
+        // 크게 다르지만 파이프라인 동작 자체는 같아서 개발에 지장이 없다.
+        val classifier = if (BuildConfig.GEMINI_API_KEY.isNotBlank()) {
+            GeminiClassifier(BuildConfig.GEMINI_API_KEY)
+        } else {
+            StubClassifier()
+        }
+        Log.i(TAG, "판별기=${classifier.source} (${classifier.javaClass.simpleName})")
         AgentPipeline(
             verdictDao = AppDatabase.getInstance(this).adVerdictDao(),
-            // 지금은 규칙 기반 대역. LLM을 붙일 때 이 줄만 바꾸면 된다.
-            classifier = StubClassifier()
+            classifier = classifier
         )
     }
 
@@ -229,6 +238,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 val result = pipeline.run(candidates)
                 // 유휴 1회에 한 줄. 이벤트마다가 아니라 스크롤이 멈췄을 때만 찍히므로
                 // 부담이 없고, 캐시가 실제로 듣는지 눈으로 볼 수 있는 유일한 창이다.
+                for (t in result.traces) {
+                    Log.i(
+                        TAG,
+                        "  A1 출처=${t.sourceKey} 글자수=${t.chars} " +
+                            "| A2 isAd=${t.rawIsAd} conf=${"%.2f".format(t.rawConfidence)} " +
+                            "| A4 신호=${t.weakSignal} conf=${"%.2f".format(t.finalConfidence)} " +
+                            "| 표시=${t.marked} :: ${t.reason.take(70)}"
+                    )
+                }
                 Log.i(
                     TAG,
                     "layer2 출처=${candidates.firstOrNull()?.sourceKey ?: "-"} " +

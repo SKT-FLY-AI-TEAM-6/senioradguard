@@ -7,7 +7,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.view.Choreographer
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.senioradguard.BuildConfig
@@ -397,15 +396,25 @@ class AdGuardAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 예약된 시각에 실행된다. 실제 스캔은 vsync 직후로 한 번 더 미뤄 앱이 프레임을
-     * 그리는 도중에 트리를 붙잡지 않게 한다.
+     * 예약된 시각에 스캔한다.
+     *
+     * 한때 여기서 Choreographer.postFrameCallback으로 vsync 직후까지 한 번 더
+     * 미뤘다. **그게 감지를 통째로 죽였다.** 우리 프로세스에는 보이는 창이 없어서
+     * 다른 앱을 보는 동안에는 프레임 콜백이 오지 않고, 콜백이 안 오니 스캔도 영영
+     * 실행되지 않았다. 실기기에서 확인한 증상:
+     *
+     *   우리 앱이 화면에 떠 있을 때        스캔 4건
+     *   크롬으로 막 전환한 직후            스캔 2건
+     *   크롬에서 20초 지난 뒤 스크롤       스캔 0건
+     *
+     * 정작 보호가 필요한 상황(다른 앱을 보는 중)에만 죽는 최악의 형태였다.
+     * 지연을 프레임 배수로 맞추는 것(frameAlignedDelay)은 그대로 두되, 실행은
+     * 핸들러에서 바로 한다.
      */
     private val scanRunnable = Runnable {
-        Choreographer.getInstance().postFrameCallback {
-            val root = rootInActiveWindow ?: return@postFrameCallback
-            if (root.packageName?.toString() !in targetApps) return@postFrameCallback
-            scanAsync(root)
-        }
+        val root = rootInActiveWindow ?: return@Runnable
+        if (root.packageName?.toString() !in targetApps) return@Runnable
+        scanAsync(root)
     }
 
     /**

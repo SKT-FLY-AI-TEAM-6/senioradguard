@@ -33,11 +33,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.senioradguard.detector.BlacklistUpdateWorker
-import com.senioradguard.notification.KakaoNotifier
 import com.senioradguard.service.AdGuardAccessibilityService
 import com.senioradguard.ui.BatteryOptimizationGuide
 import com.senioradguard.ui.ServiceStatus
+import com.senioradguard.remote.FirebaseRepo
+import com.senioradguard.remote.Role
+import com.senioradguard.ui.GuardianActivity
 import com.senioradguard.ui.SetupActivity
 import com.senioradguard.ui.theme.SeniorAdGuardTheme
 
@@ -54,11 +55,27 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        BlacklistUpdateWorker.schedule(applicationContext)
+        // TODO Phase 2 — 블랙리스트 워커 비활성화.
+        // 주 1회 14만 개 도메인을 받아 DB에 쓰지만 읽는 코드가 없다(AdDetector는
+        // 생성 지점이 없는 dead code). 다운로드·파싱·DB 전체 교체가 무거운데
+        // 얻는 게 없고, 배터리는 이 앱이 제조사 절전에 얼어붙는 원인이기도 하다.
+        // 파일(BlacklistUpdateWorker/BlacklistRepository)은 확장용으로 남겨둔다.
+        // BlacklistUpdateWorker.schedule(applicationContext)
 
-        // 최초 실행(보호자 미설정) 시 카카오 로그인/친구 선택 설정 화면으로 이동
-        if (!KakaoNotifier(this).isGuardianSet()) {
-            startActivity(Intent(this, SetupActivity::class.java))
+        // 역할을 아직 안 골랐으면 선택 화면으로, 보호자면 대시보드로 넘긴다.
+        // 이 화면(어르신 모드)은 접근성 서비스 상태를 다루므로 보호자에게는 의미가 없다.
+        when (FirebaseRepo.savedRole(this)) {
+            null -> {
+                startActivity(Intent(this, SetupActivity::class.java))
+                finish()
+                return
+            }
+            Role.GUARDIAN -> {
+                startActivity(Intent(this, GuardianActivity::class.java))
+                finish()
+                return
+            }
+            Role.SENIOR -> Unit   // 이 화면 그대로 사용
         }
 
         setContent {

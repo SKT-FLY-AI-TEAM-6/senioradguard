@@ -35,7 +35,7 @@ class OverlayManager(private val context: Context) {
     fun showWarning(
         message: String,
         packageName: String,
-        onConfirm: () -> Unit,   // "무시하기" — 사용자가 계속 진행
+        onConfirm: () -> Unit,   // "그냥 보기" — 사용자가 계속 진행
         onBlock: () -> Unit,     // "뒤로 가기" 1단계 — GLOBAL_ACTION_BACK
         currentForegroundPackage: () -> String?,
         onForceHome: () -> Unit  // "뒤로 가기" 2단계 — GLOBAL_ACTION_HOME
@@ -135,9 +135,11 @@ class OverlayManager(private val context: Context) {
             }
         }
 
-        // "무시하기" 버튼 (회색 — 덜 강조)
+        // "그냥 보기" 버튼 (회색 — 덜 강조).
+        // "무시하기"는 무엇을 무시하는지가 모호해 노인 사용자가 멈칫한다.
+        // 실제로 하는 일("경고를 닫고 그대로 본다")을 그대로 적는다.
         val confirmBtn = Button(context).apply {
-            text = "무시하기"
+            text = "그냥 보기"
             textSize = 18f
             setTextColor(0xFF888888.toInt())
             setBackgroundColor(0xFF333333.toInt())

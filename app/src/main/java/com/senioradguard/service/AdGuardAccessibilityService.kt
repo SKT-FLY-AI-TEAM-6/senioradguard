@@ -174,7 +174,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
     // TYPE_ACCESSIBILITY_OVERLAY 창은 접근성 서비스 자신의 컨텍스트로 추가해야 한다.
     // applicationContext를 쓰면 창 토큰이 없어 addView가 BadTokenException으로 죽는다
     // ("token null is not valid") — 광고를 감지하는 순간마다 앱이 크래시한다.
-    private val borderOverlay by lazy { AdBorderOverlay(this) }
+    private val borderOverlay by lazy {
+        AdBorderOverlay(this).apply { onCloseAllAds = ::closeAllAds }
+    }
 
     // Layer 3의 경고창은 TYPE_APPLICATION_OVERLAY(SYSTEM_ALERT_WINDOW)라 창 토큰이
     // 필요 없다. 위 테두리 오버레이와 달리 applicationContext로 붙여도 안전하다.
@@ -448,12 +450,80 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     private fun applyLayer1(regions: List<Rect>) = apply(regions, emptyList())
 
+    /**
+     * "광고 모두 닫기" — 표시 중인 각 광고 영역에서 닫기(X) 버튼을 찾아 누른다.
+     *
+     * 사용자가 직접 누른 버튼에 대한 응답이다. 앱이 알아서 광고를 없애는 게 아니라,
+     * 작은 X를 찾아 누르기 어려운 사람을 대신해 그 동작을 수행한다.
+     *
+     * 하나도 못 찾으면 뒤로 가기로 물러난다 — 전면 광고는 X가 접근성 트리에
+     * 없거나 이미지로만 그려져 있는 경우가 흔하다.
+     */
+    private fun closeAllAds() {
+        val root = rootInActiveWindow ?: run {
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            return
+        }
+        val targets = confirmedRegions + aiRegions
+        var closed = 0
+        for (region in targets) {
+            val x = findCloseButton(root, region, 0) ?: continue
+            if (x.performAction(AccessibilityNodeInfo.ACTION_CLICK)) closed++
+        }
+        Log.i(TAG, "광고 모두 닫기: 영역 ${targets.size}개 중 $closed 개 닫음")
+
+        if (closed == 0) performGlobalAction(GLOBAL_ACTION_BACK)
+        // 닫은 뒤 화면이 바뀌므로 곧 CONTENT_CHANGED가 오고 표시가 갱신된다
+    }
+
+    /**
+     * region 안에서 닫기 버튼으로 보이는 클릭 가능한 노드를 찾는다.
+     *
+     * 광고의 X는 텍스트가 없고 contentDescription이나 viewId로만 정체를 드러내는
+     * 경우가 대부분이라 둘 다 본다. 또 광고 영역 전체를 누르면 광고를 클릭하는
+     * 셈이 되므로, **작은 노드만** 후보로 삼는다.
+     */
+    private fun findCloseButton(
+        node: AccessibilityNodeInfo,
+        region: Rect,
+        depth: Int
+    ): AccessibilityNodeInfo? {
+        if (depth > CLOSE_SEARCH_DEPTH) return null
+
+        val bounds = Rect().also { node.getBoundsInScreen(it) }
+        // 이 가지가 광고 영역과 아예 겹치지 않으면 더 볼 필요가 없다
+        if (!Rect.intersects(bounds, region)) return null
+
+        if (node.isClickable && node.isVisibleToUser && isCloseSized(bounds) && looksLikeClose(node)) {
+            return node
+        }
+        for (i in 0 until node.childCount) {
+            findCloseButton(node.getChild(i) ?: continue, region, depth + 1)?.let { return it }
+        }
+        return null
+    }
+
+    /** 닫기 버튼은 작다. 큰 노드는 광고 본체이므로 누르면 안 된다. */
+    private fun isCloseSized(b: Rect): Boolean {
+        val max = (CLOSE_MAX_DP * resources.displayMetrics.density).toInt()
+        return b.width() in 1..max && b.height() in 1..max
+    }
+
+    private fun looksLikeClose(node: AccessibilityNodeInfo): Boolean {
+        val text = "${node.text ?: ""} ${node.contentDescription ?: ""}".lowercase()
+        if (CLOSE_TEXTS.any { it in text }) return true
+
+        val id = node.viewIdResourceName?.lowercase() ?: return false
+        return id.split(Regex("[^a-z0-9]+")).any { it in CLOSE_ID_TOKENS }
+    }
+
     /** 스크롤 중 표시를 걷어낸다. 스캔 없이 두면 테두리가 엉뚱한 자리를 가리킨다. */
     private fun clearMarks() {
         if (confirmedRegions.isEmpty() && !aiMarksShown) return
         borderOverlay.show(AdMarkStyle.CONFIRMED, emptyList())
         borderOverlay.show(AdMarkStyle.AI_GUESS, emptyList())
         confirmedRegions = emptyList()
+        aiRegions = emptyList()
         aiMarksShown = false
     }
 
@@ -466,6 +536,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         aiMarksShown = guessed.isNotEmpty()
 
         confirmedRegions = confirmed
+        aiRegions = guessed
         scheduleLayer2()
     }
 
@@ -483,6 +554,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     /** AI 점선이 지금 떠 있는가. 스크롤 시작 시 걷어낼지 판단하는 데만 쓴다. */
     private var aiMarksShown = false
+
+    /** 지금 점선으로 표시 중인 영역. "광고 모두 닫기"가 대상으로 쓴다. */
+    private var aiRegions: List<Rect> = emptyList()
 
     private val runLayer2 = Runnable {
         if (!isAiEnabled()) return@Runnable
@@ -520,6 +594,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
                     if (generation == screenGeneration) {
                         borderOverlay.show(AdMarkStyle.AI_GUESS, result.regions)
                         aiMarksShown = result.regions.isNotEmpty()
+                        aiRegions = result.regions
                     }
                 }
             } finally {
@@ -559,6 +634,20 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "AdGuard"
+
+        /** 닫기 버튼 탐색 깊이. 광고 카드 안쪽이라 아주 깊지 않다. */
+        private const val CLOSE_SEARCH_DEPTH = 25
+
+        /** 이보다 큰 노드는 닫기 버튼이 아니라 광고 본체로 본다 (dp). */
+        private const val CLOSE_MAX_DP = 72
+
+        private val CLOSE_TEXTS = setOf(
+            "닫기", "광고 닫기", "close", "dismiss", "skip ad", "광고 건너뛰기", "✕", "×"
+        )
+
+        private val CLOSE_ID_TOKENS = setOf(
+            "close", "dismiss", "btnclose", "closebutton", "adclose", "cancel", "skip"
+        )
 
         /**
          * 예측된 정지 시각에 조금 더 얹는 여유. 스크롤이 멎어도 앱이 마지막 항목을

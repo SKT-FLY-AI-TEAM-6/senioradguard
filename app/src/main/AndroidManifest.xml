@@ -15,11 +15,6 @@
          이유로 프로세스를 얼려(FZ) 접근성 이벤트 처리가 조용히 멈춘다. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
-    <!-- Android 11+ 패키지 가시성: 카카오톡 설치 여부 확인용 -->
-    <queries>
-        <package android:name="com.kakao.talk" />
-    </queries>
-
     <application
         android:name=".SeniorAdGuardApp"
         android:allowBackup="true"
@@ -39,22 +34,11 @@
             </intent-filter>
         </activity>
 
-        <!-- 설정 화면 (보호자 카카오 연동) -->
+        <!-- 최초 실행 시 역할(어르신/보호자) 선택 화면 -->
         <activity android:name=".ui.SetupActivity" />
 
-        <!-- 카카오 계정 로그인(웹) 리다이렉트 처리 -->
-        <activity
-            android:name="com.kakao.sdk.auth.AuthCodeHandlerActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data
-                    android:host="oauth"
-                    android:scheme="kakao${KAKAO_NATIVE_APP_KEY}" />
-            </intent-filter>
-        </activity>
+        <!-- 보호자 모드 — 차단 내역 대시보드 -->
+        <activity android:name=".ui.GuardianActivity" />
 
         <!-- 핵심: 광고 감지 서비스 -->
         <service

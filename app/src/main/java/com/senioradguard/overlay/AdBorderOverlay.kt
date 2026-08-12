@@ -32,6 +32,12 @@ enum class AdMarkStyle { CONFIRMED, AI_GUESS }
  */
 class AdBorderOverlay(private val context: Context) {
 
+    /**
+     * "광고 모두 닫기"를 눌렀을 때 실행할 동작. 서비스가 넣어준다.
+     * null이면 버튼을 띄우지 않는다.
+     */
+    var onCloseAllAds: (() -> Unit)? = null
+
     private val windowManager by lazy {
         context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     }
@@ -41,6 +47,15 @@ class AdBorderOverlay(private val context: Context) {
     private val handler = Handler(Looper.getMainLooper())
 
     private var overlay: FrameLayout? = null
+
+    /**
+     * 닫기 버튼은 **별도 창**이다. 테두리 창은 FLAG_NOT_TOUCHABLE이라 창 전체가
+     * 터치를 통과시키므로 그 안에 버튼을 넣으면 눌리지 않는다. 구글 정책상 광고
+     * 위를 덮는 테두리는 터치를 막으면 안 되고, 반대로 버튼은 터치를 받아야 하니
+     * 두 창을 분리하는 것 말고는 방법이 없다.
+     */
+    private var closeBar: LinearLayout? = null
+
     private val shown = mutableMapOf<AdMarkStyle, List<Rect>>()
 
     private fun dp(v: Int) = (v * context.resources.displayMetrics.density).toInt()
@@ -54,6 +69,7 @@ class AdBorderOverlay(private val context: Context) {
 
         if (shown.values.all { it.isEmpty() }) {
             removeOverlay()
+            removeCloseBar()
             return
         }
 
@@ -62,7 +78,10 @@ class AdBorderOverlay(private val context: Context) {
             if (prefs.getBoolean("sound", true)) beep()
             if (prefs.getBoolean("vibe", true)) vibrate()
         }
-        if (prefs.getBoolean("visual", true)) render()
+        if (prefs.getBoolean("visual", true)) {
+            render()
+            showCloseBar()
+        }
     }
 
     fun clear(style: AdMarkStyle) = show(style, emptyList())
@@ -70,6 +89,57 @@ class AdBorderOverlay(private val context: Context) {
     fun dismissAll() {
         shown.clear()
         removeOverlay()
+        removeCloseBar()
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // 광고 모두 닫기 버튼 (터치를 받는 별도 창)
+    // ──────────────────────────────────────────────────────────
+
+    private fun showCloseBar() {
+        val action = onCloseAllAds ?: return
+        if (closeBar != null) return
+
+        val button = TextView(context).apply {
+            text = "✕  광고 모두 닫기"
+            textSize = 19f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(22), dp(14), dp(22), dp(14))
+            background = GradientDrawable().apply {
+                setColor(Color.argb(235, 33, 33, 33))
+                cornerRadius = dp(26).toFloat()
+                setStroke(dp(2), Color.parseColor("#FF5722"))
+            }
+            setOnClickListener { action() }
+        }
+
+        val bar = LinearLayout(context).apply {
+            gravity = Gravity.CENTER
+            addView(button)
+        }
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            // FLAG_NOT_TOUCHABLE을 주지 않는다 — 이 창은 눌려야 한다.
+            // 대신 FLAG_NOT_FOCUSABLE로 키보드·뒤로가기는 아래 앱이 계속 받는다.
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = dp(90)
+        }
+
+        runCatching { windowManager.addView(bar, params) }
+            .onSuccess { closeBar = bar }
+    }
+
+    private fun removeCloseBar() {
+        closeBar?.let { runCatching { windowManager.removeView(it) } }
+        closeBar = null
     }
 
     private fun removeOverlay() {

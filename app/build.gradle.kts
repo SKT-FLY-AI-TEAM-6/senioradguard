@@ -7,12 +7,24 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
-// local.properties에서 카카오 네이티브 앱 키를 읽어 BuildConfig/manifest에 주입 (버전 관리 제외)
+// local.properties에서 키를 읽어 BuildConfig에 주입 (버전 관리 제외)
 val localProperties = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) file.inputStream().use { load(it) }
 }
-val kakaoNativeAppKey: String = localProperties.getProperty("KAKAO_NATIVE_APP_KEY", "")
+
+/**
+ * google-services 플러그인은 google-services.json이 없으면 빌드를 실패시킨다.
+ * 팀원이 파일 없이도 빌드할 수 있어야 하므로 파일이 있을 때만 적용한다.
+ * 파일이 없으면 Firebase가 초기화되지 않고, FirebaseRepo가 그 상태를 감지해
+ * 모든 호출을 무시한다(앱은 정상 동작, 원격 기록만 안 됨).
+ */
+val hasGoogleServices = file("google-services.json").exists()
+if (hasGoogleServices) {
+    apply(plugin = "com.google.gms.google-services")
+} else {
+    logger.warn("google-services.json이 없어 Firebase를 비활성화한 채 빌드합니다.")
+}
 
 // Layer 2 판별용 Gemini 키. 비어 있으면 앱이 StubClassifier로 물러나므로,
 // 키가 없는 팀원도 빌드와 실행에는 문제가 없다.
@@ -36,9 +48,8 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        buildConfigField("String", "KAKAO_NATIVE_APP_KEY", "\"$kakaoNativeAppKey\"")
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
-        manifestPlaceholders["KAKAO_NATIVE_APP_KEY"] = kakaoNativeAppKey
+        buildConfigField("Boolean", "HAS_FIREBASE", "$hasGoogleServices")
     }
 
     buildTypes {
@@ -81,9 +92,10 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     testImplementation(libs.kotlinx.coroutines.test)
 
-    // 카카오 SDK
-    implementation("com.kakao.sdk:v2-user:2.24.0")
-    implementation("com.kakao.sdk:v2-friend:2.24.0")
+    // Firebase — 보호자 모드 실시간 동기화 (google-services.json이 있을 때만 실제 동작)
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.database.ktx)
+    implementation(libs.firebase.messaging.ktx)
 
     // 코루틴
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")

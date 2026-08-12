@@ -3,9 +3,11 @@ package com.senioradguard.service
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.graphics.Rect
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Choreographer
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.senioradguard.BuildConfig
@@ -26,6 +28,109 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * 스크롤이 언제 멈출지 예측한다.
+ *
+ * VelocityTracker는 쓸 수 없다 — MotionEvent를 먹는 물건인데 접근성 서비스는
+ * MotionEvent를 받지 않는다. 대신 TYPE_VIEW_SCROLLED가 주는 스크롤 델타와
+ * 이벤트 도착 시각으로 직접 px/ms 속도를 구한다.
+ *
+ * 안드로이드 플링은 마찰로 지수 감쇠한다(v = v0·e^(-t/τ)). 그래서 남은 시간은
+ * τ·ln(v0 / v멈춤)으로 추정한다. 정확한 물리 재현이 목적이 아니라 "지금 스캔하면
+ * 헛일이고 대략 언제쯤 화면이 멎는가"만 알면 되므로 이 정도로 충분하다.
+ */
+internal class ScrollStopPredictor(private val now: () -> Long = System::currentTimeMillis) {
+
+    private companion object {
+        /** 플링 감쇠 시간상수. 실기기 플링이 대략 이 정도로 잦아든다. */
+        const val TAU_MS = 180.0
+
+        /** 이 속도 아래면 멈춘 것으로 본다 (≈20px/s). */
+        const val STOP_VELOCITY = 0.02
+
+        /** 속도 추정에 쓰는 지수이동평균 계수. 튀는 이벤트 하나에 흔들리지 않게. */
+        const val EMA_ALPHA = 0.5
+
+        /** 이 시간 넘게 스크롤 이벤트가 없으면 스크롤 상황이 아니라고 본다. */
+        const val SCROLL_IDLE_MS = 250L
+
+        /**
+         * 이동량을 알 수 없을 때, 마지막 스크롤 이벤트로부터 이만큼 지나야 멎은
+         * 것으로 본다. 크롬처럼 스크롤 위치를 안 주는 앱에서 쓰인다.
+         */
+        const val UNKNOWN_SETTLE_MS = 150L
+    }
+
+    private var velocity = 0.0          // px/ms
+    private var velocityKnown = false
+    private var lastEventAt = 0L
+
+    /**
+     * @param deltaPx 이번 이벤트의 스크롤 이동량(부호 무시).
+     *   **null은 "이동량을 알 수 없음"이고 0과 다르다.** 크롬을 비롯한 여러 앱이
+     *   스크롤 위치를 -1로 주기 때문에 이동량을 모르는 경우가 흔한데, 이걸 0으로
+     *   뭉뚱그리면 "멈췄다"로 잘못 읽혀 스크롤 도중에 스캔이 나간다.
+     *   모를 때는 속도 없이 "스크롤 중"이라는 사실만 기록한다.
+     */
+    fun record(deltaPx: Int?) {
+        val t = now()
+        val dt = t - lastEventAt
+        val fresh = lastEventAt != 0L && dt in 1..SCROLL_IDLE_MS
+        lastEventAt = t
+
+        if (deltaPx == null) {
+            velocityKnown = false
+            return
+        }
+        if (!fresh) {
+            // 첫 이벤트이거나 한참 만에 온 이벤트는 속도를 낼 근거가 없다
+            velocity = 0.0
+            velocityKnown = false
+            return
+        }
+        velocityKnown = true
+        // 이동량 0은 "안 움직였다"는 확실한 신호다. EMA로 서서히 줄이면 절반씩
+        // 깎이느라 정지 인식이 100ms 넘게 늦는다. 곧바로 멈춘 것으로 본다.
+        velocity = if (deltaPx == 0) {
+            0.0
+        } else {
+            EMA_ALPHA * (kotlin.math.abs(deltaPx) / dt.toDouble()) + (1 - EMA_ALPHA) * velocity
+        }
+    }
+
+    /** 방금까지 스크롤 이벤트가 오고 있었는가 (이동량을 몰라도 판단 가능). */
+    fun isScrollActive(): Boolean =
+        lastEventAt != 0L && now() - lastEventAt <= SCROLL_IDLE_MS
+
+    /** 화면이 실제로 움직이는 중인가. 표시를 걷어낼지 판단하는 데 쓴다. */
+    fun isScrolling(): Boolean =
+        isScrollActive() && (!velocityKnown || velocity > STOP_VELOCITY)
+
+    /**
+     * 지금부터 스크롤이 멎기까지 남은 시간(ms). 멈췄으면 0.
+     *
+     * 속도를 알면 감쇠 모델로 계산하고, 모르면 마지막 스크롤 이벤트로부터
+     * 일정 시간이 지나야 멎은 것으로 본다. 어느 쪽이든 새 스크롤 이벤트가 올
+     * 때마다 다시 계산되므로, 결과적으로 "마지막 스크롤 뒤 한 번"만 훑게 된다.
+     */
+    fun predictStopDelayMs(): Long {
+        if (!isScrollActive()) return 0
+        val elapsed = now() - lastEventAt
+
+        if (!velocityKnown) return (UNKNOWN_SETTLE_MS - elapsed).coerceAtLeast(0)
+        if (velocity <= STOP_VELOCITY) return 0
+
+        val remaining = TAU_MS * kotlin.math.ln(velocity / STOP_VELOCITY)
+        return (remaining - elapsed).toLong().coerceAtLeast(0)
+    }
+
+    fun reset() {
+        velocity = 0.0
+        velocityKnown = false
+        lastEventAt = 0L
+    }
+}
 
 /**
  * 단일 진입점. 이벤트를 받아 루트 노드를 한 번만 가져오고 각 레이어에 배분한다.
@@ -97,6 +202,29 @@ class AdGuardAccessibilityService : AccessibilityService() {
     /** Layer 2 진행 중 플래그. 판별은 왕복이 길어 겹쳐 돌면 호출만 늘어난다. */
     private val classifying = AtomicBoolean(false)
 
+    private val scrollPredictor = ScrollStopPredictor()
+
+    /** API 28 미만에서 스크롤 이동량을 위치 차이로 구하기 위한 직전 위치. */
+    private var lastScrollY = 0
+
+    /** 마지막으로 예약한 지연. 로그에만 쓴다. */
+    private var pendingScanDelay = 0L
+
+    /**
+     * 최적화 효과 계측. 예전에는 화면 변경 이벤트 하나에 스캔 하나였으므로,
+     * "이번 스캔이 이벤트 몇 개를 모았는가"가 곧 줄인 스캔 수다.
+     */
+    private var scanCount = 0
+    private var lastScanAt = 0L
+    private var eventsSinceScan = 0
+
+    /**
+     * 그중 화면 변경 이벤트만 따로. 예전 코드는 이 이벤트 하나에 스캔 하나였으므로
+     * 이 수가 곧 "예전이었다면 났을 스캔 수"다.
+     */
+    private var contentEventsSinceScan = 0
+    private var contentEventsTotal = 0
+
     private val extractor = CandidateExtractor()
 
     private val pipeline by lazy {
@@ -135,7 +263,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 실제로 쓰는 세 종류만 남긴다 (VIEW_CLICKED는 Layer 3용).
             eventTypes = AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
-                AccessibilityEvent.TYPE_VIEW_CLICKED
+                AccessibilityEvent.TYPE_VIEW_CLICKED or
+                // 스크롤 속도를 재려고 추가. 이 이벤트로는 스캔하지 않고 예측만 한다.
+                AccessibilityEvent.TYPE_VIEW_SCROLLED
             // 시스템 단계에서 걸러 우리 프로세스를 아예 깨우지 않는다.
             packageNames = (targetApps + storePackages).toTypedArray()
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
@@ -169,8 +299,111 @@ class AdGuardAccessibilityService : AccessibilityService() {
             return
         }
 
-        val root = rootInActiveWindow ?: return
-        scanAsync(root)
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            scrollPredictor.record(scrollDeltaOf(event))
+            if (scrollPredictor.isScrolling()) {
+                // 스크롤 중에는 표시를 지운다. 스캔 없이 남겨두면 테두리가 제자리에
+                // 멈춰 엉뚱한 카드를 가리키게 된다 — 광고가 아닌 것을 광고로 표시하는
+                // 쪽이 잠깐 안 보이는 것보다 나쁘다.
+                //
+                // (직전 영역을 스크롤 델타만큼 평행이동하는 방법도 검토했으나 버렸다.
+                //  고정 헤더·하단 배너는 따라 움직이지 않아 그것들이 어긋난다.)
+                clearMarks()
+            }
+            scheduleScan()
+            return
+        }
+
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            contentEventsSinceScan++
+            contentEventsTotal++
+        }
+        scheduleScan()
+    }
+
+    /**
+     * API 28+는 스크롤 이동량을 직접 준다. 그 아래는 스크롤 위치(scrollY)의 변화로
+     * 대신하고, 그마저 없으면(크롬을 포함해 여러 앱이 -1을 준다) **null**을 돌린다.
+     * 0을 돌리면 "안 움직였다"로 읽혀 스크롤 도중에 스캔이 나가버린다.
+     */
+    private fun scrollDeltaOf(event: AccessibilityEvent): Int? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && event.scrollDeltaY != 0) {
+            return event.scrollDeltaY
+        }
+        val y = event.scrollY
+        if (y < 0) return null          // 이동량을 알 수 없음 (0과 구분해야 한다)
+        val delta = y - lastScrollY
+        lastScrollY = y
+        return delta
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // 스캔 스케줄링 — 언제 훑을지
+    // ──────────────────────────────────────────────────────────
+
+    /**
+     * 다음 스캔을 예약한다. 이미 예약된 게 있으면 취소하고 다시 잡는다.
+     *
+     * 예전에는 CONTENT_CHANGED가 올 때마다 그 자리에서 전체 트리를 훑었다.
+     * 스크롤 한 번에 이벤트가 수십 개 오므로 그만큼 헛스캔이 났다. 지금은
+     * **스크롤이 멎을 시점을 예측해 그때 한 번만** 훑는다.
+     */
+    private fun scheduleScan() {
+        eventsSinceScan++
+        val predicted = scrollPredictor.predictStopDelayMs()
+        // 예측이 0이면 이미 멈춘 상황이다. 그래도 곧바로 훑지 않고 한두 프레임
+        // 모아서 처리한다 — 화면 하나 바뀔 때 CONTENT_CHANGED가 여러 번 온다.
+        val target = (if (predicted > 0) predicted + SETTLE_MS else 0)
+            .coerceIn(MIN_SCAN_DELAY_MS, MAX_SCAN_DELAY_MS)
+        // 스크롤 이벤트가 올 때마다 이 값이 다시 계산되고 예약이 갱신되므로,
+        // 결과적으로 "마지막 스크롤 이후 한 번"만 훑는다.
+
+        pendingScanDelay = target
+        handler.removeCallbacks(scanRunnable)
+        handler.postDelayed(scanRunnable, frameAlignedDelay(target))
+    }
+
+    /**
+     * 지연 시간을 프레임 경계에 맞춰 올림한다. 기기의 실제 주사율을 읽어 계산하므로
+     * 60Hz면 16.7ms, 120Hz면 8.3ms 단위가 된다.
+     *
+     * refreshRate는 DisplayMetrics가 아니라 Display에 있다.
+     */
+    private fun frameAlignedDelay(delayMs: Long): Long {
+        val interval = frameIntervalMs
+        if (interval <= 0f) return delayMs
+        val frames = kotlin.math.ceil(delayMs / interval).toInt().coerceAtLeast(1)
+        return (frames * interval).toLong()
+    }
+
+    /**
+     * 기기 주사율에서 계산한 프레임 간격.
+     *
+     * Context.getDisplay()를 쓰면 안 된다. 서비스는 화면에 연결된 컨텍스트가 아니라
+     * API 30+에서 UnsupportedOperationException을 던지고, 접근성 서비스가 통째로
+     * 죽는다(실기기에서 dumpsys accessibility의 Crashed services에 올라갔다).
+     * 화면과 무관한 컨텍스트에서 디스플레이를 얻는 정식 경로는 DisplayManager다.
+     */
+    private val frameIntervalMs: Float by lazy {
+        val hz = runCatching {
+            val dm = getSystemService(DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+            dm.getDisplay(android.view.Display.DEFAULT_DISPLAY)?.refreshRate ?: 60f
+        }.getOrDefault(60f)
+        val interval = if (hz > 1f) 1000f / hz else 1000f / 60f
+        Log.i(TAG, "주사율=${"%.1f".format(hz)}Hz 프레임간격=${"%.2f".format(interval)}ms")
+        interval
+    }
+
+    /**
+     * 예약된 시각에 실행된다. 실제 스캔은 vsync 직후로 한 번 더 미뤄 앱이 프레임을
+     * 그리는 도중에 트리를 붙잡지 않게 한다.
+     */
+    private val scanRunnable = Runnable {
+        Choreographer.getInstance().postFrameCallback {
+            val root = rootInActiveWindow ?: return@postFrameCallback
+            if (root.packageName?.toString() !in targetApps) return@postFrameCallback
+            scanAsync(root)
+        }
     }
 
     /**
@@ -179,6 +412,20 @@ class AdGuardAccessibilityService : AccessibilityService() {
      */
     private fun scanAsync(root: AccessibilityNodeInfo) {
         if (!scanning.compareAndSet(false, true)) return
+
+        val startedAt = System.currentTimeMillis()
+        scanCount++
+        Log.i(
+            TAG,
+            "scan #$scanCount 모은이벤트=$eventsSinceScan " +
+                "(구방식스캔=$contentEventsSinceScan, 누적=$contentEventsTotal) " +
+                "(직전 +${if (lastScanAt == 0L) 0 else startedAt - lastScanAt}ms, " +
+                "예약지연=${pendingScanDelay}ms)"
+        )
+        lastScanAt = startedAt
+        eventsSinceScan = 0
+        contentEventsSinceScan = 0
+
         scope.launch {
             try {
                 val confirmed = scanner.scan(root)
@@ -201,12 +448,22 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     private fun applyLayer1(regions: List<Rect>) = apply(regions, emptyList())
 
+    /** 스크롤 중 표시를 걷어낸다. 스캔 없이 두면 테두리가 엉뚱한 자리를 가리킨다. */
+    private fun clearMarks() {
+        if (confirmedRegions.isEmpty() && !aiMarksShown) return
+        borderOverlay.show(AdMarkStyle.CONFIRMED, emptyList())
+        borderOverlay.show(AdMarkStyle.AI_GUESS, emptyList())
+        confirmedRegions = emptyList()
+        aiMarksShown = false
+    }
+
     private fun apply(confirmed: List<Rect>, guessed: List<Rect>) {
         handler.removeCallbacks(recheck)
         if (confirmed.isNotEmpty() || guessed.isNotEmpty()) handler.postDelayed(recheck, 1000)
 
         borderOverlay.show(AdMarkStyle.CONFIRMED, confirmed)
         borderOverlay.show(AdMarkStyle.AI_GUESS, guessed)
+        aiMarksShown = guessed.isNotEmpty()
 
         confirmedRegions = confirmed
         scheduleLayer2()
@@ -223,6 +480,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
      */
     private var screenGeneration = 0
     private var confirmedRegions: List<Rect> = emptyList()
+
+    /** AI 점선이 지금 떠 있는가. 스크롤 시작 시 걷어낼지 판단하는 데만 쓴다. */
+    private var aiMarksShown = false
 
     private val runLayer2 = Runnable {
         if (!isAiEnabled()) return@Runnable
@@ -250,7 +510,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 Log.i(
                     TAG,
                     "layer2 출처=${candidates.firstOrNull()?.sourceKey ?: "-"} " +
-                        "후보=${candidates.size} 캐시=${result.cacheHits} " +
+                        "후보=${candidates.size} 델타생략=${result.memoHits} " +
+                        "캐시=${result.cacheHits} " +
                         "판별=${result.classified} 보류=${result.skippedByLimit} " +
                         "표시=${result.regions.size}"
                 )
@@ -258,6 +519,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
                     // 결과가 늦게 왔고 그 사이 화면이 바뀌었으면 버린다
                     if (generation == screenGeneration) {
                         borderOverlay.show(AdMarkStyle.AI_GUESS, result.regions)
+                        aiMarksShown = result.regions.isNotEmpty()
                     }
                 }
             } finally {
@@ -288,6 +550,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         isConnected = false
         handler.removeCallbacks(recheck)
         handler.removeCallbacks(runLayer2)
+        handler.removeCallbacks(scanRunnable)
         scope.cancel()
         borderOverlay.dismissAll()
         overlayManager.dismiss()
@@ -296,6 +559,21 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "AdGuard"
+
+        /**
+         * 예측된 정지 시각에 조금 더 얹는 여유. 스크롤이 멎어도 앱이 마지막 항목을
+         * 채워 넣는 시간이 있어, 딱 맞춰 훑으면 반쯤 그려진 화면을 본다.
+         */
+        private const val SETTLE_MS = 80L
+
+        /** 예약 지연의 하한. 화면 하나 바뀔 때 오는 이벤트 여러 개를 모으는 용도. */
+        private const val MIN_SCAN_DELAY_MS = 32L
+
+        /**
+         * 예약 지연의 상한. 예측이 빗나가도(감쇠 모델과 다르게 움직이는 스크롤,
+         * 손가락을 대고 천천히 끄는 경우) 이 시간 안에는 반드시 한 번 훑는다.
+         */
+        private const val MAX_SCAN_DELAY_MS = 600L
 
         /** 스크롤이 이만큼 멈춰 있어야 Layer 2를 돌린다. */
         private const val LAYER2_IDLE_MS = 600L

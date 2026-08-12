@@ -25,6 +25,30 @@ class AgentPipeline(
 
         /** 판정 유효기간. 광고는 교체되므로 오래된 판정은 버린다. */
         const val TTL_MS = 30L * 24 * 60 * 60 * 1000
+
+        /**
+         * 이번 세션에서 이미 판정이 끝난 카드를 기억하는 크기. 한 화면의 카드는
+         * 5~15개이므로 몇 화면분을 담고도 남는다.
+         */
+        const val MEMO_CAPACITY = 256
+    }
+
+    /**
+     * 델타 스캔 — 이미 판정이 끝난 카드는 다시 다루지 않는다.
+     *
+     * 캐시만 조회하는 패스는 화면이 바뀔 때마다 돈다. 그때마다 카드 수만큼 DB를
+     * 읽으면, 스크롤하는 내내 같은 카드를 계속 다시 읽는 셈이다. 카드 지문
+     * (출처 + 텍스트 해시 = CardText.cacheKey)으로 판정 결과를 메모리에 들고
+     * 있다가 그대로 돌려준다.
+     *
+     * 지문이 텍스트 기반이라 같은 카드가 스크롤로 위치만 바뀌면 같은 키가 되고,
+     * 새로 화면에 들어온 카드만 자연히 DB·판별기로 넘어간다.
+     *
+     * accessOrder=true인 LinkedHashMap이라 최근 쓴 것이 남는 LRU다.
+     */
+    private val memo = object : LinkedHashMap<String, Boolean>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>) =
+            size > MEMO_CAPACITY
     }
 
     /**
@@ -49,6 +73,8 @@ class AgentPipeline(
         val cacheHits: Int,
         val classified: Int,
         val skippedByLimit: Int,
+        /** 이미 판정한 카드라 DB 조회조차 생략한 수 (델타 스캔 효과) */
+        val memoHits: Int = 0,
         val traces: List<Trace> = emptyList()
     )
 
@@ -67,17 +93,30 @@ class AgentPipeline(
         var classified = 0
         var skipped = 0
         var misses = 0
+        var memoHits = 0
         val traces = mutableListOf<Trace>()
 
         for (candidate in candidates) {
             val key = CardText.cacheKey(candidate.sourceKey, candidate.texts)
 
+            // 이번 세션에서 이미 판정한 카드 — DB도 건드리지 않는다.
+            // 단 새 판별을 허용하는 패스(유휴 1회)에서는 기억을 건너뛰고 DB를 다시
+            // 읽는다. 기억이 만료·삭제를 못 보고 굳는 것을 그때 바로잡는다.
+            // (기억을 통째로 비우지는 않는다. 유휴 패스가 자주 도는 탓에 비우면
+            //  스크롤 중 빠른 경로가 매번 사라져 델타 스캔이 무의미해진다.)
+            val remembered = if (allowClassify) null else memo[key]
+            if (remembered != null) {
+                memoHits++
+                if (remembered) regions.add(candidate.rect)
+                continue
+            }
+
             val cached = runCatching { verdictDao.find(key, notBefore) }.getOrNull()
             if (cached != null) {
                 hits++
-                if (cached.isAd && cached.confidence >= CrossValidator.THRESHOLD) {
-                    regions.add(candidate.rect)
-                }
+                val mark = cached.isAd && cached.confidence >= CrossValidator.THRESHOLD
+                memo[key] = mark
+                if (mark) regions.add(candidate.rect)
                 continue
             }
 
@@ -128,9 +167,11 @@ class AgentPipeline(
                 )
             }
 
-            if (CrossValidator.shouldMark(verdict)) regions.add(candidate.rect)
+            val mark = CrossValidator.shouldMark(verdict)
+            memo[key] = mark
+            if (mark) regions.add(candidate.rect)
         }
 
-        return Result(regions, hits, classified, skipped, traces)
+        return Result(regions, hits, classified, skipped, memoHits, traces)
     }
 }

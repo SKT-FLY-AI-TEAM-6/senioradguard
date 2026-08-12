@@ -182,6 +182,77 @@ class AgentPipelineTest {
         assertEquals(2, classifier.calls)
     }
 
+    // ── 델타 스캔 (세션 메모) ─────────────────────────────────
+
+    // 캐시만 보는 패스는 화면이 바뀔 때마다 도는데, 그때마다 DB를 다시 읽으면
+    // 스크롤 내내 같은 카드를 계속 조회하게 된다
+    @Test
+    fun `캐시 전용 패스를 반복하면 DB를 다시 읽지 않는다`() = runTest {
+        val dao = FakeVerdictDao()
+        val classifier = CountingClassifier(Verdict(true, 0.9f, "x"))
+        val pipeline = pipeline(dao, classifier)
+        val cards = listOf(candidate("무료 배송 이벤트"))
+
+        pipeline.run(cards)                       // 판별 + 저장 (여기서 기억도 채워진다)
+        dao.findCount = 0
+
+        val first = pipeline.run(cards, allowClassify = false)
+        val second = pipeline.run(cards, allowClassify = false)
+        val third = pipeline.run(cards, allowClassify = false)
+
+        assertEquals("판별 패스가 기억을 채워 DB를 아예 읽지 않는다", 0, dao.findCount)
+        assertEquals(1, first.memoHits)
+        assertEquals(1, second.memoHits)
+        assertEquals(1, third.memoHits)
+    }
+
+    @Test
+    fun `기억된 카드도 계속 테두리를 유지한다`() = runTest {
+        val dao = FakeVerdictDao()
+        val pipeline = pipeline(dao, CountingClassifier(Verdict(true, 0.9f, "x")))
+        val cards = listOf(candidate("무료 배송 이벤트"))
+
+        pipeline.run(cards)
+        pipeline.run(cards, allowClassify = false)
+        val result = pipeline.run(cards, allowClassify = false)
+
+        assertEquals(1, result.regions.size)
+    }
+
+    // 스크롤로 새 카드가 들어오면 그것만 넘어가야 한다
+    @Test
+    fun `새로 등장한 카드만 DB로 넘어간다`() = runTest {
+        val dao = FakeVerdictDao()
+        val pipeline = pipeline(dao, CountingClassifier(Verdict(false, 0.9f, "x")))
+        val old = candidate("기존 카드 내용")
+
+        pipeline.run(listOf(old))
+        dao.findCount = 0
+
+        pipeline.run(listOf(old), allowClassify = false)                       // 기억 적재
+        dao.findCount = 0
+        pipeline.run(listOf(old, candidate("새 카드 내용", top = 500)), allowClassify = false)
+
+        assertEquals("새 카드 하나만 조회", 1, dao.findCount)
+    }
+
+    // memo가 DB와 어긋난 채 굳으면 만료·실패가 영원히 반영되지 않는다
+    @Test
+    fun `새 판별을 허용하는 패스는 기억을 건너뛰고 DB를 다시 읽는다`() = runTest {
+        val dao = FakeVerdictDao()
+        val pipeline = pipeline(dao, CountingClassifier(Verdict(true, 0.9f, "x")))
+        val cards = listOf(candidate("무료 배송 이벤트"))
+
+        pipeline.run(cards)
+        pipeline.run(cards, allowClassify = false)
+        dao.findCount = 0
+
+        val result = pipeline.run(cards)
+
+        assertEquals(1, dao.findCount)
+        assertEquals(0, result.memoHits)
+    }
+
     @Test
     fun `약한 id 신호가 임계값 아래 판정을 끌어올린다`() = runTest {
         val dao = FakeVerdictDao()

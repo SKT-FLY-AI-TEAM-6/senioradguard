@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.widget.Toast
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.senioradguard.BuildConfig
@@ -465,24 +466,44 @@ class AdGuardAccessibilityService : AccessibilityService() {
      * 사용자가 직접 누른 버튼에 대한 응답이다. 앱이 알아서 광고를 없애는 게 아니라,
      * 작은 X를 찾아 누르기 어려운 사람을 대신해 그 동작을 수행한다.
      *
-     * 하나도 못 찾으면 뒤로 가기로 물러난다 — 전면 광고는 X가 접근성 트리에
-     * 없거나 이미지로만 그려져 있는 경우가 흔하다.
+     * **못 찾았다고 뒤로 가기를 하면 안 된다.** 처음엔 그렇게 만들었는데, 웹 배너
+     * 광고는 접근성 트리에 X가 거의 없어서 사실상 매번 폴백이 걸렸고, 결과적으로
+     * 광고가 아니라 사용자가 보던 페이지가 닫혔다. 읽던 것을 잃는 쪽이 광고 몇 개
+     * 남는 것보다 훨씬 나쁘다.
+     *
+     * 뒤로 가기는 **전면 광고일 때만** 쓴다. 화면을 통째로 덮은 광고는 뒤로 가기가
+     * 광고 자체를 닫는 동작이라 페이지를 잃지 않는다.
      */
     private fun closeAllAds() {
-        val root = rootInActiveWindow ?: run {
-            performGlobalAction(GLOBAL_ACTION_BACK)
-            return
-        }
+        val root = rootInActiveWindow ?: return
+        val screen = Rect().also { root.getBoundsInScreen(it) }
         val targets = confirmedRegions + aiRegions
-        var closed = 0
-        for (region in targets) {
-            val x = findCloseButton(root, region, 0) ?: continue
-            if (x.performAction(AccessibilityNodeInfo.ACTION_CLICK)) closed++
-        }
-        Log.i(TAG, "광고 모두 닫기: 영역 ${targets.size}개 중 $closed 개 닫음")
 
-        if (closed == 0) performGlobalAction(GLOBAL_ACTION_BACK)
-        // 닫은 뒤 화면이 바뀌므로 곧 CONTENT_CHANGED가 오고 표시가 갱신된다
+        var closed = 0
+        var fullScreenAd = false
+
+        for (region in targets) {
+            val x = findCloseButton(root, region, 0)
+            if (x != null && x.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                closed++
+                continue
+            }
+            // 화면 대부분을 덮었으면 전면 광고로 본다 (AdRegionScanner가 그런 광고를
+            // 화면 전체 영역으로 접어서 돌려준다)
+            if (region.height() >= screen.height() * FULLSCREEN_RATIO) fullScreenAd = true
+        }
+
+        Log.i(TAG, "광고 모두 닫기: 영역 ${targets.size}개 중 $closed 개 닫음, 전면광고=$fullScreenAd")
+
+        when {
+            closed > 0 -> Unit                       // 닫았으면 그걸로 끝
+            fullScreenAd -> performGlobalAction(GLOBAL_ACTION_BACK)
+            else -> toast("이 광고는 닫기 버튼이 없어요")
+        }
+    }
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     /**
@@ -649,6 +670,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         /** 이보다 큰 노드는 닫기 버튼이 아니라 광고 본체로 본다 (dp). */
         private const val CLOSE_MAX_DP = 72
+
+        /** 이 비율 이상 화면을 덮으면 전면 광고로 보고 뒤로 가기를 허용한다. */
+        private const val FULLSCREEN_RATIO = 0.75
 
         private val CLOSE_TEXTS = setOf(
             "닫기", "광고 닫기", "close", "dismiss", "skip ad", "광고 건너뛰기", "✕", "×"

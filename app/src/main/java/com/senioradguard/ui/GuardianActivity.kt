@@ -28,6 +28,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -130,7 +131,28 @@ private fun GuardianScreen(modifier: Modifier = Modifier) {
                     .height(60.dp)
             ) { Text("연결하기", fontSize = 20.sp) }
         } else {
-            LabeledRow("연결된 어르신", partnerId.take(12))
+            // 코드를 줄이면 안 된다. 보호자가 제대로 입력했는지 눈으로 확인할
+            // 유일한 자리인데, take(12)로 자르니 16자리 실제 코드가 잘려 나가
+            // 오타를 냈는지조차 알 수 없었다.
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F1F1))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text("연결된 어르신", fontSize = 15.sp, color = Color(0xFF757575))
+                    Text(
+                        partnerId,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
             LabeledRow("기록된 내역", "${events.size}건")
 
             Button(

@@ -116,23 +116,43 @@ object FirebaseRepo {
         ref.child("users").child(userId).child("role").setValue(role.wire)
     }
 
-    /** 역할을 지운다. 테스트나 재설정 때 선택 화면으로 되돌리기 위해 쓴다. */
+    /**
+     * 역할을 지운다. 테스트나 재설정 때 선택 화면으로 되돌리기 위해 쓴다.
+     *
+     * 원격도 함께 지운다. 로컬만 지우면 서버에는 옛 역할과 옛 연결이 남는다.
+     * 지금은 아무도 그 값을 읽지 않아 티가 나지 않지만, 서버에서 연결 관계를
+     * 쓰기 시작하면 이미 끊긴 보호자가 계속 연결된 것으로 보인다.
+     */
     fun clearRole(context: Context) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().remove(KEY_ROLE).remove(KEY_LINKED_TO).apply()
+
+        val ref = db ?: return
+        ref.child("users").child(userId).removeValue()
     }
 
     fun linkedTo(context: Context): String? =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_LINKED_TO, null)
 
-    /** 보호자–어르신 연결. 보호자가 어르신의 코드를 입력해 부른다. */
+    /**
+     * 보호자–어르신 연결. 보호자가 어르신의 코드를 입력해 부른다.
+     * 빈 문자열을 넘기면 연결 해제로 보고 양쪽에서 지운다 — 빈 값을 그대로
+     * 올리면 "빈 상대와 연결됨"이라는 상태가 서버에 남는다.
+     */
     fun link(context: Context, partnerId: String) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putString(KEY_LINKED_TO, partnerId).apply()
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val ref = db
+        val node = ref?.child("users")?.child(userId)?.child("linkedTo")
 
-        val ref = db ?: return
-        ref.child("users").child(userId).child("linkedTo").setValue(partnerId)
+        if (partnerId.isBlank()) {
+            prefs.edit().remove(KEY_LINKED_TO).apply()
+            node?.removeValue()
+            return
+        }
+
+        prefs.edit().putString(KEY_LINKED_TO, partnerId).apply()
+        node?.setValue(partnerId)
     }
 
     // ── 이벤트 ──────────────────────────────────────────────

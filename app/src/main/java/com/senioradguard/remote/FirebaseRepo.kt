@@ -4,6 +4,7 @@ import android.content.Context
 import android.provider.Settings
 import android.util.Log
 import com.google.firebase.FirebaseApp
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.database.DataSnapshot
 import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.DatabaseReference
@@ -50,6 +51,15 @@ data class AdEvent(
  * Firebase가 초기화되지 않으므로 여기서 그 상태를 감지해 모든 호출을 조용히
  * 무시한다. 광고 감지(Layer 1·2·3)는 원격 기록과 무관하게 동작하므로, 설정이
  * 안 된 기기에서도 보호 기능 자체는 유지된다.
+ *
+ * **익명 인증을 먼저 거친다.** 보안 규칙이 `auth != null`을 요구하기 때문이다.
+ * 인증이 없으면 서버가 요청자를 구분할 수 없어, 규칙을 아무리 써도 curl 한 줄로
+ * DB 전체를 읽고 지울 수 있다(개발 중 실제로 그랬다). 로그인 화면은 없다 —
+ * 익명 인증은 기기마다 계정을 자동으로 만들어 주므로 어르신이 할 일이 없다.
+ *
+ * 연결 코드는 여전히 ANDROID_ID다. auth.uid는 28자라 보호자가 손으로 옮겨
+ * 적기 어렵다. 대신 `users/{userId}/owner`에 auth.uid를 심어, 규칙이 "이
+ * 코드의 주인만 쓸 수 있다"를 강제한다.
  */
 object FirebaseRepo {
 
@@ -61,6 +71,17 @@ object FirebaseRepo {
 
     private var db: DatabaseReference? = null
     private var userId: String = ""
+
+    /** 익명 인증이 끝났는가. 규칙이 auth를 요구하므로 이전에는 어떤 쓰기도 통과 못 한다. */
+    private var authed = false
+
+    /**
+     * 인증 전에 발생한 기록. 앱이 뜨자마자 광고를 잡으면 인증(보통 1초 이내)보다
+     * 빨라, 버리면 첫 감지가 통째로 사라진다. 인증이 끝나면 순서대로 흘려보낸다.
+     * 인증이 끝내 실패하면 이 목록도 의미가 없으므로 상한을 둔다.
+     */
+    private const val PENDING_CAP = 20
+    private val pending = ArrayDeque<Map<String, Any>>()
 
     /** Firebase가 실제로 쓸 수 있는 상태인가. */
     val isConfigured: Boolean get() = db != null
@@ -80,6 +101,37 @@ object FirebaseRepo {
             Log.e(TAG, "Firebase 초기화 실패: ${it.message}")
             null
         }
+
+        if (db != null) signIn()
+    }
+
+    /**
+     * 익명 로그인. 기기마다 계정이 하나 생기고 재실행해도 유지된다.
+     *
+     * 실패하면 원격 기능만 죽고 광고 감지는 그대로 돈다. 콘솔에서 Anonymous
+     * 제공업체를 켜지 않으면 CONFIGURATION_NOT_FOUND로 떨어지므로 로그를 남긴다.
+     */
+    private fun signIn() {
+        val auth = FirebaseAuth.getInstance()
+        auth.currentUser?.let { onSignedIn(it.uid); return }
+
+        auth.signInAnonymously()
+            .addOnSuccessListener { result ->
+                onSignedIn(result.user?.uid ?: return@addOnSuccessListener)
+            }
+            .addOnFailureListener {
+                Log.e(TAG, "익명 인증 실패 — 원격 기록 비활성화: ${it.message}")
+                pending.clear()
+            }
+    }
+
+    private fun onSignedIn(uid: String) {
+        authed = true
+        // 이 코드의 주인이 누구인지 서버에 심는다. 규칙이 이 값으로 쓰기를 막는다.
+        db?.child("users")?.child(userId)?.child("owner")?.setValue(uid)
+        Log.i(TAG, "익명 인증 완료 — 연결 코드=$userId")
+
+        while (pending.isNotEmpty()) writeEvent(pending.removeFirst())
     }
 
     /**
@@ -127,8 +179,11 @@ object FirebaseRepo {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().remove(KEY_ROLE).remove(KEY_LINKED_TO).apply()
 
-        val ref = db ?: return
-        ref.child("users").child(userId).removeValue()
+        val node = db?.child("users")?.child(userId) ?: return
+        // owner는 남긴다. 이 코드가 누구 것인지에 대한 주장이라 역할과 무관하고,
+        // 지우면 규칙상 다른 기기가 같은 코드를 가로챌 수 있다.
+        node.child("role").removeValue()
+        node.child("linkedTo").removeValue()
     }
 
     fun linkedTo(context: Context): String? =
@@ -162,18 +217,27 @@ object FirebaseRepo {
      * Firebase가 없으면 아무 일도 하지 않는다.
      */
     fun logEvent(appPackage: String, adText: String, action: String, layer: Int) {
-        val ref = db ?: return
-        val events = ref.child("events").child(userId)
-        val id = events.push().key ?: return
-        events.child(id).setValue(
-            mapOf(
-                "timestamp" to System.currentTimeMillis(),
-                "appPackage" to appPackage,
-                "adText" to adText,
-                "action" to action,
-                "layer" to layer
-            )
+        if (db == null) return
+        val event = mapOf(
+            "timestamp" to System.currentTimeMillis(),
+            "appPackage" to appPackage,
+            "adText" to adText,
+            "action" to action,
+            "layer" to layer
         )
+
+        if (!authed) {
+            if (pending.size >= PENDING_CAP) pending.removeFirst()
+            pending.addLast(event)
+            return
+        }
+        writeEvent(event)
+    }
+
+    private fun writeEvent(event: Map<String, Any>) {
+        val events = db?.child("events")?.child(userId) ?: return
+        val id = events.push().key ?: return
+        events.child(id).setValue(event)
     }
 
     /**

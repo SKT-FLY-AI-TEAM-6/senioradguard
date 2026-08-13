@@ -94,6 +94,7 @@ dependencies {
 
     // Firebase — 보호자 모드 실시간 동기화 (google-services.json이 있을 때만 실제 동작)
     implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.auth.ktx)
     implementation(libs.firebase.database.ktx)
     implementation(libs.firebase.messaging.ktx)
 

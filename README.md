@@ -80,6 +80,10 @@ settings/{userId}   sensitivity(0.6), whitelist([])
 
 Room에는 `ad_verdict` 캐시만 남긴다.
 
+**익명 인증을 거친다.** 로그인 화면은 없다 — 기기마다 계정이 자동으로 생기므로 어르신이 할 일이 없다. 인증을 넣은 이유는 보안 규칙이 `auth != null`을 요구하기 때문이다. 인증이 없으면 서버가 요청자를 구분할 수 없어 규칙을 아무리 써도 `curl` 한 줄로 DB 전체가 털린다(개발 중 실제로 그랬다).
+
+연결 코드는 여전히 ANDROID_ID다. `auth.uid`는 28자라 보호자가 손으로 옮겨 적기 어렵다. 대신 `users/{code}/owner`에 `auth.uid`를 심고, 규칙이 "이 코드의 주인만 쓸 수 있다"를 강제한다. 규칙과 남은 구멍은 `firebase/README.md` 참고.
+
 **광고 문구 자체는 올리지 않는다.** Layer 1·2 이벤트의 `adText`는 `"광고 N건 표시"`이고, `appPackage`에는 도메인 또는 패키지명까지만 들어간다(`hankyung.com`). 어르신이 무엇을 읽고 있었는지까지 보호자에게 넘길 이유가 없다. Layer 3은 누른 버튼 문구를 남기되 `CardText.mask()`로 전화·카드·주민번호를 지우고 120자로 자른다.
 
 **같은 광고를 반복해서 알리지 않는다.** Layer 1·2는 스크롤할 때마다 같은 광고를 다시 표시하므로(실측 한 페이지 40회), `SightingLog`이 **출처+레이어 조합당 한 번만** 남긴다. 서비스가 사는 동안만 기억하고 128개를 넘기면 오래된 것부터 버린다.
@@ -114,7 +118,7 @@ app/src/main/java/com/senioradguard/
 │   ├── AdBorderOverlay.kt      테두리(비터치) + 닫기 막대(터치, 별개 창)
 │   └── OverlayManager.kt       Layer 3 차단 경고 팝업
 │
-├── remote/FirebaseRepo.kt      역할 저장 · 연결 · 이벤트 기록/구독
+├── remote/FirebaseRepo.kt      익명 인증 · 역할 · 연결 · 이벤트 기록/구독
 ├── logger/AdEventLogger.kt     감지 이벤트 → Firebase
 │
 ├── detector/                   블랙리스트 (보류 — 아래 참고)
@@ -222,6 +226,15 @@ GEMINI_API_KEY=발급받은키
 1. Firebase 콘솔에서 프로젝트 생성 → Android 앱 추가 (패키지명 `com.senioradguard`)
 2. **빌드 → Realtime Database** 생성 (Firestore 아님)
 3. `google-services.json`을 **`app/`** 에 넣는다 (`.gitignore` 대상 — 커밋하지 말 것)
+4. **Authentication → Sign-in method → 익명(Anonymous) 사용 설정**
+5. **Realtime Database → 규칙** 탭에 `firebase/database.rules.json` 내용을 붙여넣고 게시
+
+4·5번을 빼먹으면 이렇게 된다:
+
+| 빠뜨린 것 | 증상 |
+|---|---|
+| 익명 인증 | `CONFIGURATION_NOT_FOUND`로 로그인 실패 → 원격 기록만 죽음 (광고 감지는 정상) |
+| 보안 규칙 | 동작은 하지만 **아무나 DB 전체를 읽고 지울 수 있다** |
 
 **Realtime Database를 먼저 만들어야 한다.** DB가 없으면 `google-services.json`에 `firebase_url`이 들어가지 않고, SDK가 프로젝트 ID로 주소를 추측해 붙었다가 서버에 끊긴다. DB를 만든 뒤 **파일을 다시 다운로드**할 것.
 
@@ -239,7 +252,7 @@ bash scripts/check_accessibility.sh     # 반드시 확인
 
 ## 현재 상태 (2026-08-13, 브랜치 `phase1-service-integration`)
 
-세 레이어가 모두 실기기에서 동작하고, Firebase 이벤트 기록까지 실제로 확인했다. 남은 큰 항목은 보호자 폰 수신 검증(2대 필요), Firebase 보안 규칙, Vision(Agent3)이다.
+세 레이어가 모두 실기기에서 동작하고, **폰 2대로 어르신 → 보호자 실시간 연동까지 확인**했다. 보안 규칙과 익명 인증도 들어갔다(콘솔 설정 필요). 남은 큰 항목은 보호자 연결 승인 절차와 Vision(Agent3)이다.
 
 ### 실기기 검증 (갤럭시 S24, SM-S921N)
 
@@ -256,6 +269,8 @@ bash scripts/check_accessibility.sh     # 반드시 확인
 | 역할 선택 → 어르신/보호자 화면 분기 | 동작 |
 | **Firebase 이벤트 기록** | **동작** — Layer 3 스토어 이동, Layer 1 광고 표시 모두 도착 |
 | **보호자 기록 중복 제거** | hankyung.com 스캔 40회 → 이벤트 1건, donga.com 이동 시 별도 1건 |
+| **2대 실시간 연동** (S921N 어르신 + S938N 보호자) | **동작** — 어르신 폰에서 새 사이트 진입 → 보호자 폰이 조작 없이 2건→4건 자동 갱신 |
+| 익명 인증 미설정 시 | `CONFIGURATION_NOT_FOUND` 로그만 남고 앱은 정상 — 광고 감지 계속 동작 |
 | 서비스 상태 표시 — 접근성 해제 시 경고 | 동작, 콜드 스타트 오탐 없음 |
 | 스캔 최적화 — 플링 8회 | 이벤트 241개 → 스캔 13회 (94.6% 감소) |
 | 메모리 (서비스만, 광고 페이지 25회 스크롤) | Java 27→30MB, Native 53→49MB — 누수 없음 |
@@ -280,6 +295,8 @@ bash scripts/check_accessibility.sh     # 반드시 확인
 | "광고 모두 닫기"가 광고 대신 페이지를 닫음 | X를 못 찾으면 `GLOBAL_ACTION_BACK`으로 폴백했는데, **웹 배너에는 X가 거의 없어** 폴백이 매번 걸렸다 |
 | Layer 1·2 감지가 보호자에게 안 감 | `AdEventLogger.logAdMarked`를 만들고 **호출부를 넣지 않았음.** Layer 3 이벤트만 올라가고 있었다 |
 | 자주 보는 사이트가 중복 기록됨 | `SightingLog`을 `containsKey`로 조회 — `LinkedHashMap`의 접근 순서는 **`get`/`put`만 갱신한다.** 단위 테스트가 잡음 |
+| 보호자가 연결 코드를 확인할 수 없음 | `partnerId.take(12)`로 잘라 보여줬는데 실제 코드는 16자리. 오타를 냈는지조차 알 수 없었다 |
+| 모드를 바꿔도 서버에 옛 연결이 남음 | `clearRole`이 로컬 prefs만 지웠다 |
 
 ### 두 레이어는 실제로 서로를 보완했다
 
@@ -305,7 +322,7 @@ bash scripts/check_accessibility.sh     # 반드시 확인
 
 | 항목 | 상태 |
 |---|---|
-| **보호자 폰 수신** | DB 쓰기는 검증됐지만 대시보드가 실제로 그리는 것은 미확인. 기기 2대 필요 |
+| **보호자 연결 승인** | 연결 코드를 아는 사람이면 누구나 기록을 읽을 수 있다. 어르신 쪽 수락 절차가 필요하다 (`firebase/README.md`에 설계) |
 | **Layer 2 원격 기록** | 코드 경로는 Layer 1과 같은 함수를 쓰지만, AI 토글이 OFF라 실기기에서 미확인 |
 | **웹 배너 닫기** | 접근성 트리에 X가 없어 닫을 수단 자체가 없다. 앱 내 광고·전면 광고에서는 동작 |
 | **Agent3 (Vision)** | 이미지만 있는 광고 판별. 미착수 |
@@ -321,7 +338,7 @@ bash scripts/check_accessibility.sh     # 반드시 확인
 ### 배포 전 반드시 할 것
 
 1. **Gemini 키를 앱에서 빼기.** 지금은 `local.properties` → `BuildConfig`라 APK에서 추출된다. 우리 서버를 거치는 `AdClassifier` 구현으로 교체할 것
-2. **Firebase 보안 규칙.** 현재 테스트 모드라 `userId`(ANDROID_ID)만 알면 누구나 남의 이벤트를 읽고 지울 수 있다. 실제로 개발 중 `curl` 한 줄로 DB 전체를 읽고 삭제했다. 인증 + 규칙이 필요하다
+2. **보호자 연결 승인 절차.** 규칙을 넣어도 연결 코드를 아는 사람은 기록을 읽을 수 있다. 어르신 폰에서 수락해야 읽기가 열리도록 바꿔야 한다
 3. `SYSTEM_ALERT_WINDOW` / 접근성 권한의 사용 목적을 스토어 심사용으로 명시
 
 ---

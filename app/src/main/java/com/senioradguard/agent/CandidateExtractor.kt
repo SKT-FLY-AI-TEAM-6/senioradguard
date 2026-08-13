@@ -1,6 +1,7 @@
 package com.senioradguard.agent
 
 import android.graphics.Rect
+import android.os.SystemClock
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
@@ -33,14 +34,29 @@ class CandidateExtractor {
     /**
      * @param exclude Layer 1이 이미 광고로 판정한 영역. 겹치는 카드는 후보에서 뺀다
      *                (확정 표시가 있는데 AI 추정을 덧그릴 이유가 없다)
+     * @param budgetMs 순회 시간 상한. 0이면 상한 없음.
+     *
+     * 스크롤 중에는 이 순회가 Layer 1 스캔에 **이어서** 한 번 더 도는 두 번째 트리
+     * 순회다(캐시만 보는 경로). 상한이 없으면 느린 앱에서 그 왕복이 통째로 늘어나
+     * 확정 테두리까지 손가락을 못 따라온다. 반대로 유휴 때 도는 판별 경로는
+     * 후보를 빠짐없이 봐야 하므로 상한을 걸지 않는다.
+     *
+     * 마감 시각을 필드가 아니라 **인자로 들고 내려간다.** 스크롤 경로와 유휴 판별
+     * 경로는 서로 다른 코루틴이라 동시에 돌 수 있는데, 필드에 두면 스크롤 쪽이
+     * 써넣은 짧은 마감을 유휴 쪽 순회가 이어받아 후보를 0개로 끊어버린다.
      */
-    fun extract(root: AccessibilityNodeInfo, exclude: List<Rect>): List<AdCandidate> {
+    fun extract(
+        root: AccessibilityNodeInfo,
+        exclude: List<Rect>,
+        budgetMs: Long = 0L
+    ): List<AdCandidate> {
         val screen = Rect().also { root.getBoundsInScreen(it) }
         if (screen.width() <= 0 || screen.height() <= 0) return emptyList()
 
+        val deadline = if (budgetMs > 0L) SystemClock.uptimeMillis() + budgetMs else 0L
         val sourceKey = sourceKeyOf(root)
         val out = mutableListOf<AdCandidate>()
-        collect(root, 0, screen, sourceKey, exclude, out)
+        collect(root, 0, screen, sourceKey, exclude, deadline, out)
         return out
     }
 
@@ -50,9 +66,11 @@ class CandidateExtractor {
         screen: Rect,
         sourceKey: String,
         exclude: List<Rect>,
+        deadline: Long,
         out: MutableList<AdCandidate>
     ) {
         if (depth > MAX_DEPTH || out.size >= MAX_CANDIDATES) return
+        if (deadline > 0L && SystemClock.uptimeMillis() > deadline) return
 
         if (node.isVisibleToUser && isCard(node, screen)) {
             val rect = Rect().also { node.getBoundsInScreen(it) }
@@ -74,7 +92,7 @@ class CandidateExtractor {
         }
 
         for (i in 0 until node.childCount) {
-            collect(node.getChild(i) ?: continue, depth + 1, screen, sourceKey, exclude, out)
+            collect(node.getChild(i) ?: continue, depth + 1, screen, sourceKey, exclude, deadline, out)
         }
     }
 

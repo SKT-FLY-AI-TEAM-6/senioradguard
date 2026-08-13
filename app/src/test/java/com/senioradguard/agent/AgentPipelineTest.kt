@@ -37,8 +37,13 @@ private class CountingClassifier(
 ) : AdClassifier {
     override val source = "FAKE"
     var calls = 0
-    override suspend fun classify(text: String): Verdict? {
+
+    /** 파이프라인이 후보의 출처를 판별기까지 실제로 넘기는지 확인용. */
+    var lastSourceKey: String? = null
+
+    override suspend fun classify(text: String, sourceKey: String): Verdict? {
         calls++
+        lastSourceKey = sourceKey
         return verdict
     }
 }
@@ -81,6 +86,17 @@ class AgentPipelineTest {
         assertEquals(1, result.classified)
         assertEquals(1, dao.rows.size)
         assertEquals("FAKE", dao.rows.values.first().source)
+    }
+
+    // 출처가 없으면 LLM이 쇼핑몰 자체 상품과 끼어든 광고를 구분할 수 없다.
+    // 넘기는 걸 잊어도 컴파일은 되므로(기본값이 "") 테스트로 못박는다.
+    @Test
+    fun `판별기에 후보의 출처를 함께 넘긴다`() = runTest {
+        val classifier = CountingClassifier(Verdict(true, 0.9f, "광고"))
+
+        pipeline(FakeVerdictDao(), classifier).run(listOf(candidate("무료 배송 이벤트")))
+
+        assertEquals("example.com", classifier.lastSourceKey)
     }
 
     // 절감의 대부분이 부정 판정 캐시에서 나온다

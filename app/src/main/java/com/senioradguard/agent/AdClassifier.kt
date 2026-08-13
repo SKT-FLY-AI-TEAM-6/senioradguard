@@ -22,8 +22,12 @@ interface AdClassifier {
     val source: String
 
     /**
+     * @param sourceKey 카드가 나온 곳. 브라우저면 도메인, 앱이면 패키지명.
+     *        같은 "70% 할인 무료배송"이라도 쇼핑몰에서 나오면 그 앱의 본래
+     *        기능이고 뉴스 사이트에서 나오면 끼어든 광고다. 문맥 없이는 이
+     *        구분이 안 된다. 출처를 안 쓰는 구현체를 위해 기본값을 둔다.
      * @return 판별 결과. 실패·타임아웃이면 null — 호출부는 캐시에 저장하지 않고
      *         이번 화면은 표시하지 않는다 (모르면 아무 말도 하지 않는 쪽이 안전하다).
      */
-    suspend fun classify(text: String): Verdict?
+    suspend fun classify(text: String, sourceKey: String = ""): Verdict?
 }

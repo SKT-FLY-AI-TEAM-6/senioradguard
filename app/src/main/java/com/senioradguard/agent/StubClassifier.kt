@@ -31,7 +31,7 @@ class StubClassifier : AdClassifier {
         "기자", "취재", "보도", "인터뷰", "칼럼", "사설", "속보", "댓글"
     )
 
-    override suspend fun classify(text: String): Verdict {
+    override suspend fun classify(text: String, sourceKey: String): Verdict {
         val lower = text.lowercase()
 
         val matched = adSignals.filterKeys { lower.contains(it) }

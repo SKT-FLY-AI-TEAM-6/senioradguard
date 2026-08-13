@@ -11,12 +11,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -32,12 +33,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.guradian.detector.BlacklistUpdateWorker
 import com.guradian.service.GuardianAccessibilityService
 import com.guradian.ui.BatteryOptimizationGuide
 import com.guradian.ui.ServiceStatus
-import com.guradian.ui.theme.GuardianTheme
 
+/**
+ * 상태 화면 하나. 이 앱의 본체는 접근성 서비스이고, 화면은 "지금 지켜보고 있는지"를
+ * 알려주는 것이 전부다.
+ */
 class MainActivity : ComponentActivity() {
 
     /** 배터리 예외 상태. 설정 화면에서 허용하고 돌아오면 onResume이 갱신한다. */
@@ -51,10 +54,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        BlacklistUpdateWorker.schedule(applicationContext)
 
         setContent {
-            GuardianTheme {
+            MaterialTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     HomeScreen(
                         serviceState = serviceState,
@@ -152,9 +154,10 @@ private fun HomeScreen(
 /**
  * Layer 2(AI 광고 판별) 옵트인 토글. 기본 OFF.
  *
- * 켜면 화면에 보이는 카드의 텍스트가 외부 판별 서버로 나간다. 사용자가 그 사실을
- * 알고 스스로 켜야 하므로 기본값을 끔으로 두고, 무엇이 나가는지 문구로 밝힌다.
- * Layer 1(공식 라벨)과 Layer 3(설치 차단)은 이 토글과 무관하게 항상 동작한다.
+ * 켜면 액션바에 [광고 찾기] 버튼이 나타나고, **그 버튼을 누른 순간에만** 화면 카드의
+ * 텍스트가 외부 판별 서버로 나간다. 자동 실행 경로는 없다. 사용자가 그 사실을 알고
+ * 스스로 켜야 하므로 기본값을 끔으로 두고, 무엇이 나가는지 문구로 밝힌다.
+ * Layer 1(공식 라벨)과 전환 탈출은 이 토글과 무관하게 항상 동작한다.
  */
 @Composable
 private fun AiClassifyToggle() {
@@ -181,7 +184,7 @@ private fun AiClassifyToggle() {
                 )
                 Text(
                     text = "'광고'라고 적혀 있지 않은 광고도 찾아냅니다.\n" +
-                        "켜면 화면의 글자가 판별 서버로 전송됩니다.",
+                        "[광고 찾기]를 누를 때만 화면의 글자가 판별 서버로 전송됩니다.",
                     fontSize = 16.sp,
                     color = Color(0xFF5D4037)
                 )

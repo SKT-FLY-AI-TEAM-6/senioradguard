@@ -16,8 +16,8 @@ import java.net.URL
  * 배포 전에는 우리 서버를 거치는 구현으로 반드시 교체할 것 — 그때 바꿀 곳은
  * AdClassifier 구현체 하나뿐이다.
  *
- * SDK를 쓰지 않고 HttpURLConnection으로 직접 부른다. 프로젝트의 다른 네트워크
- * 코드(KakaoNotifier, BlacklistRepository)와 같은 방식이라 의존성이 늘지 않는다.
+ * SDK를 쓰지 않고 HttpURLConnection으로 직접 부른다. BlacklistRepository와 같은
+ * 방식이라 의존성이 늘지 않는다.
  */
 class GeminiClassifier(
     private val apiKey: String,

@@ -75,8 +75,9 @@ class AgentPipeline(
                 continue
             }
 
-            val raw = runCatching { classifier.classify(CardText.forClassifier(candidate.texts)) }
-                .getOrNull()
+            val raw = runCatching {
+                classifier.classify(CardText.forClassifier(candidate.texts), candidate.sourceKey)
+            }.getOrNull()
             // 판별에 실패하면 캐시에 남기지 않는다. 실패를 저장하면 TTL 동안
             // 그 카드를 다시 볼 기회가 사라진다.
             if (raw == null) continue

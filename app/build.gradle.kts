@@ -7,12 +7,17 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
-// local.properties에서 카카오 네이티브 앱 키를 읽어 BuildConfig/manifest에 주입 (버전 관리 제외)
+// local.properties에서 키를 읽어 BuildConfig/manifest에 주입 (버전 관리 제외)
 val localProperties = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) file.inputStream().use { load(it) }
 }
 val kakaoNativeAppKey: String = localProperties.getProperty("KAKAO_NATIVE_APP_KEY", "")
+
+// Gemini 광고 판별 키. 비어 있으면 앱이 StubClassifier로 물러나므로 키 없이도 빌드된다.
+// ⚠️ 개발용 경로다. APK는 누구나 뜯을 수 있어 이 방식으로는 키가 그대로 노출된다.
+//    배포 전에는 우리 서버를 거치는 AdClassifier 구현체로 교체할 것.
+val geminiApiKey: String = localProperties.getProperty("GEMINI_API_KEY", "")
 
 android {
     namespace = "com.senioradguard"
@@ -31,6 +36,8 @@ android {
 
         buildConfigField("String", "KAKAO_NATIVE_APP_KEY", "\"$kakaoNativeAppKey\"")
         manifestPlaceholders["KAKAO_NATIVE_APP_KEY"] = kakaoNativeAppKey
+
+        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
     }
 
     buildTypes {

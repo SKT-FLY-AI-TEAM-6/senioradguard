@@ -37,8 +37,13 @@ private class CountingClassifier(
 ) : AdClassifier {
     override val source = "FAKE"
     var calls = 0
-    override suspend fun classify(text: String): Verdict? {
+
+    /** 파이프라인이 후보의 출처를 넘겨주는지 확인하려고 마지막 값을 남긴다. */
+    var lastSourceKey: String? = null
+
+    override suspend fun classify(text: String, sourceKey: String): Verdict? {
         calls++
+        lastSourceKey = sourceKey
         return verdict
     }
 }
@@ -68,6 +73,17 @@ class AgentPipelineTest {
 
         assertTrue(result.regions.isEmpty())
         assertEquals(0, classifier.calls)
+    }
+
+    @Test
+    fun `판별기에 후보의 출처를 함께 넘긴다`() = runTest {
+        // 출처는 판정을 가르는 신호다. 같은 "70% 할인"이라도 쇼핑몰이면 그 앱의
+        // 본래 기능이고 뉴스 사이트면 끼어든 광고라, 빠지면 오탐이 돌아온다.
+        val classifier = CountingClassifier(Verdict(true, 0.9f, "x"))
+
+        pipeline(FakeVerdictDao(), classifier).run(listOf(candidate("무료 배송 이벤트")))
+
+        assertEquals("example.com", classifier.lastSourceKey)
     }
 
     @Test

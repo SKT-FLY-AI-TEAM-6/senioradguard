@@ -5,7 +5,13 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.os.Build
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import com.guradian.BuildConfig
+import com.guradian.action.ActionBar
+import com.guradian.action.ActionBarState
+import com.guradian.action.CloseAffordanceFinder
+import com.guradian.action.EscapeAction
+import com.guradian.action.PrimaryAction
 import com.guradian.agent.AdClassifier
 import com.guradian.agent.AgentPipeline
 import com.guradian.agent.CandidateExtractor
@@ -15,7 +21,10 @@ import com.guradian.overlay.AdBorderOverlay
 import com.guradian.overlay.AdMarkStyle
 import com.guradian.overlay.BorderTracker
 import com.guradian.rule.RuleEngine
+import com.guradian.rule.RuleVerdict
+import com.guradian.store.DetectionLog
 import com.guradian.store.InMemoryVerdictStore
+import com.guradian.store.NoopDetectionLog
 import com.guradian.store.VerdictStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -227,6 +236,133 @@ class GuardianAccessibilityService : AccessibilityService() {
     // ── endregion ──
 
     // ── region: action ──  (feat/action-bar 가 채운다)
+
+    /**
+     * 액션바는 **서비스 컨텍스트(this)** 로 만든다. applicationContext를 쓰면
+     * 창 토큰이 없어 BadTokenException으로 죽는다.
+     */
+    private val actionBar by lazy { ActionBar(this, ::onPrimaryClick) }
+
+    /**
+     * 표시가 갱신될 때마다 액션바를 다시 계산한다. 스캔이 비동기라 이벤트 처리
+     * 시점에는 아직 옛 값이어서, 여기 걸지 않으면 버튼이 한 박자 늦게 바뀐다.
+     */
+    init {
+        borderTracker.onApplied = { refreshActionBar() }
+    }
+
+    private val closeFinder = CloseAffordanceFinder()
+
+    private val detectionLog: DetectionLog = NoopDetectionLog
+
+    private val escapeAction by lazy {
+        EscapeAction(
+            onBack = { performGlobalAction(GLOBAL_ACTION_BACK) },
+            onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) },
+            currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() }
+        )
+    }
+
+    /** 지금 탈출해야 하는 상황인가. 사용자가 [돌아가기]를 누르면 해제된다. */
+    private var pendingEscape: RuleVerdict.Escape? = null
+
+    /** 어느 패키지에 갇혔는가. BACK이 먹었는지 판단하는 기준. */
+    private var trappedIn: String? = null
+
+    /**
+     * 액션바 상태를 다시 계산해 반영한다. 확정 테두리 수와 탈출 상태가 바뀔 때마다.
+     * 메인 스레드에서만 부른다.
+     */
+    private fun refreshActionBar(busy: Boolean = false) {
+        val confirmed = borderTracker.confirmedRegions
+        actionBar.setState(
+            ActionBarState(
+                escape = pendingEscape?.reason,
+                adRegionCount = confirmed.size + borderOverlay.regionsOf(AdMarkStyle.AI_GUESS).size,
+                busy = busy,
+                aiEnabled = isAiEnabled()
+            )
+        )
+        // 광고를 가리면 구글 정책 위반이다. 하단이 겹치면 위로 옮긴다.
+        actionBar.avoid(confirmed + borderOverlay.regionsOf(AdMarkStyle.AI_GUESS))
+    }
+
+    /** 주 버튼 하나가 세 동작을 나눠 맡는다. 지금 어느 것인지는 상태 머신이 정한다. */
+    private fun onPrimaryClick(action: PrimaryAction) {
+        when (action) {
+            PrimaryAction.ESCAPE -> doEscape()
+            PrimaryAction.CLOSE_AD -> doCloseAd()
+            PrimaryAction.FIND_AD -> doFindAd()
+            PrimaryAction.BUSY, PrimaryAction.NONE -> Unit
+        }
+    }
+
+    /** task 3 — BACK, 안 먹으면 HOME. */
+    private fun doEscape() {
+        val escape = pendingEscape ?: return
+        // hostHash는 크롬(악성 URL)에서만 채워진다. 스토어 패키지명은 host가 아니라
+        // 여기 넣지 않는다 — DetectionLog 시그니처가 원문을 못 받게 막고 있다.
+        detectionLog.onEscape(escape.reason, escape.hostHash)
+
+        escapeAction.perform(trappedIn) {
+            pendingEscape = null
+            trappedIn = null
+            refreshActionBar()
+        }
+    }
+
+    /**
+     * task 2 — 닫기 어포던스를 찾아 대리 클릭.
+     *
+     * **사용자가 [광고 닫기]를 누른 이 경로에서만 ACTION_CLICK을 실행한다.**
+     * 자동 실행 경로를 만들면 그건 광고 차단이고 정책 위반이다.
+     */
+    private fun doCloseAd() {
+        val root = targetRoot() ?: return
+        val adRect = (borderTracker.confirmedRegions +
+            borderOverlay.regionsOf(AdMarkStyle.AI_GUESS)).firstOrNull() ?: return
+
+        when (val found = closeFinder.find(root, adRect, resources.displayMetrics.density)) {
+            is CloseAffordanceFinder.Result.Found -> {
+                val ok = found.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                detectionLog.onAdClosed(source = "rule", succeeded = ok)
+                // 조용한 실패는 고장으로 읽힌다 — 눌렀는데 아무 일도 없으면
+                // 사용자는 버튼이 죽었다고 생각하고 계속 누른다.
+                if (!ok) actionBar.say("닫기 버튼을 찾지 못했어요")
+            }
+
+            CloseAffordanceFinder.Result.NotYet ->
+                actionBar.say("잠시 후에 건너뛸 수 있어요")
+
+            CloseAffordanceFinder.Result.NotFound -> {
+                detectionLog.onAdClosed(source = "rule", succeeded = false)
+                actionBar.say("닫기 버튼을 찾지 못했어요")
+            }
+        }
+    }
+
+    /**
+     * task 1 — Layer 2를 1회 실행. **사용자가 기다린다.**
+     *
+     * 즉시 "찾는 중…"으로 바꾸고, 0건이어도 반드시 결과를 말한다.
+     */
+    private fun doFindAd() {
+        findAdsNow { result ->
+            if (result.busy) {
+                refreshActionBar(busy = true)
+                return@findAdsNow
+            }
+            if (result.aiDisabled) {
+                actionBar.say("설정에서 AI 광고 판별을 켜주세요")
+            } else if (result.staleScreen) {
+                actionBar.say("화면이 바뀌어서 다시 눌러주세요")
+            } else {
+                detectionLog.onAdDetected("agent", result.regions.size, aiGuessed = true)
+                actionBar.reportFound(result.regions.size)
+            }
+            refreshActionBar(busy = false)
+        }
+    }
     // ── endregion ──
 
     override fun onServiceConnected() {
@@ -244,6 +380,8 @@ class GuardianAccessibilityService : AccessibilityService() {
             // 테두리가 끊겨 보인다 — 스무스함의 상한이 여기서 정해진다.
             notificationTimeout = 0
         }
+        actionBar.show()
+        refreshActionBar()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
@@ -274,16 +412,58 @@ class GuardianAccessibilityService : AccessibilityService() {
             borderTracker.onScroll(scrollDeltaY(event))
         }
 
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            // 페이지가 새로 떴다. 악성 URL인지 확인한다 — 지금은 항상 false지만
+            // 호출부를 배선해 둬야 task 4에서 구현체만 갈아끼울 수 있다.
+            checkUrlNow()
+        }
+
         borderTracker.onEvent(event) { targetRoot() }
         // ── endregion ──
     }
 
     /**
-     * 탈출 상황을 감지했다. 실제 대응(액션바 빨강 확장 + BACK/HOME)은 task 3의
-     * 몫이라 feat/action-bar가 이 자리를 채운다. 지금은 판정만 도착한다.
+     * 탈출 상황을 감지했다.
+     *
+     * 화면을 막지 않는다 — 원본은 전체 화면 경고 팝업으로 터치를 가로챘지만,
+     * 여기서는 액션바가 빨강으로 확장되고 진동할 뿐 사용자가 스스로 조작할 자유는
+     * 그대로 둔다. 설치를 정말 원했던 사용자를 가두지 않기 위해서다.
      */
-    private fun onEscapeDetected(escape: com.guradian.rule.RuleVerdict.Escape) {
-        android.util.Log.i(TAG, "escape=${escape.reason} ${escape.detail}")
+    private fun onEscapeDetected(escape: RuleVerdict.Escape) {
+        Log.i(TAG, "escape=${escape.reason} ${escape.detail}")
+        pendingEscape = escape
+        trappedIn = rootInActiveWindow?.packageName?.toString()
+        refreshActionBar()
+        actionBar.expandForEscape()
+        vibrateForEscape()
+    }
+
+    /**
+     * 지금 보고 있는 페이지가 악성 URL인지 확인한다. **크롬에서만 의미가 있다.**
+     *
+     * 노드 조회와 조회 자체가 IPC·I/O라 백그라운드로 보낸다.
+     */
+    private fun checkUrlNow() {
+        scope.launch {
+            val root = targetRoot() ?: return@launch
+            val escape = runCatching { ruleEngine.checkUrl(root) }.getOrNull() ?: return@launch
+            withContext(Dispatchers.Main) { onEscapeDetected(escape) }
+        }
+    }
+
+    /** ESCAPE 진입 진동. 화면을 안 보고 있어도 무언가 일어났음을 알린다. */
+    private fun vibrateForEscape() {
+        val vibrator = getSystemService(VIBRATOR_SERVICE) as? android.os.Vibrator ?: return
+        val effect = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            android.os.VibrationEffect.createPredefined(
+                android.os.VibrationEffect.EFFECT_HEAVY_CLICK
+            )
+        } else {
+            android.os.VibrationEffect.createOneShot(
+                200, android.os.VibrationEffect.DEFAULT_AMPLITUDE
+            )
+        }
+        runCatching { vibrator.vibrate(effect) }
     }
 
     override fun onInterrupt() {
@@ -293,6 +473,8 @@ class GuardianAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         isConnected = false
         borderTracker.clear()
+        escapeAction.cancel()
+        actionBar.dismiss()
         scope.cancel()
         borderOverlay.dismissAll()
         super.onDestroy()

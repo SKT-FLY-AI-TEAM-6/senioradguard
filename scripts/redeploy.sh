@@ -2,11 +2,11 @@
 #
 # 실기기 재배포. 순서가 중요하다 —
 #   설치(=force-stop 발생) → 접근성 서비스 재활성화 → 앱 실행
-# Android가 재설치 시 안전장치로 enabled_accessibility_services를 지우기 때문에,
+# Android가 안전장치로 enabled_accessibility_services를 지워버리기 때문이다.
 # 반대 순서로 하면 설정에는 "켜짐"으로 보이는데 실제로는 이벤트를 못 받는다.
 set -e
 
-# Git Bash(MSYS)가 "com.pkg/com.pkg.Service"의 슬래시를 경로로 보고 변환해버린다.
+# Git Bash(MSYS)가 "com.pkg/com.pkg.Service"의 슬래시를 경로로 보고 변환해버린다
 export MSYS_NO_PATHCONV=1
 
 # adb는 PATH → ANDROID_HOME 순으로 찾는다 (개발자마다 SDK 위치가 다르다)
@@ -24,7 +24,7 @@ SERVICE="com.guradian/com.guradian.service.GuardianAccessibilityService"
 ./gradlew installDebug
 
 # 이미 켜져 있던 다른 접근성 서비스를 지우지 않는다. 통째로 덮어쓰면 사용자가
-# 쓰던 화면읽기·다른 광고 감지 앱이 조용히 꺼진다.
+# 쓰던 화면읽기·다른 광고 감지 등이 조용히 꺼진다.
 CURRENT="$("$ADB" shell settings get secure enabled_accessibility_services | tr -d '\r')"
 case "$CURRENT" in
   null|"") MERGED="$SERVICE" ;;
@@ -38,3 +38,9 @@ esac
 "$ADB" shell am start -n com.guradian/.MainActivity
 
 echo "재배포 완료 — 접근성 서비스: $MERGED"
+echo
+echo "로그: adb logcat -s GurADian"
+echo "  layer2 판별기=...        Gemini / Stub 중 무엇이 도는지"
+echo "  layer2 후보=… 캐시=… …   [광고 찾기] 1회 결과"
+echo "  escape=…                 탈출 감지"
+echo "  detected / closed        액션바 동작 결과"

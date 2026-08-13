@@ -1,245 +1,296 @@
-# GuArDian — 광고 감지 코어
+# GuArDian — 광고 감지 코어 (2-Layer 재구축)
 
-노인 사용자가 스마트폰 사용 중 광고를 광고로 인식하지 못해 불필요한 앱을 설치하거나 개인정보를 입력하는 피해를 막기 위한 Android 앱.
+> **이 브랜치는 `integration/2layer`다.** 발표 아키텍처(2-Layer + 상시 액션바)로
+> 감지 코어를 재구축한 버전이고, **`main`은 건드리지 않는다.**
+> `main`은 senioradguard에서 카카오 연동만 걷어낸 3-Layer 린 버전이 계속 돈다.
 
-**이 저장소는 [senioradguard](https://github.com/SKT-FLY-AI-TEAM-6/senioradguard)의 린 버전이다.** 감지 핵심 기능은 전부 그대로 살아 있고, **보호자 카카오톡 알림 연동만 걷어냈다** (아래 [§ 원본과 달라진 점](#원본과-달라진-점)).
-
-**핵심 차별점 (경쟁사 대비)**
-- AdGuard, Family Link 등 기존 서비스는 노인 특화 없음
-- 앱 설치 팝업 감지 + 광고 클릭 직전 개입 → 기존에 없는 기능
-- 노인 UX: 큰 글씨(24sp), 버튼 2개만, 빨간 경고
+노인 사용자가 광고를 광고로 인식하지 못해 불필요한 앱을 설치하거나 개인정보를
+입력하는 피해를 막기 위한 Android 앱.
 
 ---
 
-## 기술 스택
-- 언어: Kotlin, UI는 Jetpack Compose (Material3)
-- 화면 감지: Android AccessibilityService API
-- 비동기: Kotlin Coroutines
-- Layer 2 판별: Gemini (`HttpURLConnection` 직접 호출, 의존성 추가 없음)
-- 저장소: Room DB + WorkManager (블랙리스트 주 1회 갱신)
-- Min SDK: API 26 (Android 8.0) / target·compile SDK 36
+## main과 무엇이 다른가
 
----
-
-## 3-Layer 구조
-
-`GuardianAccessibilityService` 하나가 이벤트를 받아 루트 노드를 한 번만 가져오고 각 레이어에 배분한다.
-
-| | 무엇을 잡나 | 표시 | 터치 |
-|---|---|---|---|
-| **Layer 1** | 공식 광고 표기(광고·Sponsored·AD)와 광고 네트워크 컨테이너 id | 주황 **실선** + "AD 광고" | 통과 |
-| **Layer 2** | 라벨 없는 광고를 판별기로 추정 | 노랑 **점선** + "AI 광고 같아요" | 통과 |
-| **Layer 3** | 앱 설치 유도(스토어 이동, 설치 버튼 클릭) | 차단 경고 팝업 | **수신** |
-
-Layer 1·2 오버레이는 `TYPE_ACCESSIBILITY_OVERLAY` + `FLAG_NOT_TOUCHABLE`이다. **이 플래그는 절대 제거하면 안 된다** — 광고 클릭·구매·설치를 방해하면 구글 정책 위반이다. Layer 3만 터치를 받는데, 이는 광고 방해가 아니라 설치 직전 개입이라 성격이 다르다.
-
-### "AD 광고"와 "AI 광고 같아요"의 차이
-
-같은 판정의 강약이 아니라 **근거가 다른 별개 경로**다.
-
-| | **AD 광고** (주황 실선) | **AI 광고 같아요** (노랑 점선) |
+| | `main` (린 버전) | `integration/2layer` (이 브랜치) |
 |---|---|---|
-| 근거 | 화면에 **"광고"라고 적혀 있음** | 문구가 **광고처럼 보임** |
-| 판정 | 문자열 정확 일치 (참/거짓) | 점수 ≥ 0.6 (확률) |
-| 옵트인 토글 | 무관, 항상 동작 | **켜야만** 동작 (기본 OFF) |
-| 실행 시점 | 화면 바뀔 때마다 즉시 | 스크롤 멈춘 뒤 600ms |
-| 외부 전송 | 없음 | 카드 텍스트 (마스킹 후) |
+| 레이어 | 3-Layer (감지 / AI / 설치차단) | **2-Layer + 액션바** |
+| Layer 2 실행 | 스크롤 멈춘 뒤 600ms 자동 | **[광고 찾기]를 누를 때만** |
+| 대응 UI | 전체 화면 경고 팝업 (터치 가로챔) | **상시 액션바, 화면을 막지 않음** |
+| 광고 닫기 | 없음 | 어포던스 탐지 → 대리 클릭 |
+| 저장소 | Room | `VerdictStore` 인메모리 (task 4에서 교체) |
+| 로그 | `AdEventLogger` | `DetectionLog` (원문이 못 들어가는 시그니처) |
+| 악성 URL | 블랙리스트 dead code | `MaliciousUrlSource` (항상 false, 크롬 한정) |
+| 의존성 | Room · WorkManager 포함 | **Kotlin + Compose + Coroutines만** |
 
-중복은 구조적으로 막혀 있다. `CandidateExtractor.extract(root, exclude = confirmedRegions)`가 Layer 1이 잡은 영역과 조금이라도 겹치는 가지를 통째로 버리므로, **점선은 항상 "Layer 1이 못 찾은 것"만 가리킨다.** 한 광고에 실선과 점선이 겹치는 일은 없다.
-
-점선이 틀릴 수 있다는 뜻을 UI로 구분해둔 것이다 — 실선/점선, "광고"/"광고 같아요".
+**가장 큰 변화는 Layer 2의 트리거다.** 화면 텍스트가 외부로 나가는 유일한 지점이
+사용자의 명시적 동작과 1:1로 대응하게 만들었다. 자동 실행 경로(`scheduleLayer2` /
+`LAYER2_IDLE_MS`)는 아예 만들지 않았다.
 
 ---
+
+## task 매핑 — Layer 3은 다섯 갈래로 흩어진다
+
+이 재구축의 핵심이다. 원본 `guard/InstallGuard.kt` 하나가 하던 일이 이렇게 나뉜다.
+
+| 원본 InstallGuard의 책임 | 새 위치 | task |
+|---|---|---|
+| `storePackages` 매칭 | `rule/EscapeRules` | **1** (룰 판정) |
+| `InstallTriggerRules.isInstallTrigger()` | `rule/EscapeRules` | **1** (룰 판정) |
+| `GLOBAL_ACTION_BACK` + HOME 폴백 | `action/EscapeAction` | **3** |
+| `OverlayManager.showWarning()` (경고 UI) | `action/ActionBar` | **2** (액션바 공유) |
+| `AdEventLogger` 기록 | `store/DetectionLog` | **4** (이 저장소 범위 밖) |
+| `KakaoNotifier` 전송 | 없음 | **5** (이 저장소 범위 밖) |
+
+**"Layer 3 = task 3"이 아니다.** 판정은 task 1로 내려가고, UI는 task 2가 만드는
+액션바에 얹히고, 기록·알림은 이 저장소를 떠난다. task 3에 남는 것은 **탈출 동작
+그 자체**뿐이다.
+
+그래서 **task 3은 task 2 없이 완성될 수 없다.** 실제 순서는 task 2 → task 3이다.
+
+### 저장소 범위
+
+```
+GuArDian = task 1 + task 2 + task 3
+           (감지 · 닫기 · 탈출 — 전부 기기 안에서 끝나는 것)
+
+범위 밖  = task 4 (DB · 서버 · 로그 집계)
+           task 5 (가족 그룹 · Insight Report · 카카오)
+```
+
+범위 밖이라도 **붙일 자리는 남겼다.** `store/`의 인터페이스 셋이 그 이음매고,
+**구현체는 전부 no-op이지만 호출부는 전부 배선돼 있다.** 호출부가 없으면 나중에
+붙일 때 서비스를 다시 뜯어야 한다.
+
+---
+
+## 흐름
+
+```
+onAccessibilityEvent(event)
+│
+├─ Layer 1 (룰 판정) — 항상, 자동
+│  ├─ RuleEngine.scan(root)        → List<Rect> → BorderTracker → 실선 테두리
+│  ├─ RuleEngine.checkPackage(pkg) → Escape(STORE_REDIRECT)
+│  ├─ RuleEngine.checkClick(text)  → Escape(INSTALL_TRIGGER)
+│  └─ RuleEngine.checkUrl(root)    → Escape(MALICIOUS_URL)   ※ 크롬 한정, 지금은 항상 null
+│
+├─ Layer 2 (Agent) — [광고 찾기]를 누를 때만
+│  └─ findAdsNow() → AgentPipeline → List<Rect> → 점선 테두리
+│     (캐시만 보는 스크롤 경로는 유지 — 판별한 카드는 스크롤해도 점선이 따라온다)
+│
+└─ ActionBar (대응) — 주 버튼 하나
+   우선순위: BUSY > [돌아가기] > [광고 닫기] > [광고 찾기] > 없음
+```
 
 ## 파일 구조
 
 ```
 app/src/main/java/com/guradian/
-├── service/GuardianAccessibilityService.kt  ← 단일 진입점, 레이어 배분
+├── service/
+│   └── GuardianAccessibilityService.kt   단일 진입점. 레이어 배분만
 │
-├── region/                     Layer 1 (팀원 AdDetectService에서 이식)
-│   ├── AdLabelRules.kt         광고 라벨/컨테이너 id 판정 (순수 함수)
-│   └── AdRegionScanner.kt      노드 트리 순회 → 광고 영역
+├── rule/                                 ← Layer 1 · task 1
+│   ├── AdLabelRules.kt                   광고 라벨/컨테이너 id 판정 (순수 함수)
+│   ├── AdRegionScanner.kt                노드 트리 순회 → 광고 영역
+│   ├── EscapeRules.kt                    스토어 패키지 + 위험 문구 판정 (순수 함수)
+│   ├── BrowserHost.kt                    크롬 주소창 → host
+│   └── RuleEngine.kt                     위 넷의 단일 진입점
 │
-├── agent/                      Layer 2 파이프라인
-│   ├── CandidateExtractor.kt   Agent1: 노드트리 → 카드 단위 후보
-│   ├── AdClassifier.kt         Agent2 인터페이스 ← 판별기 교체점
-│   ├── GeminiClassifier.kt       Gemini 직접 호출 (출처를 함께 넘긴다)
-│   ├── StubClassifier.kt         키 없을 때의 규칙 기반 대역 (LLM 아님)
-│   ├── CrossValidator.kt       Agent4: viewId 약한 신호로 ±0.15
-│   ├── AgentPipeline.kt        캐시 조회 → 판별 → 저장 → 표시
-│   ├── CardText.kt             마스킹 · 정규화 · 캐시 키
-│   └── RateLimiter.kt          시간당 호출 상한 (토큰버킷)
+├── agent/                                ← Layer 2 · task 1
+│   ├── AdCandidate.kt
+│   ├── CandidateExtractor.kt             Agent1
+│   ├── AdClassifier.kt                   인터페이스 (교체점)
+│   ├── GeminiClassifier.kt               HttpURLConnection 직접 호출
+│   ├── StubClassifier.kt                 키 없을 때 규칙 기반 대역
+│   ├── CrossValidator.kt                 Agent4
+│   ├── AgentPipeline.kt                  캐시 → 판별 → 표시
+│   ├── CardText.kt                       마스킹 · 정규화 · 캐시 키
+│   └── RateLimiter.kt                    토큰버킷
 │
-├── guard/                      Layer 3
-│   ├── InstallGuard.kt         스토어 이동 · 설치 버튼 클릭 감지
-│   └── InstallTriggerRules.kt  위험 문구 판정 (순수 함수)
+├── action/                               ← task 2 · task 3
+│   ├── ActionBar.kt                      상시 액션바 (순수 View)
+│   ├── ActionBarState.kt                 주 버튼 상태 머신 (순수 함수)
+│   ├── CloseAffordanceFinder.kt          task 2 — 닫기·건너뛰기 탐지
+│   └── EscapeAction.kt                   task 3 — BACK + HOME 폴백
 │
 ├── overlay/
-│   ├── AdBorderOverlay.kt      Layer 1·2 비차단 테두리 (한 창에 함께)
-│   └── OverlayManager.kt       Layer 3 차단 경고 팝업
+│   ├── AdBorderOverlay.kt                비차단 테두리 (실선/점선)
+│   └── BorderTracker.kt                  스캔 주기 · 스크롤 추종 · 히스테리시스
 │
-├── detector/                   블랙리스트 (현재 소비자 없음 — 아래 참고)
-│   ├── db/                     Room: blacklist_domains, ad_verdict
-│   ├── BlacklistRepository.kt  원격 목록 다운로드/파싱/교체
-│   ├── BlacklistUpdateWorker.kt  주 1회 갱신
-│   ├── DomainMatcher.kt        접미사 분해 O(1) 매칭
-│   └── AdDetector.kt           ⚠️ dead code — 생성 지점 없음
+├── store/                                ← 이음매 (task 4가 여기에 붙는다)
+│   ├── VerdictStore.kt                   interface + InMemoryVerdictStore
+│   ├── DetectionLog.kt                   interface + NoopDetectionLog
+│   └── MaliciousUrlSource.kt             interface + EmptyMaliciousUrlSource
 │
-├── logger/AdEventLogger.kt     이벤트 기록 (전송 경로 없음 — 아래 참고)
 ├── ui/
-│   ├── ServiceStatus.kt        서비스가 실제로 살아있는지 확인
+│   ├── ServiceStatus.kt
 │   └── BatteryOptimizationGuide.kt
-└── MainActivity.kt             상태 화면 + AI 판별 옵트인 토글
+├── MainActivity.kt                       상태 화면 + AI 판별 토글
+└── GuardianApp.kt                        Application
 ```
 
 ---
 
-## 원본과 달라진 점
+## 이음매 세 개
 
-**린 버전 = 감지 핵심 기능은 전부 유지, 카카오 연동만 제거.** 잘라낸 것은 원본 저장소(`phase2-gemini-classifier`)에 그대로 남아 있어 언제든 되가져올 수 있다.
+```kotlin
+// store/VerdictStore.kt
+interface VerdictStore {
+    suspend fun get(key: String): Verdict?
+    suspend fun put(key: String, verdict: Verdict)
+}
+// 지금: InMemoryVerdictStore(maxEntries = 500, ttlMillis = 30일)
+// task 4: RoomVerdictStore
 
-| 제거한 것 | 사유 |
-|---|---|
-| `notification/KakaoNotifier.kt` · `PendingNotificationQueue.kt` | 카카오 비즈 앱 검수 미승인. 호출해도 메시지 API가 거부한다 |
-| `ui/SetupActivity.kt` | 카카오 로그인 전용 화면. 로그인을 취소하면 흰 화면에 갇히는 버그도 있었다 |
-| 카카오 SDK 의존성 · `devrepo.kakao.com` 저장소 · `KAKAO_NATIVE_APP_KEY` 주입 | 위와 한 몸 |
-| `AuthCodeHandlerActivity` · `<queries>com.kakao.talk` · `POST_NOTIFICATIONS` | 위와 한 몸 |
-| `AdEventLogger`의 **전송 경로** | 카카오 전송이 실체의 전부였다. 이벤트 기록(`Log.i`)만 남기고 호출부는 그대로 뒀다 — 나중에 알림이 붙을 때 이 구현만 바꾸면 된다 |
+// store/DetectionLog.kt
+interface DetectionLog {
+    fun onAdDetected(source: String, count: Int, aiGuessed: Boolean)
+    fun onAdClosed(source: String, succeeded: Boolean)
+    fun onEscape(reason: EscapeReason, hostHash: String?)
+}
+// 지금: NoopDetectionLog (Log.i 한 줄만)
+// task 4: RoomDetectionLog + 서버 전송 큐
 
-이름도 함께 바꿨다: 패키지 `com.senioradguard` → `com.guradian`, `AdGuardAccessibilityService` → `GuardianAccessibilityService`, `SeniorAdGuardApp` → `GuardianApp`. `applicationId`가 달라져 **원본 앱과 한 기기에 나란히 설치된다** — 실기기 3종으로 A/B를 볼 때 필요하다.
-
-**감지 로직은 한 글자도 바뀌지 않았다.** `AdLabelRules` / `AdRegionScanner` / `CandidateExtractor` / `AgentPipeline` / `InstallTriggerRules` / `AdBorderOverlay`의 판정 규칙·상수·스크롤 추종 장치 전부 원본 그대로다.
-
-### 2-Layer 재구축은 별도 브랜치
-
-발표 아키텍처(2-Layer + 상시 액션바 + task 1~5 매핑)로 재구축하는 작업은 `integration/2layer` 브랜치에서 진행한다. main은 지금 동작하는 이 3-Layer 구조를 유지한다. 계획은 [`guardian-build-plan.md`](../guardian-build-plan.md) 참고.
-
----
-
-## 감지 대상 앱
-
-`targetApps` = 유튜브 / 인스타그램 / 당근 / 크롬. 스토어(Play, 갤럭시)는 Layer 3 전용.
-
-**삼성 인터넷은 제외했다.** 렌더링된 웹 페이지를 접근성 트리에 노출하지 않는다 — 같은 URL에서 크롬은 노드 421개에 본문 텍스트가 나오는 반면 삼성 인터넷은 노드 20개(주소창·버튼 등 UI 껍데기)에 텍스트가 0개다. 볼 수 있는 정보가 없어 코드로는 해결이 불가능하다. **다른 브라우저를 추가할 때도 이 방법으로 노출 여부를 먼저 확인할 것**, 그리고 `targetApps`와 `AdRegionScanner.browsers` **양쪽에** 넣어야 한다.
-
-## 감지 한계
-- 유튜브 인스트림 광고(영상 내부): 비디오 플레이어 안이라 접근 불가
-- 네이버식 광고: 라벨이 `clickable=false` 노드에 있어 `adLinkOf`가 영역을 못 잡음
-- 카카오톡·네이버 앱: 대상 목록에 없음 (프라이버시 범위를 좁히려는 의도적 선택)
-
----
-
-## Layer 2 상세
-
-```
-스크롤 멈춤 600ms
-   ↓
-Agent1  CandidateExtractor   카드 단위 후보 (Layer 1이 잡은 영역은 제외)
-   ↓
-        캐시 조회 (Room)     히트면 판별 없이 즉시 표시
-   ↓ 미스 (1회 최대 3건)
-Agent2  AdClassifier         광고 여부 판정 (Gemini, 키 없으면 Stub)
-   ↓
-Agent4  CrossValidator       viewId 약한 신호로 ±0.15
-   ↓
-        저장 + 0.6 이상이면 점선 표시
+// store/MaliciousUrlSource.kt
+interface MaliciousUrlSource {
+    suspend fun isMalicious(host: String): Boolean
+}
+// 지금: EmptyMaliciousUrlSource — 항상 false
+// task 4: KISA 공공데이터포털 기반 구현
 ```
 
-**판별기는 `local.properties`의 `GEMINI_API_KEY` 유무로 갈린다.** 키가 있으면 `GeminiClassifier`, 없으면 `StubClassifier`로 물러나 키 없이도 빌드·실행된다. 어느 쪽이 도는지는 로그 한 줄로 확인한다: `layer2 판별기=GEMINI:...` 또는 `layer2 판별기=STUB`.
+**`DetectionLog`에는 화면 텍스트 원문이 들어가지 않는다.** "보내지 않는다 — 화면
+텍스트 원문 · URL 전문"을 문서가 아니라 **인터페이스 시그니처 단계에서 강제**한다.
+`hostHash`는 `DetectionLog.hashHost()`가 만드는 SHA-256이다. 나중에 구현체를
+잘못 만들어도 원문이 새어나갈 통로 자체가 없다.
 
-**`StubClassifier`는 진짜 판별기가 아니다.** 파이프라인 전 구간을 실기기에서 돌려보기 위한 규칙 기반 대역이다. 문맥을 이해하지 못하므로 이 판정 품질을 LLM 품질로 오해하면 안 된다 (지마켓 "슈퍼딜" 오탐 사례가 아래에 있다).
-
-**API 키를 앱에 두면 안 된다.** APK는 누구나 뜯을 수 있어 키가 그대로 추출된다. `local.properties` → `BuildConfig`는 개발 중에만 쓰고, 배포 전에는 우리 서버를 거치는 구현체로 교체해야 한다. `AdClassifier`가 그 교체점이고 거기 말고는 손댈 곳이 없다.
-
-**캐시 키** = `"$sourceKey|SHA-256(정규화 텍스트)"`. 정규화에서 숫자를 `#`으로 바꾸는 게 핵심이다 — 카운트다운·가격·조회수가 볼 때마다 달라서 그대로 두면 같은 광고인데 매번 미스가 난다. 부정 판정(`isAd=false`)도 저장하며 절감의 대부분이 여기서 나온다. TTL 30일.
-
-**Agent4가 원 요구사항과 다른 이유**: HTML 클래스명 교차검증은 안드로이드 접근성 API로 불가능하다. 크롬이 노출하는 것은 HTML `id`뿐이고(`viewIdResourceName`), CSS `class`는 접근성 트리에 실리지 않는다. `AccessibilityNodeInfo.className`은 안드로이드 위젯 이름이라 무관하다. 그래서 id의 약한 신호로 대체했다. 신호가 **없을 때는 점수를 깎지 않는다** — 네이티브 앱 id는 대개 광고와 무관한 이름이라, 없다고 깎으면 앱 안의 진짜 광고가 전부 임계값 아래로 밀린다.
-
-**부하·프라이버시 제어**: 유휴 600ms 후 실행 / 1회 최대 3건 / 시간당 60건 / 입력 400자 절단 / 전화·카드·주민번호 마스킹 / 입력 필드를 포함한 카드 제외 / **기본 OFF 옵트인**. Layer 1·3은 토글과 무관하게 항상 동작한다. 429(무료 티어 상한)를 받으면 5분간 판별을 쉰다.
+**이 규칙을 깨는 파라미터를 추가하지 말 것.** 원문이 필요해 보이면 그건 집계
+방식을 다시 생각해야 한다는 신호다.
 
 ---
 
-## 테두리가 스크롤을 따라오는 방법 — 두 개의 속도
+## 액션바 — "큰 버튼 하나"
 
-트리 순회는 아무리 조여도 150~250ms가 걸린다. 여기에 스로틀이 얹히면 광고가 움직인 뒤 테두리가 따라오기까지 수백 ms인데, 60fps는 16.7ms다. **스캔 주기를 손보는 방식으로는 원리적으로 스무스해질 수 없다.** 그래서 두 갈래로 나눈다.
+| 상황 | 주 버튼 | 색 | 동작 |
+|---|---|---|---|
+| 진행 중 | **찾는 중…** | 회색 | (비활성) |
+| Escape 상태 | **돌아가기** | 빨강 | BACK → 안 바뀌면 HOME |
+| 광고 테두리 있음 | **광고 닫기** | 주황 | 어포던스 탐지 → `ACTION_CLICK` |
+| AI 판별 ON | **광고 찾기** | 파랑 | Layer 2 1회 실행 |
+| 그 외 | 없음 | | |
 
-- **빠른 쪽 (매 스크롤 이벤트)** — 노드를 하나도 읽지 않고 이미 그려둔 테두리를 `scrollDeltaY`만큼 즉시 민다. `layoutParams`만 고치므로 프레임 단위로 붙는다.
-- **느린 쪽 (스로틀된 스캔)** — 진짜 좌표를 찾아 추정치를 보정한다. 결과는 항상 몇백 ms 전의 화면이므로 `scrollSinceScanStart`만큼 되밀어 그린다. 이 보정이 없으면 스캔이 끝날 때마다 테두리가 뒤로 튄다.
+어르신에게 버튼 세 개를 동시에 주면 고르는 일 자체가 부담이다. 지금 상황에서 가장
+필요한 하나만 크게 보여준다. `busy`가 전부를 이기는 이유는, 손 밑에서 버튼이 다른
+기능으로 바뀌면 두 번째 누름이 엉뚱한 동작을 실행하기 때문이다.
 
-느린 쪽을 제 시간에 끝나게 하는 장치가 다섯 개 있다. **하나라도 빠지면 테두리가 옛 자리에 얼어붙거나 깜빡인다.**
+### 구현 제약 (반드시 지킬 것)
 
-1. `TYPE_VIEW_SCROLLED` 구독 — 순수 스크롤에서는 `CONTENT_CHANGED`가 오지 않는다. 가장 큰 원인이었다
-2. 트레일링 스로틀 — 겹친 요청을 버리지 않고 미룬다 (버리면 드래그의 마지막 위치를 잃는다)
-3. 스캔 예산 — 순회 시간 상한 (`AdRegionScanner` 주석 참고)
-4. 잘린 결과 홀드 — 최대 3회까지 직전 영역을 붙잡는다
+- `TYPE_ACCESSIBILITY_OVERLAY` + **서비스 컨텍스트**(`this`). `applicationContext`를
+  쓰면 창 토큰이 없어 `BadTokenException`으로 죽는다
+- **Compose 아님, 순수 View.** 오버레이 창에는 `ViewTreeLifecycleOwner`·
+  `SavedStateRegistryOwner`가 없다
+- 테두리 창(`FLAG_NOT_TOUCHABLE`)과 **별도 창**이어야 한다. 합치면 둘 다 터치를
+  받거나 둘 다 통과시킨다
+- 터치 타깃 72dp, 글자 24sp 이상
+- **광고 위에 겹치지 않는다** — 하단 바가 광고 `Rect`와 겹치면 상단으로 옮긴다.
+  광고를 가리면 구글 정책 위반
+
+### `ACTION_CLICK` 정책
+
+**대리 클릭은 사용자가 `[광고 닫기]`를 누른 경우에만 한다.** 자동으로 닫으면 그건
+광고 차단이고 정책 위반이다. 우리가 하는 일은 "닫기 버튼이 저기 있는데 너무 작아서
+못 누르는 사람 대신 눌러주는 것"이지 "광고를 없애는 것"이 아니다.
+**호출부는 액션바 클릭 핸들러 하나뿐이어야 한다.**
+
+---
+
+## 스크롤 추종 — 두 개의 속도
+
+트리 순회는 아무리 조여도 150~250ms가 걸린다. 60fps는 16.7ms다. **스캔 주기를
+손보는 방식으로는 원리적으로 스무스해질 수 없다.** 그래서 두 갈래로 나눈다.
+
+- **빠른 쪽 (매 스크롤 이벤트)** — 노드를 하나도 읽지 않고 이미 그려둔 테두리를
+  `scrollDeltaY`만큼 즉시 민다. `layoutParams`만 고치므로 프레임 단위로 붙는다.
+- **느린 쪽 (스로틀된 스캔)** — 진짜 좌표를 찾아 보정한다. 결과는 몇백 ms 전의
+  화면이므로 `scrollSinceScanStart`만큼 되밀어 그린다. 이 보정이 없으면 스캔이
+  끝날 때마다 테두리가 뒤로 튄다.
+
+느린 쪽을 제 시간에 끝나게 하는 장치 다섯 개. **하나라도 빠지면 얼어붙거나 깜빡인다.**
+
+1. `TYPE_VIEW_SCROLLED` 구독 — 순수 스크롤에서는 `CONTENT_CHANGED`가 오지 않는다
+2. 트레일링 스로틀 — 겹친 요청을 버리지 않고 미룬다
+3. 스캔 예산 — 순회 시간 상한
+4. 잘린 결과 홀드 — 최대 3회
 5. 히스테리시스 — 나타날 때 즉시, 사라질 때 700ms 대기
 
-**주사율 통일은 최종본 이후로 미뤄뒀다.** 실험 기기 3종의 주사율이 달라 지금 맞춰봐야 한 대 기준으로만 맞는다. 위 상수(`SCAN_INTERVAL_MS` 200 / `RECHECK_MS` 1000 / `CLEAR_DELAY_MS` 700 / `LAZY_RESCAN_MS` 600·1800·3500)는 그때까지 손대지 않는다.
+원본에서는 이게 전부 서비스 안에 흩어져 있었다. `overlay/BorderTracker.kt` 한
+클래스로 뽑았고 **로직과 상수는 한 글자도 바꾸지 않았다.**
+
+**주사율 통일은 최종본 이후로 미뤘다.** 실험 기기 3종의 주사율이 달라 지금
+맞춰봐야 한 대 기준으로만 맞는다. `SCAN_INTERVAL_MS` 200 / `RECHECK_MS` 1000 /
+`CLEAR_DELAY_MS` 700 / `MAX_TRUNCATED_HOLDS` 3 / `LAZY_RESCAN_MS` 600·1800·3500은
+그때까지 손대지 않는다.
 
 ---
 
-## 현재 상태
+## 감지 한계
 
-단위 테스트 **74건 통과** (`./gradlew testDebugUnitTest`).
-
-실기기(갤럭시 S24, SM-S921N)에서 원본으로 검증한 것 — 로직이 동일하므로 그대로 유효하다:
-
-| 확인 항목 | 결과 |
-|---|---|
-| Layer 1 — 유튜브 쇼츠 광고, 크롬 광고 카드 테두리 | 동작 |
-| Layer 1 — 스크롤 추종 (즉시 offset + 되밀기 보정) | 동작 |
-| Layer 2 — 후보 추출 → 캐시 → 판별 → 점선 표시 | 동작 (gmarket에서 `캐시=1 판별=0`으로 재사용 확인) |
-| Layer 2 — 기사 페이지 오탐 | 없음 (hankyung `후보=4 판별=3 표시=0`) |
-| Layer 2 — 옵트인 OFF 시 | 파이프라인 자체가 돌지 않음 |
-| Layer 2 — Gemini 표본 검증 | 12/12 (쇼핑몰 자체 특가·기사·앱 UI·대출·경품 미끼) |
-| Layer 3 — 스토어 이동 경고 / 뒤로 가기 / 무시하기 | 모두 동작 |
-| 서비스 상태 표시 — 접근성 해제 시 경고 | 동작, 콜드 스타트 오탐 없음 |
-| 메모리 (서비스만, 광고 페이지 25회 스크롤) | Java 27→30MB, Native 53→49MB — 누수 없음 |
-
-두 레이어는 실제로 서로를 보완했다. 한경은 광고에 AD 라벨이 붙어 Layer 1이 처리했고(Layer 2는 기사에 아무것도 표시하지 않음), 지마켓은 라벨이 없어 Layer 2만 반응했다.
-
-**스텁이 지마켓 "슈퍼딜" 캐러셀을 광고로 잡은 것은 오탐이다** — 그 쇼핑몰 자체 상품 영역이다. "특가·무료배송·할인"만 보고 판단해서 생기는 전형적인 문맥 실패이고, `GeminiClassifier`가 출처(`sourceKey`)를 함께 넘겨 판정하는 이유가 이것이다.
-
-**아직 안 되는 것**
-- **Agent3 (Vision)** — 이미지만 있는 광고 판별. 미착수
-- **보호자 알림 · Insight Report** — 이 저장소의 범위 밖
-
-**정리 필요**
-- `detector/AdDetector.kt`는 **생성 지점이 없는 dead code**다. 그 결과 `BlacklistUpdateWorker`가 주 1회 14만 개 도메인을 받아 DB에 쓰는데 **읽는 코드가 없다.** 나중에 쓸 자산이라 지우지 않았지만, 그때까지 워커를 멈출지 결정이 필요하다 (배터리는 이 앱이 삼성 절전에 얼어붙는 원인이기도 하다).
+- **유튜브 인스트림 광고**(영상 내부): 비디오 플레이어 안이라 접근성 트리에 없다.
+  **이 설계로 해결되지 않는 구조적 한계다.**
+- **네이버식 광고**: 라벨이 `clickable=false` 노드에 있어 `adLinkOf`가 영역을 못 잡는다
+- **삼성 인터넷**: 렌더링된 웹 페이지를 접근성 트리에 노출하지 않는다 — 같은 URL에서
+  크롬은 노드 421개에 본문 텍스트가 나오는 반면 삼성 인터넷은 노드 20개에 텍스트가
+  0개다. 볼 정보가 없어 코드로는 해결 불가라 `targetApps`에서 뺐다
+- **악성 URL은 크롬 한정**: 인스타·유튜브·당근에는 URL이라는 개념이 접근성 트리에
+  없다. 구현체를 아무리 좋게 만들어도 이 한계는 사라지지 않는다
+- **카카오톡·네이버 앱**: 대상 목록에 없음 (프라이버시 범위를 좁히려는 의도적 선택)
 
 ---
 
-## 실기기 테스트 시 반드시 지킬 것
-
-**`am force-stop`이나 재설치를 하면 Android가 안전장치로 `enabled_accessibility_services` 설정을 지운다.** 항상 **설치/force-stop → 접근성 서비스 재활성화 → 앱 실행** 순서로 할 것. 반대로 하면 설정에 "활성화됨"으로 보여도 실제로는 이벤트를 받지 못한다. `scripts/redeploy.sh`가 이 순서를 지킨다.
-
-```bash
-./scripts/redeploy.sh
-adb logcat -s GurADian   # layer2 판별기=... / 후보·캐시·판별·표시 카운트
-```
-
-그 외 함정들:
-- **`uiautomator dump`는 다른 접근성 서비스를 꺼버린다** (`accessibility_enabled=0`). 진단하려던 서비스를 진단 도구가 죽인다.
-- **삼성 One UI는 일반 앱의 `Log.d`/`Log.v`를 억제한다.** `Log.i` 이상을 쓸 것.
-- **Jetpack Compose `Button`은 터치 클릭 시 `TYPE_VIEW_CLICKED`를 보내지 않는다.** Layer 3을 테스트하려면 네이티브 View/WebView로 재현할 것 (실제 광고 팝업은 대부분 네이티브라 로직 자체엔 문제 없음).
-- Git Bash에서 `/sdcard/...` 경로는 MSYS가 변환해버린다. `MSYS_NO_PATHCONV=1`을 붙일 것.
-
----
-
-## 빌드
-
-`local.properties`에 아래를 둔다 (버전 관리 제외).
+## 빌드와 검증
 
 ```properties
+# local.properties (버전 관리 제외)
 sdk.dir=/path/to/Android/Sdk
 GEMINI_API_KEY=...     # 없어도 빌드된다 — StubClassifier로 물러난다
 ```
 
+```bash
+./gradlew testDebugUnitTest    # 단위 테스트 97건
+./scripts/redeploy.sh          # 실기기 배포 (접근성 재활성화 순서 포함)
+adb logcat -s GurADian
+```
+
+실기기 검증 항목은 [`docs/실기기-검증-체크리스트.md`](docs/실기기-검증-체크리스트.md).
+
+**`GEMINI_API_KEY`가 없으면 `StubClassifier`로 떨어진다.** 스텁은 문맥을 못 읽어
+지마켓 "슈퍼딜"(그 쇼핑몰 자체 상품 영역)을 광고로 오탐한 전례가 있고, 버튼을 눌러
+부르는 구조에서는 사용자가 결과를 기다리므로 오탐이 그대로 평가받는다.
+`layer2 판별기=` 로그로 어느 쪽이 도는지 먼저 확인할 것.
+
 ---
 
-## 주의사항
-- `SYSTEM_ALERT_WINDOW` 권한: Play Store 심사 시 접근성 목적 명시 필요
-- 제조사 절전(삼성 Freecess)이 서비스를 얼릴 수 있다 → 배터리 예외 안내 + 상태 표시로 대응 중
-- 오탐 방지: 표시 임계값 0.6으로 보수적 설정
-- 팀원 이식 코드(`AdLabelRules`, `AdRegionScanner`)의 **로직과 상수는 변경 금지**. 실기기에서 부딪혀 나온 대응이라 손대면 회귀한다
+## 브랜치
+
+```
+main (린 버전 — 3-Layer, 카카오만 제거)   ← 건드리지 않는다
+ │
+ └── feat/2layer-scaffold                  재구축 뼈대 (region 주석)
+      └── feat/layer1-rule                 rule/ · overlay/ · MaliciousUrlSource
+           └── feat/layer2-agent           agent/ · VerdictStore · findAdsNow()
+                └── feat/action-bar        action/ · DetectionLog
+                                  ↓
+                        integration/2layer  (A → B → C 순서로 병합)
+```
+
+계획서 §5는 세 브랜치를 main에서 나란히 띄우는 그림이었지만, 실제로는 B가 A의
+`BrowserHost`를, C가 A의 `confirmedRegions`와 B의 `findAdsNow()`를 소비하므로
+그 순서대로 쌓았다. 계획서 §5.1이 지정한 병합 순서(A → B → C)와 같다.
+
+## 남은 항목
+
+- 어포던스 탐지 휴리스틱 — 앱별 실기기 튜닝 (지금은 인터페이스·배선까지)
+- 주사율 통일 — 실험 기기 3종, 최종본 이후
+- KISA 악성 URL 소스 — 공공데이터포털 API 신청·포맷
+- task 4·5 백엔드 (FastAPI + PostgreSQL) 착수 시점
+- Agent3 (Vision) — 이미지만 있는 광고 판별. 미착수

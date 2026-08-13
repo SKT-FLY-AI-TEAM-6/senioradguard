@@ -116,8 +116,11 @@ class CandidateExtractor {
      * 캐시 키의 앞부분. 브라우저는 주소창에서 도메인을 읽고, 앱은 패키지명을 쓴다.
      * 도메인을 쓰는 이유는 같은 사이트의 같은 광고가 재방문 때 캐시에 걸리게 하기
      * 위함이다 — 크롬 하나로 묶으면 사이트가 달라도 같은 키를 공유해 오염된다.
+     *
+     * Layer 1 경로(보호자 기록의 중복 제거)도 같은 키를 써야 해서 공개해 둔다.
+     * 노드 한 개(주소창)만 조회하므로 스캔마다 불러도 부담이 없다.
      */
-    private fun sourceKeyOf(root: AccessibilityNodeInfo): String {
+    fun sourceKeyOf(root: AccessibilityNodeInfo): String {
         val pkg = root.packageName?.toString() ?: return "unknown"
         if (pkg != "com.android.chrome") {
             lastBrowserHost = null

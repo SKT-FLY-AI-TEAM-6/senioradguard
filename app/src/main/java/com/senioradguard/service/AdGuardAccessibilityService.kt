@@ -17,6 +17,7 @@ import com.senioradguard.agent.GeminiClassifier
 import com.senioradguard.agent.StubClassifier
 import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.guard.InstallGuard
+import com.senioradguard.logger.AdEventLogger
 import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.AdMarkStyle
 import com.senioradguard.overlay.OverlayManager
@@ -28,6 +29,36 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * 보호자에게 이미 알린 광고인지 기억한다.
+ *
+ * Layer 1·2는 스크롤할 때마다 같은 광고를 다시 표시한다. 표시할 때마다 원격에
+ * 남기면 한 페이지를 훑는 동안 같은 광고가 수십 건 쌓여 보호자 화면이 쓸모없어진다.
+ * 그래서 **출처(도메인/패키지) + 레이어 조합당 한 번만** 남긴다.
+ *
+ * 서비스가 살아있는 동안만 기억하며, 용량을 넘기면 오래된 것부터 버린다. 버려진
+ * 출처를 나중에 다시 방문하면 한 번 더 남는데, 그 정도 중복은 감수한다 —
+ * 영구 저장을 하면 "어제 본 광고를 오늘 다시 봤다"를 영영 못 알리게 된다.
+ */
+internal class SightingLog(private val capacity: Int = 128) {
+
+    private val seen = object : LinkedHashMap<String, Boolean>(32, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>) =
+            size > capacity
+    }
+
+    /** 처음 보는 조합이면 true를 돌려주고 기억한다. */
+    fun shouldReport(sourceKey: String, layer: Int): Boolean {
+        val key = "$sourceKey|L$layer"
+        // containsKey가 아니라 get이어야 한다 — LinkedHashMap의 접근 순서는
+        // get/put만 갱신한다. containsKey로 조회하면 자주 보는 사이트가
+        // "오래 안 본 것"으로 취급돼 먼저 밀려나고 중복 기록이 난다.
+        if (seen[key] != null) return false
+        seen[key] = true
+        return true
+    }
+}
 
 /**
  * 스크롤이 언제 멈출지 예측한다.
@@ -228,6 +259,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private var contentEventsTotal = 0
 
     private val extractor = CandidateExtractor()
+
+    /** 같은 광고를 보호자에게 반복해서 알리지 않도록 막는다. */
+    private val sightings = SightingLog()
 
     private val pipeline by lazy {
         // 키가 없는 팀원도 빌드·실행이 되도록 스텁으로 물러난다. 판정 품질은
@@ -451,7 +485,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 } else {
                     emptyList()
                 }
-                withContext(Dispatchers.Main) { apply(confirmed, guessed) }
+                // 트리 접근은 이 백그라운드 블록에서 끝낸다 (apply는 메인 스레드).
+                val sourceKey = runCatching { extractor.sourceKeyOf(root) }.getOrNull()
+                withContext(Dispatchers.Main) { apply(confirmed, guessed, sourceKey) }
             } finally {
                 scanning.set(false)
             }
@@ -557,7 +593,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         aiMarksShown = false
     }
 
-    private fun apply(confirmed: List<Rect>, guessed: List<Rect>) {
+    private fun apply(confirmed: List<Rect>, guessed: List<Rect>, sourceKey: String? = null) {
         handler.removeCallbacks(recheck)
         if (confirmed.isNotEmpty() || guessed.isNotEmpty()) handler.postDelayed(recheck, 1000)
 
@@ -567,7 +603,22 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         confirmedRegions = confirmed
         aiRegions = guessed
+        reportSighting(sourceKey, layer = 1, count = confirmed.size)
+        reportSighting(sourceKey, layer = 2, count = guessed.size)
         scheduleLayer2()
+    }
+
+    /**
+     * 광고를 표시했다는 사실을 보호자에게 남긴다.
+     *
+     * 광고 문구 자체는 올리지 않는다. 어르신이 무엇을 읽고 있었는지까지 보호자에게
+     * 넘길 이유가 없고, 보호자가 알아야 할 것은 "어디서 광고가 몇 건 떴는가"다.
+     * 출처는 도메인 또는 패키지명까지만 남는다.
+     */
+    private fun reportSighting(sourceKey: String?, layer: Int, count: Int) {
+        if (sourceKey == null || count == 0) return
+        if (!sightings.shouldReport(sourceKey, layer)) return
+        AdEventLogger.logAdMarked(sourceKey, "광고 ${count}건 표시", layer)
     }
 
     // ──────────────────────────────────────────────────────────
@@ -625,6 +676,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
                         borderOverlay.show(AdMarkStyle.AI_GUESS, result.regions)
                         aiMarksShown = result.regions.isNotEmpty()
                         aiRegions = result.regions
+                        reportSighting(
+                            candidates.firstOrNull()?.sourceKey,
+                            layer = 2,
+                            count = result.regions.size
+                        )
                     }
                 }
             } finally {

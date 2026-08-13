@@ -4,7 +4,6 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
-    alias(libs.plugins.ksp)
 }
 
 // local.properties에서 키를 읽어 BuildConfig에 주입 (버전 관리 제외)
@@ -31,8 +30,6 @@ android {
         versionCode = 1
         versionName = "1.0"
 
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
     }
 
@@ -58,35 +55,17 @@ android {
     }
 }
 
+// main(린 버전)에서 더 걷어낸 것: Room · WorkManager · 블랙리스트 다운로드.
+// DB는 task 4의 몫이고, 이 브랜치는 store/ 인터페이스 뒤에 자리만 남긴다.
+// Gemini는 HttpURLConnection으로 직접 부르므로 HTTP 클라이언트도 필요 없다.
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
-    implementation(libs.androidx.compose.ui.graphics)
-    implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
-    testImplementation(libs.junit)
-    androidTestImplementation(libs.androidx.junit)
-    androidTestImplementation(libs.androidx.espresso.core)
-    androidTestImplementation(platform(libs.androidx.compose.bom))
-    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
-    debugImplementation(libs.androidx.compose.ui.tooling)
-    debugImplementation(libs.androidx.compose.ui.test.manifest)
-    testImplementation(libs.kotlinx.coroutines.test)
-
-    // 코루틴
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
-
-    // Room (블랙리스트 로컬 DB)
-    implementation(libs.androidx.room.runtime)
-    implementation(libs.androidx.room.ktx)
-    ksp(libs.androidx.room.compiler)
-
-    // WorkManager (블랙리스트 주 1회 업데이트)
-    implementation(libs.androidx.work.runtime.ktx)
-
-    androidTestImplementation(libs.androidx.room.testing)
-    androidTestImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
 }

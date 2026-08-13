@@ -1,14 +1,13 @@
-package com.guradian.region
+package com.guradian.rule
 
 import android.graphics.Rect
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * 화면 노드 트리를 순회해 공식 광고 표기가 붙은 영역을 찾는다.
+ * 화면 노드 트리를 순회해 공식 광고 표기가 붙은 영역을 찾는다. — task 1
  *
- * 팀원 AdDetectService(com.flyai.adalert)에서 이식. 판정 규칙과 상수는 그대로 두고,
- * `feature/universal-ad-detection`의 **예산 기반 중단**만 추가로 들여왔다.
+ * senioradguard에서 이식. **판정 규칙과 상수는 그대로다.**
  *
  * ## 왜 예산이 필요한가 — 이게 없으면 테두리가 드래그를 못 따라간다
  * 노드를 하나 읽을 때마다 대상 앱 프로세스로 IPC가 오가고, **그 앱이 바쁘면 호출이
@@ -18,27 +17,27 @@ import android.view.accessibility.AccessibilityNodeInfo
  *
  * 상한을 걸면 대신 "다 못 본 결과"가 나온다. 그 결과로 영역을 갱신하면 아직 화면에
  * 있는 광고의 테두리가 사라지므로, 잘렸다는 사실을 [Result.truncated]로 알려
- * 호출자가 직전 영역을 붙잡을 수 있게 한다.
+ * 호출자가 직전 영역을 붙잡을 수 있게 한다([com.guradian.overlay.BorderTracker]).
  */
 class AdRegionScanner {
 
-    private companion object {
+    companion object {
         /**
          * 팀원 실측값. 크롬의 모바일 뉴스 페이지가 500~1300 노드였고 전부 훑는 데
          * 150~250ms가 걸렸다(S25 Edge). 너무 조이면 광고에 닿기 전에 끊긴다 —
          * 실제로 120ms로 뒀을 때 700 노드에서 잘려 광고를 통째로 놓쳤다.
          */
-        const val NODE_BUDGET = 5000
+        private const val NODE_BUDGET = 5000
         const val TIME_BUDGET_MS = 400L
-        const val MAX_DEPTH = 60
-        const val MAX_REGIONS = 5
+        private const val MAX_DEPTH = 60
+        private const val MAX_REGIONS = 5
 
         /**
          * 조상을 거슬러 올라가는 횟수 상한. `.parent` 하나가 IPC 한 번이라, 상한이
          * 없으면 깊은 웹 문서에서 라벨 하나당 수십 번의 왕복이 생긴다. 예산을 조상
          * 탐색이 전부 써버리면 정작 형제 노드에 있는 광고를 못 본다.
          */
-        const val MAX_CLIMB = 12
+        private const val MAX_CLIMB = 12
     }
 
     /**
@@ -72,11 +71,16 @@ class AdRegionScanner {
     private var deadline = 0L
     private var truncated = false
 
-    fun scan(root: AccessibilityNodeInfo): Result {
+    /**
+     * @param budgetMs 이번 순회의 시간 상한. 기본은 [TIME_BUDGET_MS] 그대로다.
+     *        인자로 뺀 것은 스크롤 경로처럼 더 짧게 조여야 하는 호출자를 위한 것이고,
+     *        기본값을 바꾼 게 아니다.
+     */
+    fun scan(root: AccessibilityNodeInfo, budgetMs: Long = TIME_BUDGET_MS): Result {
         val started = SystemClock.uptimeMillis()
         visited = 0
         truncated = false
-        deadline = started + TIME_BUDGET_MS
+        deadline = started + budgetMs
 
         val screen = Rect().also { root.getBoundsInScreen(it) }
         inBrowser = root.packageName?.toString() in browsers

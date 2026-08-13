@@ -2,4 +2,5 @@
     <!-- 접근성 설정 목록에도 이 이름이 뜬다. 안내 문구가 "목록에서 '광고 지킴이'를
          찾아 켜주세요"라고 말하므로 그 이름과 정확히 같아야 한다. -->
     <string name="app_name">광고 지킴이</string>
+    <string name="accessibility_description">화면에 광고가 뜨면 테두리로 알려주고, 광고를 닫거나 원래 화면으로 돌아갈 수 있게 큰 버튼을 띄웁니다.</string>
 </resources>

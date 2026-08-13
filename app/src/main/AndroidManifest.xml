@@ -4,11 +4,9 @@
     <!-- 권한 -->
     <uses-permission android:name="android.permission.BIND_ACCESSIBILITY_SERVICE" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <!-- Gemini 판별(Layer 2)과 블랙리스트 갱신이 쓴다. 보호자 알림 전송은 없다. -->
+    <!-- Gemini 판별(Layer 2)이 쓴다. 서버 전송(task 4·5)은 이 저장소에 없다. -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <!-- AdBorderOverlay가 광고 감지 시 진동으로 알린다. 없으면 vibrate() 호출이
+    <!-- 광고 감지·ESCAPE 진입 시 진동으로 알린다. 없으면 vibrate() 호출이
          SecurityException으로 앱을 죽인다 (감지 성공 직후 크래시). -->
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- 배터리 최적화 예외 요청. 없으면 제조사(삼성 Freecess 등)가 백그라운드라는
@@ -24,7 +22,7 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.GuArDian">
 
-        <!-- 메인 화면 -->
+        <!-- 상태 화면 + AI 판별 토글 -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -34,7 +32,7 @@
             </intent-filter>
         </activity>
 
-        <!-- 핵심: 광고 감지 서비스 -->
+        <!-- 핵심: 광고 감지 서비스. 단일 진입점이고 레이어 배분만 한다. -->
         <service
             android:name=".service.GuardianAccessibilityService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"

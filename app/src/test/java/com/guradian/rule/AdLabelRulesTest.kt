@@ -1,4 +1,4 @@
-package com.guradian.region
+package com.guradian.rule
 
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

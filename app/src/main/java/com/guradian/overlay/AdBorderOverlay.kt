@@ -6,10 +6,6 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
-import android.media.AudioManager
-import android.media.ToneGenerator
-import android.os.Handler
-import android.os.Looper
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -26,9 +22,10 @@ enum class AdMarkStyle { CONFIRMED, AI_GUESS }
 /**
  * 광고 영역에 테두리와 배지를 그리는 비차단 오버레이.
  *
- * 팀원 AdDetectService의 showBorders/buildBorderView/setAdRegions/beep에서 이식.
  * FLAG_NOT_TOUCHABLE로 터치를 통과시켜 광고 클릭·구매·설치 선택을 일절 방해하지
- * 않는다 (구글 정책). 이 플래그는 절대 제거하면 안 된다.
+ * 않는다 (구글 정책). **이 플래그는 절대 제거하면 안 된다.** 액션바는 터치를
+ * 받아야 하므로 이 창과 **별도의 창**으로 붙는다 — 합치면 둘 다 터치를 받거나
+ * 둘 다 통과시킨다.
  *
  * Layer 1(CONFIRMED)과 Layer 2(AI_GUESS)의 영역 목록을 따로 들고 한 창에 함께
  * 그린다. 한쪽이 갱신돼도 다른 쪽은 유지된다.
@@ -42,9 +39,10 @@ enum class AdMarkStyle { CONFIRMED, AI_GUESS }
  * 지금은 같은 자리·같은 모양이면 **[View.setLayoutParams]로 위치만 갱신**하고
  * 뷰를 재사용한다. 모양이 달라졌을 때만 그 한 칸을 새로 만든다.
  *
- * 또 예전에는 갱신마다 [View.post]로 다음 프레임에 미뤘다. 창이 이미 배치된
- * 뒤에는 미룰 이유가 없고, 그 한 프레임이 그대로 추종 지연이 된다. 창 크기를
- * 아직 모르는 첫 그리기에서만 미룬다.
+ * ## 원본에서 달라진 것 — 알림음 제거
+ * senioradguard는 광고를 처음 발견할 때 `ToneGenerator`로 삑 소리를 냈다.
+ * 광고마다 소리가 나는 것은 노인 사용자에게 피로이고, 스크롤이 많은 피드에서는
+ * 거의 끊이지 않는다. **진동만 남긴다.**
  */
 class AdBorderOverlay(private val context: Context) {
 
@@ -56,9 +54,9 @@ class AdBorderOverlay(private val context: Context) {
         const val BADGE_MIN_HEIGHT_DP = 80
 
         /**
-         * 알림음·진동을 다시 울리기까지의 최소 간격.
-         * 광고가 잠깐 사라졌다 돌아오는 경우에까지 다시 울리면 소리가 계속 난다.
-         * 서비스 쪽 히스테리시스로 대부분 걸러지지만 마지막 안전장치로 둔다.
+         * 진동을 다시 울리기까지의 최소 간격.
+         * 광고가 잠깐 사라졌다 돌아오는 경우에까지 다시 울리면 계속 떨린다.
+         * BorderTracker의 히스테리시스로 대부분 걸러지지만 마지막 안전장치로 둔다.
          */
         const val ALERT_MIN_GAP_MS = 3000L
     }
@@ -72,7 +70,6 @@ class AdBorderOverlay(private val context: Context) {
     private val prefs: SharedPreferences by lazy {
         context.getSharedPreferences("settings", Context.MODE_PRIVATE)
     }
-    private val handler = Handler(Looper.getMainLooper())
 
     private var overlay: FrameLayout? = null
     private val shown = mutableMapOf<AdMarkStyle, List<Rect>>()
@@ -80,13 +77,16 @@ class AdBorderOverlay(private val context: Context) {
     /** 창이 배치되길 기다리는 중인가. 드래그 중에 post가 여러 개 쌓이는 것을 막는다. */
     private var layoutPending = false
 
-    /** 마지막으로 알림음·진동을 울린 시각 */
+    /** 마지막으로 진동을 울린 시각 */
     private var lastAlertAt = 0L
 
     /** 자식 뷰 하나의 생김새. 이게 같으면 뷰를 그대로 재사용한다. */
     private data class Spec(val style: AdMarkStyle, val withBadge: Boolean)
 
     private fun dp(v: Int) = (v * context.resources.displayMetrics.density).toInt()
+
+    /** 지금 그려져 있는 영역들. 액션바가 "광고 위에 겹치지 않기" 판단에 쓴다. */
+    fun regionsOf(style: AdMarkStyle): List<Rect> = shown[style].orEmpty()
 
     /** 해당 스타일의 영역 목록을 교체한다. 다른 스타일의 표시는 그대로 둔다. */
     fun show(style: AdMarkStyle, regions: List<Rect>) {
@@ -104,7 +104,6 @@ class AdBorderOverlay(private val context: Context) {
             val now = SystemClock.uptimeMillis()
             if (now - lastAlertAt > ALERT_MIN_GAP_MS) {
                 lastAlertAt = now
-                if (prefs.getBoolean("sound", true)) beep()
                 if (prefs.getBoolean("vibe", true)) vibrate()
             }
         }
@@ -293,12 +292,6 @@ class AdBorderOverlay(private val context: Context) {
                 setPadding(dp(10), 0, 0, 0)
             })
         }
-
-    private fun beep() {
-        val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80)
-        tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 200)
-        handler.postDelayed({ tone.release() }, 400)
-    }
 
     private fun vibrate() {
         // minSdk 26이므로 VibrationEffect를 무조건 쓸 수 있다

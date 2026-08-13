@@ -1,10 +1,11 @@
-package com.guradian.region
+package com.guradian.rule
 
 /**
- * 공식 광고 표기 판정 규칙.
+ * 공식 광고 표기 판정 규칙. — task 1
  *
- * 팀원 AdDetectService(com.flyai.adalert)에서 이식. 로직과 상수는 변경하지 않았다 —
- * 아래 처리는 모두 실제 앱에서 부딪혀 나온 대응이라 임의로 손대면 회귀한다.
+ * 팀원 AdDetectService(com.flyai.adalert) → senioradguard를 거쳐 이식.
+ * **로직과 상수는 한 글자도 바꾸지 않았다** — 아래 처리는 모두 실제 앱에서
+ * 부딪혀 나온 대응이라 임의로 손대면 회귀한다.
  */
 object AdLabelRules {
 

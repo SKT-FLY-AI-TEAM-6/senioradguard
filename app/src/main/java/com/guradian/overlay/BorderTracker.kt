@@ -67,6 +67,13 @@ class BorderTracker(
      */
     var onScanComplete: (suspend (root: AccessibilityNodeInfo, confirmed: List<Rect>) -> List<Rect>)? = null
 
+    /**
+     * 표시가 실제로 갱신된 뒤 메인 스레드에서 불린다. 액션바가 "광고 몇 개가
+     * 보이는가"를 여기서 다시 읽는다 — 스캔은 비동기라 이벤트 처리 시점에는
+     * 아직 옛 값이다.
+     */
+    var onApplied: (() -> Unit)? = null
+
     /** 스캔 코루틴이 읽고 메인 스레드가 쓴다. Layer 2와 액션바가 읽는다. */
     @Volatile
     var confirmedRegions: List<Rect> = emptyList()
@@ -297,6 +304,7 @@ class BorderTracker(
 
         confirmedRegions = shifted
         generation++
+        onApplied?.invoke()
     }
 
     private fun List<Rect>.shiftedBy(dy: Int): List<Rect> =

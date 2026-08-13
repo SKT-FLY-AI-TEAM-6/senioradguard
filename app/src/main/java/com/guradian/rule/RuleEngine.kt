@@ -1,6 +1,7 @@
 package com.guradian.rule
 
 import android.view.accessibility.AccessibilityNodeInfo
+import com.guradian.store.DetectionLog
 import com.guradian.store.EmptyMaliciousUrlSource
 import com.guradian.store.MaliciousUrlSource
 
@@ -18,8 +19,14 @@ sealed interface RuleVerdict {
      * @param detail 사람이 읽는 근거. 스토어 패키지명이나 눌린 버튼 문구다.
      *        **host 원문은 여기 넣지 않는다** — 로그로 흘러갈 수 있는 값이라,
      *        악성 URL의 경우 host 대신 고정 문구를 쓴다.
+     * @param hostHash 크롬에서 온 판정이면 SHA-256. 그 외에는 null.
+     *        [com.guradian.store.DetectionLog.onEscape]가 그대로 받는다.
      */
-    data class Escape(val reason: EscapeReason, val detail: String) : RuleVerdict
+    data class Escape(
+        val reason: EscapeReason,
+        val detail: String,
+        val hostHash: String? = null
+    ) : RuleVerdict
 }
 
 /**
@@ -78,7 +85,11 @@ class RuleEngine(
         val host = browserHost.of(root) ?: return null
         if (!malicious.isMalicious(host)) return null
         // detail에 host를 넣지 않는다 — 이 값이 로그·화면으로 새어나가면
-        // "URL 전문은 보내지 않는다"는 약속이 무너진다.
-        return RuleVerdict.Escape(EscapeReason.MALICIOUS_URL, "위험한 주소")
+        // "URL 전문은 보내지 않는다"는 약속이 무너진다. 기록에는 해시만 간다.
+        return RuleVerdict.Escape(
+            reason = EscapeReason.MALICIOUS_URL,
+            detail = "위험한 주소",
+            hostHash = DetectionLog.hashHost(host)
+        )
     }
 }

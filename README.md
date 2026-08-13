@@ -6,7 +6,7 @@
 **핵심 차별점 (경쟁사 대비)**
 - AdGuard, Family Link 등 기존 서비스는 노인 특화 없음
 - 앱 설치 팝업 감지 + 광고 클릭 직전 개입 → 기존에 없는 기능
-- 보호자에게 카카오톡 알림 → 별도 앱 설치 불필요
+- 보호자가 같은 앱의 **보호자 모드**로 실시간 알림 수신
 - 노인 UX: 큰 글씨(24sp), 버튼 2개만, 빨간 경고
 
 ---
@@ -15,8 +15,9 @@
 - 언어: Kotlin, UI는 Jetpack Compose (Material3)
 - 화면 감지: Android AccessibilityService API
 - 비동기: Kotlin Coroutines
-- 보호자 알림: 카카오 SDK (메시지 API)
-- 저장소: Room DB + WorkManager (블랙리스트 주 1회 갱신)
+- 판별기: Gemini API (`gemini-3.5-flash-lite`), 키 없으면 규칙 기반 스텁으로 폴백
+- 보호자 알림: Firebase Realtime Database 실시간 구독
+- 저장소: Room DB (`ad_verdict` 캐시만)
 - Min SDK: API 26 (Android 8.0) / target·compile SDK 36
 
 ---
@@ -32,6 +33,8 @@
 | **Layer 3** | 앱 설치 유도(스토어 이동, 설치 버튼 클릭) | 차단 경고 팝업 | **수신** |
 
 Layer 1·2 오버레이는 `TYPE_ACCESSIBILITY_OVERLAY` + `FLAG_NOT_TOUCHABLE`이다. **이 플래그는 절대 제거하면 안 된다** — 광고 클릭·구매·설치를 방해하면 구글 정책 위반이다. Layer 3만 터치를 받는데, 이는 광고 방해가 아니라 설치 직전 개입이라 성격이 다르다.
+
+화면 상단의 **"광고 모두 닫기"** 막대는 테두리와 **별개 창**이다. 테두리 창은 `FLAG_NOT_TOUCHABLE`을 그대로 유지하고, 막대 창만 터치를 받는다 — 한 창에 두면 플래그를 벗겨야 하므로 창을 나눴다.
 
 ### "AD 광고"와 "AI 광고 같아요"의 차이
 
@@ -49,6 +52,52 @@ Layer 1·2 오버레이는 `TYPE_ACCESSIBILITY_OVERLAY` + `FLAG_NOT_TOUCHABLE`�
 
 점선이 틀릴 수 있다는 뜻을 UI로 구분해둔 것이다 — 실선/점선, "광고"/"광고 같아요".
 
+### 광고 모두 닫기
+
+각 광고 영역 안에서 닫기 버튼처럼 생긴 노드를 찾아(깊이 25 이하, 영역과 교차, clickable, 72dp 이하, `CLOSE_TEXTS`/`CLOSE_ID_TOKENS` 일치) `ACTION_CLICK`을 보낸다.
+
+**못 찾았을 때 뒤로 가기로 폴백하면 안 된다.** 처음에 그렇게 만들었더니 웹 배너에는 접근성 트리에 X가 사실상 없어서 폴백이 매번 걸렸고, **광고가 아니라 보던 페이지가 닫혔다.** 지금은 이렇게 나뉜다:
+
+| 상황 | 동작 |
+|---|---|
+| 닫기 버튼을 찾음 | `ACTION_CLICK` |
+| 못 찾았는데 **전면 광고** (높이 ≥ 화면의 75%) | `GLOBAL_ACTION_BACK` — 이때는 뒤로 가기가 곧 광고 닫기다 |
+| 못 찾았고 배너 | **아무것도 안 함** + "이 광고는 닫기 버튼이 없어요" |
+
+배너는 페이지의 일부라 뒤로 가기가 곧 페이지 이탈이다. 못 닫는 광고는 정직하게 못 닫는다고 알린다.
+
+---
+
+## 두 가지 모드
+
+첫 실행 시 넷플릭스 프로필처럼 큰 카드 두 개로 역할을 고른다 (`SetupActivity`).
+
+| | 어르신 모드 👵 | 보호자 모드 👨‍👩‍👦 |
+|---|---|---|
+| 하는 일 | 접근성 서비스로 광고 감지·표시 | 이벤트 실시간 구독 + 대시보드만 |
+| 화면 | `MainActivity` (상태, AI 토글, 연결 코드) | `GuardianActivity` (이벤트 목록) |
+| 접근성 권한 | 필요 | 불필요 |
+
+어르신 화면의 **연결 코드**(ANDROID_ID 기반 userId)를 보호자가 입력하면 구독이 붙는다. 역할은 언제든 "모드 바꾸기"로 되돌릴 수 있다.
+
+### Firebase 구조
+
+```
+users/{userId}      role("senior"|"guardian"), linkedTo(partnerId)
+events/{userId}/{eventId}
+                    timestamp, appPackage, adText(마스킹), 
+                    action("blocked"|"warned"|"ignored"), layer(1|2|3)
+settings/{userId}   sensitivity(0.6), whitelist([])
+```
+
+Room에는 `ad_verdict` 캐시만 남긴다. `adText`는 `CardText.mask()`를 거쳐 120자로 자른 값이라 전화·카드·주민번호가 올라가지 않는다.
+
+**`app/google-services.json`이 없어도 빌드된다.** `build.gradle.kts`가 파일 존재 여부로 `google-services` 플러그인 적용을 결정하고, `FirebaseRepo`의 모든 호출은 `FirebaseApp.getApps()`가 비어 있으면 조용히 no-op한다. 파일을 넣지 않은 팀원은 광고 감지만 되고 보호자 연동만 빠진 상태로 돌아간다.
+
+### 카카오는 걷어냈다
+
+비즈 앱 검수 승인이 끝내 나지 않아 메시지 API가 계속 거부됐다. 외부 승인에 기능이 묶여 있는 구조라 Firebase 구독으로 대체했다. `notification/KakaoNotifier.kt`·`PendingNotificationQueue.kt`는 **삭제하지 않고 줄 주석(`//`) 처리**해 남겼다 — 블록 주석으로 감쌌더니 안쪽 KDoc의 `*/`와 짝이 어긋나 "Unclosed comment"로 빌드가 깨졌다. 되살리려면 SDK 의존성과 매니페스트 항목을 다시 넣어야 한다.
+
 ---
 
 ## 파일 구조
@@ -64,7 +113,8 @@ app/src/main/java/com/senioradguard/
 ├── agent/                      Layer 2 파이프라인
 │   ├── CandidateExtractor.kt   Agent1: 노드트리 → 카드 단위 후보
 │   ├── AdClassifier.kt         Agent2 인터페이스 ← LLM 교체점
-│   ├── StubClassifier.kt         규칙 기반 임시 대역 (LLM 아님)
+│   ├── GeminiClassifier.kt       Gemini 구현 (기본)
+│   ├── StubClassifier.kt         규칙 기반 폴백 (키 없을 때, LLM 아님)
 │   ├── CrossValidator.kt       Agent4: viewId 약한 신호로 ±0.15
 │   ├── AgentPipeline.kt        캐시 조회 → 판별 → 저장 → 표시
 │   ├── CardText.kt             마스킹 · 정규화 · 캐시 키
@@ -75,21 +125,26 @@ app/src/main/java/com/senioradguard/
 │   └── InstallTriggerRules.kt  위험 문구 판정 (순수 함수)
 │
 ├── overlay/
-│   ├── AdBorderOverlay.kt      Layer 1·2 비차단 테두리 (한 창에 함께)
+│   ├── AdBorderOverlay.kt      Layer 1·2 비차단 테두리 + 닫기 막대(별개 창)
 │   └── OverlayManager.kt       Layer 3 차단 경고 팝업
 │
-├── detector/                   블랙리스트 (현재 소비자 없음 — 아래 참고)
-│   ├── db/                     Room: blacklist_domains, ad_verdict
+├── remote/FirebaseRepo.kt      역할 저장 · 연결 · 이벤트 기록/구독
+├── logger/AdEventLogger.kt     감지 이벤트 → Firebase (마스킹 후)
+│
+├── detector/                   블랙리스트 (보류 — 아래 참고)
+│   ├── db/                     Room: ad_verdict
 │   ├── BlacklistRepository.kt  원격 목록 다운로드/파싱/교체
-│   ├── BlacklistUpdateWorker.kt  주 1회 갱신
+│   ├── BlacklistUpdateWorker.kt  ⚠️ 예약 호출부 주석 처리됨
 │   ├── DomainMatcher.kt        접미사 분해 O(1) 매칭
 │   └── AdDetector.kt           ⚠️ dead code — 생성 지점 없음
 │
-├── notification/               카카오 보호자 알림 + 실패 큐
+├── notification/               ⚠️ 카카오 — 전체 주석 처리 (삭제 안 함)
 ├── ui/
+│   ├── SetupActivity.kt        역할 선택 (어르신 / 보호자)
+│   ├── GuardianActivity.kt     보호자 대시보드 + 연결 코드 입력
 │   ├── ServiceStatus.kt        서비스가 실제로 살아있는지 확인
 │   └── BatteryOptimizationGuide.kt
-└── MainActivity.kt             상태 화면 + AI 판별 옵트인 토글
+└── MainActivity.kt             어르신 화면 — 상태 · AI 토글 · 연결 코드
 ```
 
 ---
@@ -102,7 +157,8 @@ app/src/main/java/com/senioradguard/
 
 - `TYPE_VIEW_SCROLLED`의 이동량과 도착 시각으로 px/ms 속도를 구하고, 플링의 지수 감쇠(`v = v₀·e^(-t/τ)`)로 남은 시간을 추정한다. **`VelocityTracker`는 쓸 수 없다** — MotionEvent를 먹는 물건인데 접근성 서비스는 MotionEvent를 받지 않는다.
 - 이동량을 모르는 앱(크롬 등 `scrollY = -1`)에서는 **`null`로 구분해** 마지막 스크롤 이벤트 뒤 일정 시간을 기다린다. 이걸 `0`으로 뭉뚱그리면 "멈췄다"로 잘못 읽혀 스크롤 도중에 스캔이 나간다.
-- 기기 주사율(`DisplayManager` → `Display.refreshRate`, **`DisplayMetrics`에는 없다**)로 프레임 간격을 구해 지연을 프레임 배수로 올림하고, 실제 실행은 `Choreographer.postFrameCallback`으로 vsync 직후에 붙인다.
+- 기기 주사율(`DisplayManager` → `Display.refreshRate`, **`DisplayMetrics`에는 없다**)로 프레임 간격을 구해 지연을 프레임 배수로 올림한다.
+- **실행을 `Choreographer.postFrameCallback`에 붙이면 안 된다.** vsync 콜백은 **보이는 창이 있는 프로세스에만** 온다. 우리 앱이 백그라운드로 내려간 순간 콜백이 끊겨 감지가 통째로 멈췄다 (아래 결함 표 참고). 프레임 정렬은 지연 계산에만 쓰고, 실행은 `handler.postDelayed`로 그대로 돌린다.
 - 스크롤 중에는 표시를 걷어낸다. 스캔 없이 남기면 테두리가 제자리에 멈춰 엉뚱한 카드를 가리킨다. (직전 영역을 스크롤 델타만큼 평행이동하는 방법도 검토했으나 고정 헤더·하단 배너가 어긋나서 버렸다.)
 
 **실기기 측정 (갤럭시 S24, 한경 본문 플링 8회)**
@@ -173,9 +229,9 @@ GEMINI_API_KEY=발급받은키
 
 ---
 
-## 현재 상태 (2026-08-12, 브랜치 `phase1-service-integration`)
+## 현재 상태 (2026-08-13, 브랜치 `phase1-service-integration`)
 
-세 레이어가 모두 실기기에서 동작한다. 판별기는 Gemini에 연결돼 있고, 스캔 타이밍 최적화까지 들어갔다. 남은 큰 항목은 카카오 검수 승인(외부 대기)과 Vision(Agent3)이다.
+세 레이어가 모두 실기기에서 동작한다. 판별기는 Gemini에 연결돼 있고, 스캔 타이밍 최적화가 들어갔으며, 보호자 알림은 카카오에서 Firebase로 갈아탔다. 남은 큰 항목은 **Firebase 실사용 검증**(`google-services.json` 투입 필요)과 Vision(Agent3)이다.
 
 ### 실기기 검증 (갤럭시 S24, SM-S921N)
 
@@ -186,13 +242,17 @@ GEMINI_API_KEY=발급받은키
 | Layer 2 — 쇼핑몰 자체 상품을 광고로 오판하는가 | **아니오.** LLM이 "제3자 광고가 아닌 정상 쇼핑 콘텐츠"로 구분 |
 | Layer 2 — 기사 페이지 오탐 | 없음 |
 | Layer 2 — 옵트인 OFF 시 | 파이프라인 자체가 돌지 않음 (로그 0줄) |
-| Layer 3 — 스토어 이동 경고 / 뒤로 가기 / 무시하기 | 모두 동작 |
+| Layer 3 — 스토어 이동 경고 / [뒤로가기] / [그냥 보기] | 모두 동작 |
+| 백그라운드(크롬)에서 감지가 계속 도는가 | 동작 — 크롬 30초 체류 중 스캔 7회 |
+| 광고 모두 닫기 — 웹 배너 | 페이지 유지 + "닫기 버튼이 없어요" 안내 (아래 참고) |
+| 역할 선택 → 어르신/보호자 화면 분기 | 동작 |
 | 서비스 상태 표시 — 접근성 해제 시 경고 | 동작, 콜드 스타트 오탐 없음 |
 | 스캔 최적화 — 플링 8회 | 이벤트 241개 → 스캔 13회 (94.6% 감소) |
 | DB version 1 → 2 덮어 설치 | 크래시 없음 |
 | 메모리 (서비스만, 광고 페이지 25회 스크롤) | Java 27→30MB, Native 53→49MB — 누수 없음 |
+| **Firebase 이벤트 실제 수신** | **미검증** — `google-services.json` 미투입 |
 
-**테스트**: 단위 85건 (`./gradlew testDebugUnitTest`), 계측 7건 (`AdVerdictDaoTest`, USB 실기기 필요).
+**테스트**: 단위 85건 (`./gradlew testDebugUnitTest`), 계측 8건 (`AdVerdictDaoTest` 7 + 예제 1, USB 실기기 필요).
 
 ### 검증에서 실제로 잡힌 결함들
 
@@ -208,6 +268,10 @@ GEMINI_API_KEY=발급받은키
 | 최적화가 오히려 스캔을 늘림 | 스크롤 이동량 "모름"을 `0`("안 움직임")으로 뭉뚱그림 |
 | 유튜브 "광고 건너뛰기"에 차단 경고 | Layer 3 키워드에 "광고"가 있었음 — 광고를 피하려는 행동을 앱이 막는 꼴 |
 | 보호자 알림이 조용히 아무 일도 안 함 | `AdEventLogger.init()` 호출부가 없었음 |
+| **다른 앱을 보는 동안 감지가 통째로 멈춤** | 실행을 `Choreographer.postFrameCallback`에 붙였음. **보이는 창이 없는 프로세스에는 vsync가 오지 않는다.** A/B: 우리 앱 포그라운드 스캔 4회 → 크롬 20초 체류 스캔 **0회**. 제거 후 크롬 30초 → 7회 |
+| **"광고 모두 닫기"가 광고 대신 페이지를 닫음** | X를 못 찾으면 `GLOBAL_ACTION_BACK`으로 폴백하게 했는데, **웹 배너에는 접근성 트리에 X가 거의 없어** 폴백이 매번 걸렸다. 전면 광고(≥ 화면 75%)로만 제한 |
+
+뒤의 둘은 **사용자가 실사용 중 신고해서** 잡혔다. 둘 다 내가 "성능·편의를 위해" 넣은 장치가 원래 기능을 망가뜨린 경우다.
 
 ### 두 레이어는 실제로 서로를 보완했다
 
@@ -233,21 +297,23 @@ GEMINI_API_KEY=발급받은키
 
 | 항목 | 상태 |
 |---|---|
-| **보호자 카카오톡 알림** | 코드 경로는 완성. **카카오 비즈 앱 검수 승인 전이라 메시지 API가 거부된다**(외부 대기). 실패분은 큐에 쌓이고 승인 후 첫 전송 성공 시점에 함께 재전송된다 |
-| **`SetupActivity` 흰 화면** | 카카오 로그인을 취소하면 빈 화면에 갇힌다. 미수정 |
+| **보호자 대시보드 실제 수신** | 코드 경로는 완성이지만 **`google-services.json`이 없어 한 번도 실제 이벤트를 받아본 적이 없다.** 파일 투입 후 어르신 폰 → 보호자 폰 왕복 검증이 필요 |
+| **웹 배너 닫기** | 접근성 트리에 X가 없어 닫을 수단 자체가 없다. 화면의 ⓘ·⋮는 광고주 정보/신고지 닫기가 아니다. 앱 내 광고·전면 광고에서는 동작 |
 | **Agent3 (Vision)** | 이미지만 있는 광고 판별. 미착수 |
 | **네이버식 광고** | 라벨이 `clickable=false` 노드에 있어 `adLinkOf`가 영역을 못 잡는다 |
 | **삼성 인터넷** | 웹 콘텐츠를 접근성 트리에 노출하지 않아 우리 코드로는 해결 불가 |
 
+카카오 로그인 취소 시 흰 화면에 갇히던 버그는 `SetupActivity`가 역할 선택 화면으로 재작성되고 카카오 경로가 사라지면서 함께 없어졌다.
+
 ### 보류 (추후 확장)
 
-`detector/AdDetector.kt`는 **생성 지점이 없는 dead code**이고, 그래서 `BlacklistUpdateWorker`가 주 1회 14만 개 도메인을 받아 DB에 쓰는데 **읽는 코드가 없다.** 블랙리스트 방식 자체가 무거워(다운로드·파싱·DB 교체) 지금 단계에서는 쓰지 않기로 했다. 코드는 확장 방향으로 남겨둔다.
+`detector/AdDetector.kt`는 **생성 지점이 없는 dead code**이고, 그래서 `BlacklistUpdateWorker`가 주 1회 14만 개 도메인을 받아 DB에 쓰는데 **읽는 코드가 없다.** 다운로드·파싱·DB 교체가 통째로 무거워 지금 단계에서는 쓰지 않기로 하고, `MainActivity`의 `schedule()` 호출부를 주석 처리했다(파일은 남김, `TODO Phase 2`).
 
 ### 배포 전 반드시 할 것
 
 1. **Gemini 키를 앱에서 빼기.** 지금은 `local.properties` → `BuildConfig`라 APK에서 추출된다. 우리 서버를 거치는 `AdClassifier` 구현으로 교체할 것
-2. 카카오 비즈 앱 검수 승인
-3. `SetupActivity` 흰 화면 수정
+2. **Firebase 보안 규칙.** 현재 구조는 `userId`(ANDROID_ID)만 알면 남의 이벤트를 읽을 수 있다. 인증 + 규칙이 필요하다
+3. `google-services.json`을 넣고 보호자 왕복 검증
 4. `SYSTEM_ALERT_WINDOW` / 접근성 권한의 사용 목적을 스토어 심사용으로 명시
 
 ---
@@ -264,11 +330,19 @@ GEMINI_API_KEY=발급받은키
 
 ---
 
-## 카카오 알림 — 남은 절차
-1. 카카오 개발자 콘솔 → 앱 설정 → 비즈니스 → **비즈 앱 전환** (개인 비즈 앱 가능, 사업자등록번호 불필요)
-2. **카카오톡 채널 연결** (비즈 앱 전환 시 필요할 수 있음)
-3. 제품 설정에서 **친구 API/피커**, **메시지 API** 각각 사용 신청 → 검수 승인 대기
-4. 승인 전에는 앱 소유자/팀 멤버 계정으로만 테스트된다
+## Firebase 붙이기
+
+1. Firebase 콘솔에서 프로젝트 생성 → Android 앱 추가 (패키지명 `com.senioradguard`)
+2. `google-services.json`을 **`app/`** 에 넣는다 (`.gitignore` 대상 — 커밋하지 말 것)
+3. Realtime Database 생성 (테스트 규칙으로 시작하되 **배포 전 반드시 잠글 것**)
+4. `./gradlew assembleDebug` — 파일이 있으면 플러그인이 자동으로 붙는다
+5. 폰 두 대에서 각각 어르신/보호자를 고르고, 어르신 화면의 연결 코드를 보호자에 입력
+
+설치 후에는 접근성 등록 여부를 **반드시** 확인한다:
+
+```bash
+bash scripts/check_accessibility.sh
+```
 
 ---
 
@@ -277,3 +351,5 @@ GEMINI_API_KEY=발급받은키
 - 제조사 절전(삼성 Freecess)이 서비스를 얼릴 수 있다 → 배터리 예외 안내 + 상태 표시로 대응 중
 - 오탐 방지: 표시 임계값 0.6으로 보수적 설정
 - 팀원 이식 코드(`AdLabelRules`, `AdRegionScanner`)의 **로직과 상수는 변경 금지**. 실기기에서 부딪혀 나온 대응이라 손대면 회귀한다
+- **Layer 1·2 오버레이의 `FLAG_NOT_TOUCHABLE`은 절대 제거 금지.** 터치가 필요하면 닫기 막대처럼 창을 따로 만들 것
+- API 키는 **채팅·이슈·커밋 어디에도 붙여넣지 말 것.** `local.properties`에만 둔다

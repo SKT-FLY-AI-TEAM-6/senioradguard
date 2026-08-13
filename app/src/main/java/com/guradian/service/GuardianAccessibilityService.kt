@@ -3,14 +3,26 @@ package com.guradian.service
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.os.Build
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import com.guradian.BuildConfig
+import com.guradian.agent.AdClassifier
+import com.guradian.agent.AgentPipeline
+import com.guradian.agent.CandidateExtractor
+import com.guradian.agent.GeminiClassifier
+import com.guradian.agent.StubClassifier
 import com.guradian.overlay.AdBorderOverlay
+import com.guradian.overlay.AdMarkStyle
 import com.guradian.overlay.BorderTracker
 import com.guradian.rule.RuleEngine
+import com.guradian.store.InMemoryVerdictStore
+import com.guradian.store.VerdictStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 단일 진입점. 이벤트를 받아 각 레이어에 배분하기만 한다.
@@ -81,6 +93,137 @@ class GuardianAccessibilityService : AccessibilityService() {
     // ── endregion ──
 
     // ── region: layer2 ──  (feat/layer2-agent 이 채운다)
+
+    /**
+     * 캐시 전용 경로를 BorderTracker에 건다.
+     *
+     * onServiceConnected가 아니라 여기서 거는 이유: 그 함수는 세 브랜치가 공유하는
+     * region 밖이라 건드리면 병합이 충돌한다. init 블록은 이 region 안이다.
+     */
+    init {
+        borderTracker.onScanComplete = ::cachedGuesses
+    }
+
+    /** 판별 진행 중 플래그. 왕복이 길어 겹쳐 돌면 호출만 늘어난다. */
+    private val classifying = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * 스크롤 경로에서 도는 후보 추출의 시간 상한. 이건 확정 테두리 스캔에 **이어서**
+     * 도는 두 번째 순회라, 상한이 없으면 느린 앱에서 테두리가 손가락을 못 따라온다.
+     */
+    private val scrollExtractBudgetMs = 150L
+
+    private val extractor by lazy { CandidateExtractor(ruleEngine.browserHost) }
+
+    private val verdictStore: VerdictStore = InMemoryVerdictStore()
+
+    private val pipeline by lazy {
+        // 키가 없으면 규칙 기반 대역으로 물러난다 — 키를 아직 안 받은 팀원도 앱을
+        // 빌드해 파이프라인 전 구간을 돌려볼 수 있어야 한다.
+        val key = BuildConfig.GEMINI_API_KEY
+        val classifier: AdClassifier =
+            if (key.isNotBlank()) GeminiClassifier(key) else StubClassifier()
+        Log.i(TAG, "layer2 판별기=${classifier.source}")
+
+        AgentPipeline(store = verdictStore, classifier = classifier)
+    }
+
+    /**
+     * 스크롤해도 점선이 카드를 따라오게 하는 **캐시 전용** 경로.
+     *
+     * 판별기를 부르지 않으므로 외부로 나가는 것이 없다. 그래서 자동으로 돌아도
+     * 프라이버시 논거를 해치지 않는다 — 나가는 시점은 [findAdsNow] 하나뿐이다.
+     * 다만 이건 이번 프레임의 **두 번째** 트리 순회라 상한을 걸어 확정 테두리의
+     * 추종을 방해하지 않게 한다.
+     */
+    private suspend fun cachedGuesses(
+        root: android.view.accessibility.AccessibilityNodeInfo,
+        confirmed: List<android.graphics.Rect>
+    ): List<android.graphics.Rect> {
+        if (!isAiEnabled()) return emptyList()
+        return runCatching {
+            pipeline.run(
+                extractor.extract(root, confirmed, budgetMs = scrollExtractBudgetMs),
+                allowClassify = false
+            ).regions
+        }.getOrDefault(emptyList())
+    }
+
+    /**
+     * 사용자가 [광고 찾기]를 눌렀을 때만 호출된다.
+     *
+     * **자동 실행 경로를 만들지 말 것** — 화면 텍스트가 외부로 나가는 유일한
+     * 지점이고, 그 시점이 사용자의 명시적 동작과 1:1로 대응해야 한다. 원본에 있던
+     * `scheduleLayer2()` / `runLayer2` / `LAYER2_IDLE_MS`(유휴 600ms 자동 실행)를
+     * 이 함수 하나로 대체했다.
+     *
+     * @param onResult 표시할 점선 영역과 진행 상황. 액션바가 "찾는 중…"과
+     *        "0건" 피드백에 쓴다 (task 2). 메인 스레드에서 불린다.
+     */
+    fun findAdsNow(onResult: (FindResult) -> Unit = {}) {
+        if (!isAiEnabled()) {
+            onResult(FindResult(emptyList(), busy = false, aiDisabled = true))
+            return
+        }
+        if (!classifying.compareAndSet(false, true)) return
+
+        onResult(FindResult(emptyList(), busy = true))
+
+        // 결과가 늦게 왔는데 그 사이 화면이 바뀌었으면 표시하지 않는다.
+        val generation = borderTracker.generation
+        val excluded = borderTracker.confirmedRegions
+
+        scope.launch {
+            try {
+                val root = targetRoot() ?: run {
+                    withContext(Dispatchers.Main) { onResult(FindResult(emptyList(), busy = false)) }
+                    return@launch
+                }
+                // 버튼을 눌러 도는 경로라 상한을 걸지 않는다. 후보를 빠짐없이 봐야
+                // 판별이 의미가 있고, 사용자는 이미 기다리기로 한 상태다.
+                val candidates = extractor.extract(root, excluded)
+                val result = pipeline.run(candidates)
+                Log.i(
+                    TAG,
+                    "layer2 출처=${candidates.firstOrNull()?.sourceKey ?: "-"} " +
+                        "후보=${candidates.size} 캐시=${result.cacheHits} " +
+                        "판별=${result.classified} 보류=${result.skippedByLimit} " +
+                        "표시=${result.regions.size}"
+                )
+                withContext(Dispatchers.Main) {
+                    if (generation != borderTracker.generation) {
+                        // 화면이 넘어갔다. 판정은 캐시에 남아 다음에 같은 카드가
+                        // 나오면 즉시 뜬다.
+                        onResult(FindResult(emptyList(), busy = false, staleScreen = true))
+                        return@withContext
+                    }
+                    borderOverlay.show(AdMarkStyle.AI_GUESS, result.regions)
+                    onResult(FindResult(result.regions, busy = false))
+                }
+            } finally {
+                classifying.set(false)
+            }
+        }
+    }
+
+    /** 기본 OFF 옵트인. 화면 텍스트가 외부로 나가므로 사용자가 켜야만 동작한다. */
+    fun isAiEnabled(): Boolean =
+        getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_AI_CLASSIFY, false)
+
+    /**
+     * [findAdsNow]의 진행 상황.
+     *
+     * **0건일 때도 반드시 알려야 한다.** 무반응은 고장으로 읽힌다 — 어르신은
+     * 버튼이 안 먹었다고 생각하고 계속 누른다.
+     */
+    data class FindResult(
+        val regions: List<android.graphics.Rect>,
+        val busy: Boolean,
+        /** 토글이 꺼져 있어 아예 돌지 않았다 */
+        val aiDisabled: Boolean = false,
+        /** 결과가 늦게 와서 버렸다 */
+        val staleScreen: Boolean = false
+    )
     // ── endregion ──
 
     // ── region: action ──  (feat/action-bar 가 채운다)

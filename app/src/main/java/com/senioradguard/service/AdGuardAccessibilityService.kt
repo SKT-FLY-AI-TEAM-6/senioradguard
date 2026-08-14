@@ -1179,6 +1179,31 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 진짜 목적지를 본 것이 아니다 — 저위험으로 캐시하면 안 된다.
             val finalHost = UrlNormalizer.hostOf(page.finalUrl)
             if (finalHost != null && AdEntryDetector.isAdRedirector(finalHost)) {
+                // 신뢰 플랫폼의 공식 관문에서 끝났다면 목적지는 그 플랫폼 안이다 —
+                // 앱 딥링크 광고(실측: 쿠팡 파트너스)의 정직한 결말.
+                val trusted = AdEntryDetector.trustedTerminalName(finalHost)
+                if (trusted != null) {
+                    val a = RiskAssessment.Assessed(
+                        RiskLevel.LOW, "$trusted 공식 페이지로 연결되는 광고예요"
+                    )
+                    runCatching {
+                        urlVerdictDao.upsert(
+                            UrlVerdict(
+                                normalizedUrl = normalized,
+                                riskLevel = a.level.name,
+                                reason = a.reason,
+                                finalUrl = page.finalUrl,
+                                analyzedAt = System.currentTimeMillis(),
+                                validUntil = System.currentTimeMillis() +
+                                    UrlRiskRules.validityMs(a.level)
+                            )
+                        )
+                    }
+                    linkFingerprints(fpKeys, normalized)
+                    Log.i(TAG, "신뢰 종착지 — $trusted (${page.finalUrl.take(60)})")
+                    withContext(Dispatchers.Main) { finishShield(normalized, a) }
+                    return@launch
+                }
                 Log.i(TAG, "분석 중단 — 최종지가 리다이렉터 (${page.finalUrl})")
                 withContext(Dispatchers.Main) {
                     finishShieldUnverified("연결되는 곳을 끝까지 확인하지 못했어요")

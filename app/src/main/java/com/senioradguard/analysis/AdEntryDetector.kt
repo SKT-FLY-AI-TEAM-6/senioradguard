@@ -117,6 +117,23 @@ class AdEntryDetector(private val clock: () -> Long) {
         }
 
         /**
+         * 신뢰 플랫폼의 공식 관문. 여기서 체인이 끝나면 목적지는 그 플랫폼 안이다 —
+         * 도메인 소유자가 플랫폼 자신이라 다른 곳으로는 못 간다.
+         * 실측(쿠팡 파트너스): link.coupang.com은 302 없이 JS로 coupang:// 앱
+         * 스킴을 쏘는 페이지라 체인 추적이 여기서 끝난다. "확인 불가"가 아니라
+         * "쿠팡으로 연결되는 광고"가 정직한 판정이다.
+         */
+        private val trustedTerminals = mapOf(
+            "link.coupang.com" to "쿠팡"
+        )
+
+        fun trustedTerminalName(host: String): String? {
+            val h = host.lowercase().removeSuffix(".")
+            return trustedTerminals.entries
+                .firstOrNull { h == it.key || h.endsWith(".${it.key}") }?.value
+        }
+
+        /**
          * 광고망이 과금 정산용으로 도착 URL에 붙이는 클릭 추적 파라미터.
          * 이게 붙어 있으면 이 페이지는 광고 클릭으로 도착한 것이다.
          *

@@ -128,6 +128,24 @@ class AdEntryDetectorTest {
     }
 
     @Test
+    fun 신뢰_종착지는_플랫폼_이름을_알려준다() {
+        assertTrue(AdEntryDetector.trustedTerminalName("link.coupang.com") == "쿠팡")
+        assertTrue(AdEntryDetector.trustedTerminalName("api.mjbiz.co.kr") == null)
+        assertTrue(AdEntryDetector.trustedTerminalName("coupang.com") == null)
+    }
+
+    @Test
+    fun 경유지_쿼리에_내장된_목적지를_꺼낸다() {
+        val wrapped = "https://api.mjbiz.co.kr/kw/rdw?origUrl=" +
+            "https%3A%2F%2Flink.coupang.com%2Fre%2FAFFSRP%3Flptag%3DAF1234&x=1"
+        assertTrue(
+            AdEntryDetector.embeddedDestination(wrapped) ==
+                "https://link.coupang.com/re/AFFSRP?lptag=AF1234"
+        )
+        assertTrue(AdEntryDetector.embeddedDestination("https://a.com/?q=hello") == null)
+    }
+
+    @Test
     fun 쿠팡_본체는_리다이렉터가_아니다() {
         // link.coupang.com(파트너스 경유지)만 리다이렉터다 — 본체를 리다이렉터로
         // 보면 쿠팡 안에서 정상 쇼핑하는 내내 가림막이 뜬다

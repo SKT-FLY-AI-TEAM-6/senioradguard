@@ -49,11 +49,21 @@ class AdRegionScanner {
      */
     class Result(
         val regions: List<Rect>,
+        /**
+         * [regions]와 1:1로 대응하는, 그 좌표를 만들어낸 노드. 스크롤 중에
+         * 트리를 다시 훑지 않고 이 노드의 좌표만 다시 읽는 추적에 쓴다
+         * (ad_claude_fable에서 이식). 판정 로직은 바꾸지 않았고 노드 참조만
+         * 함께 돌려준다.
+         */
+        val anchors: List<Anchor?>,
         /** 예산이 모자라 도중에 끊겼는가 — 끊긴 결과로는 영역을 갱신하면 안 된다 */
         val truncated: Boolean,
         val visited: Int,
         val elapsedMs: Long
     )
+
+    /** 영역과 그 근거 노드 한 쌍 (내부용) */
+    private class Resolved(val rect: Rect, val anchor: Anchor?)
 
     /**
      * 모바일 웹은 화면 구조가 앱과 달라 광고 영역을 다른 방식으로 잡는다.
@@ -80,13 +90,14 @@ class AdRegionScanner {
 
         val screen = Rect().also { root.getBoundsInScreen(it) }
         inBrowser = root.packageName?.toString() in browsers
-        val regions = mutableListOf<Rect>()
-        collectAdRegions(root, 0, screen, regions)
+        val found = mutableListOf<Resolved>()
+        collectAdRegions(root, 0, screen, found)
         // 전체 화면 광고가 하나라도 있으면 전체 테두리 하나만 표시
-        regions.firstOrNull { it == screen }?.let { regions.retainAll(listOf(it)) }
+        found.firstOrNull { it.rect == screen }?.let { full -> found.retainAll(listOf(full)) }
 
         return Result(
-            regions = regions,
+            regions = found.map { it.rect },
+            anchors = found.map { it.anchor },
             truncated = truncated,
             visited = visited,
             elapsedMs = SystemClock.uptimeMillis() - started
@@ -110,7 +121,7 @@ class AdRegionScanner {
         node: AccessibilityNodeInfo,
         depth: Int,
         screen: Rect,
-        out: MutableList<Rect>
+        out: MutableList<Resolved>
     ) {
         // 인스타그램 릴스는 광고 라벨이 30단계보다 깊이 있어 여유 있게 잡는다
         if (depth > MAX_DEPTH || out.size >= MAX_REGIONS) return
@@ -126,11 +137,13 @@ class AdRegionScanner {
                 val byId = AdLabelRules.isAdContainer(node.viewIdResourceName)
                 if (byId || AdLabelRules.isAdLabel("${node.text ?: ""} · ${node.contentDescription ?: ""}")) {
                     val r = when {
-                        byId -> Rect(scratch)
+                        byId -> Resolved(Rect(scratch), Anchor.of(node))
                         inBrowser -> adLinkOf(node, screen)
                         else -> containerOf(node, screen)
                     }
-                    if (r != null && out.none { it.contains(r) || r.contains(it) }) out.add(r)
+                    if (r != null && out.none { it.rect.contains(r.rect) || r.rect.contains(it.rect) }) {
+                        out.add(r)
+                    }
                     return
                 }
             }
@@ -146,14 +159,14 @@ class AdRegionScanner {
      * (웹 문서에는 "광고 카드"에 해당하는 구조가 없어 부모를 계속 올라가면 문서 전체를 잡는다)
      * 광고 한 칸이라기엔 너무 큰 곳까지 올라가면 포기한다 — 그런 광고는 대개 id로 따로 잡힌다.
      */
-    private fun adLinkOf(marker: AccessibilityNodeInfo, screen: Rect): Rect? {
+    private fun adLinkOf(marker: AccessibilityNodeInfo, screen: Rect): Resolved? {
         val r = Rect()
         var cur: AccessibilityNodeInfo? = marker
         var up = 0
         while (cur != null && up < MAX_CLIMB) {
             cur.getBoundsInScreen(r)
             if (r.height() > screen.height() * 0.5) return null
-            if (cur.isClickable) return Rect(r)
+            if (cur.isClickable) return Resolved(Rect(r), Anchor.of(cur))
             cur = cur.parent
             up++
         }
@@ -166,26 +179,41 @@ class AdRegionScanner {
      * 라벨이 속한 피드 항목부터 피드 아래 끝까지를 광고 영역으로 본다.
      * (인스타그램은 광고 게시물의 헤더·본문이 각각 별도 피드 항목이라 카드 조상이 없음)
      * 카드를 못 찾거나 영역이 화면의 75% 이상이면 전체 화면 광고로 본다.
+     *
+     * 합성 좌표(전체 화면 승격, 피드 항목을 늘린 것)는 노드를 따라 움직이면 안 되므로
+     * follow=false 앵커에 라벨 노드를 담는다 — 광고가 사라졌는지 확인할 유일한 수단이다.
      */
-    private fun containerOf(marker: AccessibilityNodeInfo, screen: Rect): Rect {
+    private fun containerOf(marker: AccessibilityNodeInfo, screen: Rect): Resolved {
         val r = Rect()
         var cur: AccessibilityNodeInfo? = marker   // 병합 노드는 라벨 노드 자신이 곧 광고 카드
         var item: Rect? = null                     // 직전에 지나온 조상 = 피드의 항목
+        var card: AccessibilityNodeInfo? = null    // 카드로 확정된 노드 (스크롤 추적에 쓴다)
         var up = 0
         while (cur != null && up < MAX_CLIMB) {
             cur.getBoundsInScreen(r)
-            if (cur.isScrollable) return item?.apply { bottom = maxOf(bottom, r.bottom) } ?: Rect(screen)
+            if (cur.isScrollable) {
+                return Resolved(
+                    item?.apply { bottom = maxOf(bottom, r.bottom) } ?: Rect(screen),
+                    Anchor.of(marker, follow = false)
+                )
+            }
             // 화면 가장자리에 걸쳐 잘려 보이는 카드는 최소 높이 조건을 면제
             val clipped = r.top <= screen.height() * 0.06 || r.bottom >= screen.height() * 0.94
             if (r.width() >= screen.width() * 0.7 && r.height() <= screen.height() * 0.85 &&
                 (r.height() >= screen.height() * 0.08 || clipped)
-            ) break
+            ) {
+                card = cur
+                break
+            }
             item = Rect(r)
             cur = cur.parent
             up++
         }
         val region = if (cur != null) Rect(r) else Rect(screen)
-        if (region.height() >= screen.height() * 0.75) region.set(screen)
-        return region
+        if (region.height() >= screen.height() * 0.75) {
+            region.set(screen)
+            return Resolved(region, Anchor.of(marker, follow = false))
+        }
+        return Resolved(region, Anchor.of(card))
     }
 }

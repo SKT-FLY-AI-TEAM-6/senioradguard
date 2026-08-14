@@ -1,9 +1,11 @@
 package com.senioradguard
 
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -84,11 +86,48 @@ class MainActivity : ComponentActivity() {
                     HomeScreen(
                         serviceState = serviceState,
                         batteryExempt = batteryExempt,
+                        onDetectionToggle = ::onDetectionToggle,
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
             }
         }
+    }
+
+    /**
+     * 광고 감시(접근성 서비스)를 앱 안에서 켜고 끈다.
+     *
+     * WRITE_SECURE_SETTINGS가 있어야 직접 토글이 되고(개발 기기에서
+     * `adb shell pm grant com.senioradguard android.permission.WRITE_SECURE_SETTINGS`),
+     * 없으면 접근성 설정 화면으로 폴백한다.
+     *
+     * 다른 접근성 서비스는 건드리지 않는다 — 목록을 통째로 덮어쓰면 사용자가
+     * 쓰던 화면읽기·다른 감지 앱이 조용히 꺼진다 (redeploy.sh와 같은 원칙).
+     */
+    private fun setDetectionEnabled(on: Boolean): Boolean {
+        if (checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return false
+        val svc = "$packageName/${AdGuardAccessibilityService::class.java.name}"
+        val cur = Settings.Secure.getString(
+            contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ).orEmpty()
+        val others = cur.split(':').filter { it.isNotBlank() && it != svc }
+        val next = if (on) others + svc else others
+        return runCatching {
+            Settings.Secure.putString(
+                contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                next.joinToString(":")
+            )
+            Settings.Secure.putString(contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, "1")
+        }.isSuccess
+    }
+
+    private fun onDetectionToggle(on: Boolean) {
+        if (!setDetectionEnabled(on)) ServiceStatus.openAccessibilitySettings(this)
+        // 서비스가 붙거나 떨어지는 데 잠깐 걸린다 — 상태 표시를 뒤따라 갱신한다
+        handler.postDelayed({ refreshServiceState() }, 400)
     }
 
     override fun onResume() {
@@ -121,6 +160,7 @@ class MainActivity : ComponentActivity() {
 private fun HomeScreen(
     serviceState: ServiceStatus.State,
     batteryExempt: Boolean,
+    onDetectionToggle: (Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -135,6 +175,11 @@ private fun HomeScreen(
             text = "광고 지킴이",
             fontSize = 30.sp,
             fontWeight = FontWeight.Bold
+        )
+
+        DetectionToggleCard(
+            running = serviceState == ServiceStatus.State.RUNNING,
+            onToggle = onDetectionToggle
         )
 
         // 서비스가 꺼져 있으면 배터리 안내보다 이게 먼저다 — 아예 감시가 없는 상태다.
@@ -176,6 +221,38 @@ private fun HomeScreen(
         // 보호자를 연결할 수도, 역할을 바꿔볼 수도 없다.
         ConnectionCodeCard()
         ChangeRoleButton()
+    }
+}
+
+/**
+ * 광고 감시 켜기/끄기 스위치. 어르신 기준: 설정 화면을 찾아가지 않고
+ * 앱 첫 화면에서 바로 켜고 끌 수 있어야 한다.
+ * (직접 토글은 WRITE_SECURE_SETTINGS가 있을 때만 — 없으면 설정 화면으로 안내)
+ */
+@Composable
+private fun DetectionToggleCard(running: Boolean, onToggle: (Boolean) -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "광고 감시",
+                    fontSize = 21.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = if (running) "켜져 있어요 — 광고가 나오면 알려드립니다."
+                    else "꺼져 있어요 — 스위치를 켜 주세요.",
+                    fontSize = 16.sp,
+                    color = Color(0xFF5D4037)
+                )
+            }
+            Switch(checked = running, onCheckedChange = onToggle)
+        }
     }
 }
 

@@ -126,7 +126,8 @@ class AdBorderOverlay(private val context: Context) {
         }
         if (prefs.getBoolean("visual", true)) {
             render()
-            showCloseBar()
+            // 닫기 막대는 여기서 자동으로 띄우지 않는다 — 닫을 수 있는 광고가
+            // 있는지는 서비스가 판단해 showCloseBar/hideCloseBar로 지시한다.
         }
     }
 
@@ -172,7 +173,8 @@ class AdBorderOverlay(private val context: Context) {
     // 광고 모두 닫기 버튼 (터치를 받는 별도 창)
     // ──────────────────────────────────────────────────────────
 
-    private fun showCloseBar() {
+    /** 닫을 수 있는 광고가 있을 때만 서비스가 부른다. */
+    fun showCloseBar() {
         val action = onCloseAllAds ?: return
         if (closeBar != null) return
 
@@ -212,6 +214,8 @@ class AdBorderOverlay(private val context: Context) {
         runCatching { windowManager.addView(bar, params) }
             .onSuccess { closeBar = bar }
     }
+
+    fun hideCloseBar() = removeCloseBar()
 
     private fun removeCloseBar() {
         closeBar?.let { runCatching { windowManager.removeView(it) } }

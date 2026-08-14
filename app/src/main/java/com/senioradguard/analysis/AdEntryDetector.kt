@@ -5,21 +5,30 @@ enum class ShieldReason {
     /** 광고 영역 클릭 직후의 이동 */
     AD_CLICK,
 
-    /** 광고망 과금 리다이렉터 도메인 감지 — 클릭 이벤트를 놓쳤을 때의 백업 신호 */
-    AD_REDIRECTOR
+    /** 광고망 과금 리다이렉터 도메인 감지 */
+    AD_REDIRECTOR,
+
+    /** 도착 URL에 광고 클릭 추적 파라미터(gclid 등)가 붙어 있음 */
+    AD_LANDING
 }
 
 /**
  * "이 페이지 진입이 광고에서 왔는가"를 판정한다.
  *
  * 브라우저 전환·페이지 이동 자체는 기사 클릭에서도 일어나므로 그것만으로
- * 가림막을 띄우면 안 된다. 판정 재료는 두 가지다.
+ * 가림막을 띄우면 안 된다. 판정 재료는 세 가지다.
  *
  * 1. 직전 클릭이 표시 중인 광고 영역 안이었는가 (서비스가 좌표 대조 후
  *    [recordAdClick]/[recordNonAdClick]으로 알려준다) + 시간 창
  * 2. 이동한 곳이 광고망 리다이렉터인가 — 기사 클릭은 리다이렉터를 거치지 않는다
+ * 3. 도착 URL에 광고 클릭 추적 파라미터가 붙어 있는가 — **웹 광고의 주 판별
+ *    경로다.** 실기기 검증(2026-08-14, 연합뉴스TV의 실제 사기성 광고)에서
+ *    크롬이 웹 광고 탭에 TYPE_VIEW_CLICKED를 아예 만들지 않는 것이 확인됐다.
+ *    좌표 판별(1)은 표준 링크에서만 통하고, 실제 광고 위젯은 이 경로로 잡는다.
+ *    광고망은 과금 정산을 위해 도착 URL에 클릭 ID(gclid 등)를 반드시 붙이므로
+ *    클릭을 못 봐도 도착지가 광고발임을 URL이 증명한다.
  *
- * 둘 다 아니면 개입하지 않는다. 판별 불가를 가림막으로 처리하면 기사를 누를
+ * 셋 다 아니면 개입하지 않는다. 판별 불가를 가림막으로 처리하면 기사를 누를
  * 때마다 가림막이 떠서 서비스를 못 쓰게 된다 — 그 경우 호출부는 조용히
  * 캐시 조회만 한다.
  *
@@ -52,13 +61,26 @@ class AdEntryDetector(private val clock: () -> Long) {
      * 소모한다(같은 클릭으로 가림막이 두 번 뜨지 않게). null이면 개입 금지.
      *
      * @param host 이동한 곳의 호스트. 확보 전이면 null — 클릭 대기만으로 판정한다.
+     * @param rawUrl 주소창에 보이는 이동 후 URL 원문(정규화 전). 광고 클릭
+     *        추적 파라미터 검사에 쓰므로 정규화 전 값이어야 한다 —
+     *        UrlNormalizer가 바로 그 파라미터들을 지운다.
+     * @param previousHost 직전에 있던 호스트. **직전이 리다이렉터였다면 지금
+     *        페이지는 광고 도착지다** — 리다이렉터 체류는 수백 ms라 그 순간을
+     *        놓칠 수 있는데, 다음 이동에서 한 번 더 잡는 확정 신호다
+     *        (실기기: nate → trace.popin.cc → 랜딩의 두 번째 전환).
      */
-    fun reasonForNavigation(host: String?): ShieldReason? {
+    fun reasonForNavigation(
+        host: String?,
+        rawUrl: String? = null,
+        previousHost: String? = null
+    ): ShieldReason? {
         val fresh = hasFreshPending()
         pendingAt = null
         return when {
             fresh -> ShieldReason.AD_CLICK
             host != null && isAdRedirector(host) -> ShieldReason.AD_REDIRECTOR
+            previousHost != null && isAdRedirector(previousHost) -> ShieldReason.AD_REDIRECTOR
+            rawUrl != null && isAdLanding(rawUrl) -> ShieldReason.AD_LANDING
             else -> null
         }
     }
@@ -73,16 +95,51 @@ class AdEntryDetector(private val clock: () -> Long) {
         /**
          * 광고망 과금 리다이렉터. 광고 클릭은 거의 항상 이 중 하나를 거쳐가고,
          * 일반 콘텐츠 클릭은 거치지 않는다. 서브도메인 포함 접미사 일치로 본다.
+         *
+         * popin.cc는 실기기 검증(2026-08-14, 네이트 뉴스의 popIn 추천위젯 광고)에서
+         * 실제 경유가 확인돼 추가했다 — 새 광고망을 만나면 여기에 계속 보탠다.
          */
         private val redirectorHosts = setOf(
             "googleadservices.com", "doubleclick.net", "googlesyndication.com",
             "adservice.google.com", "criteo.com", "adfit.kakao.com",
-            "taboola.com", "dable.io", "outbrain.com", "ad.daum.net"
+            "taboola.com", "dable.io", "outbrain.com", "ad.daum.net",
+            // 국내 광고망
+            "popin.cc", "mobon.net", "realclick.co.kr", "cauly.net", "adop.cc"
         )
 
         fun isAdRedirector(host: String): Boolean {
             val h = host.lowercase().removeSuffix(".")
             return redirectorHosts.any { h == it || h.endsWith(".$it") }
+        }
+
+        /**
+         * 광고망이 과금 정산용으로 도착 URL에 붙이는 클릭 추적 파라미터.
+         * 이게 붙어 있으면 이 페이지는 광고 클릭으로 도착한 것이다.
+         *
+         * 이름만으로 판정하는 목록에 일반 utm_*은 넣지 않는다 — utm_source 등은
+         * 뉴스레터·SNS 공유 링크에도 흔해서 오탐이 난다. utm_medium은 값이
+         * 유료 매체를 가리킬 때만 인정한다.
+         */
+        private val adClickParams = setOf(
+            "gclid", "gad_source", "gbraid", "wbraid",   // 구글 광고
+            "msclkid",                                    // 마이크로소프트 광고
+            "n_media", "n_ad", "n_ad_group", "n_campaign", "n_query"  // 네이버 광고
+        )
+
+        private val adUtmMediums = setOf("cpc", "ppc", "paid", "display", "banner", "paid_social")
+
+        /** 도착 URL에 광고 클릭 추적 파라미터가 붙어 있는가. */
+        fun isAdLanding(rawUrl: String): Boolean {
+            val query = rawUrl.substringAfter('?', "").substringBefore('#')
+            if (query.isEmpty()) return false
+            for (param in query.split('&')) {
+                val name = param.substringBefore('=').lowercase()
+                if (name in adClickParams) return true
+                if (name == "utm_medium" &&
+                    param.substringAfter('=', "").lowercase() in adUtmMediums
+                ) return true
+            }
+            return false
         }
     }
 }

@@ -1,9 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- 권한 -->
     <uses-permission android:name="android.permission.BIND_ACCESSIBILITY_SERVICE" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 앱 안에서 광고 감시를 켜고 끄는 토글용. 시스템 권한이라 일반 설치로는 못 받고
+         개발 기기에서 `adb shell pm grant com.senioradguard android.permission.WRITE_SECURE_SETTINGS`
+         로 부여했을 때만 동작한다. 없으면 토글이 접근성 설정 화면으로 폴백한다. -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />

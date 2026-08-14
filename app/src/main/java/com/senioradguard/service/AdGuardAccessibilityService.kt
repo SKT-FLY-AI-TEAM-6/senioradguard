@@ -26,7 +26,9 @@ import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.AdMarkStyle
 import com.senioradguard.overlay.OverlayManager
 import com.senioradguard.overlay.ShieldOverlay
+import com.senioradguard.overlay.TrackedBorderOverlay
 import com.senioradguard.region.AdRegionScanner
+import com.senioradguard.region.Anchor
 import com.senioradguard.risk.RiskLevel
 import com.senioradguard.risk.UrlNormalizer
 import kotlinx.coroutines.CoroutineScope
@@ -140,6 +142,19 @@ class AdGuardAccessibilityService : AccessibilityService() {
         AdBorderOverlay(this).apply { onCloseAllAds = ::closeAllAds }
     }
 
+    /**
+     * Layer 1 확정 광고의 테두리 — 앵커 추적으로 광고에 fit하게 붙는다
+     * (ad_claude_fable 엔진 이식). AI 점선(AdMarkStyle.AI_GUESS)은 기존
+     * borderOverlay가 계속 담당한다.
+     */
+    private val trackedBorders by lazy {
+        TrackedBorderOverlay(this).apply { onAnchorLost = { requestScan() } }
+    }
+
+    /** [confirmedRegions]와 1:1 — 그 좌표를 만들어낸 노드. 스크롤 추적에 쓴다 */
+    @Volatile
+    private var confirmedAnchors: List<Anchor?> = emptyList()
+
     // Layer 3의 경고창은 TYPE_APPLICATION_OVERLAY(SYSTEM_ALERT_WINDOW)라 창 토큰이
     // 필요 없다. 위 테두리 오버레이와 달리 applicationContext로 붙여도 안전하다.
     private val overlayManager by lazy { OverlayManager(applicationContext) }
@@ -177,6 +192,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private var navPollsLeft = 0
     private var urlSettleReadsLeft = 0
     private var lastSettleUrl: String? = null
+
+    /** 직전 스캔에서 본 크롬 웹 호스트. 바뀌면 페이지 이동이다. */
+    private var prevChromeHost: String? = null
 
     /**
      * 스캔 진행 중 플래그. 트리 순회는 수십~수백 ms가 걸릴 수 있는데 이벤트는 그보다
@@ -321,16 +339,19 @@ class AdGuardAccessibilityService : AccessibilityService() {
             handler.removeCallbacks(lazyRescan)
             for (d in LAZY_RESCAN_MS) handler.postDelayed(lazyRescan, d)
             // 광고 클릭 대기 중의 창 전환(앱→브라우저 포함)은 광고발 진입이다
-            if (pkg == CHROME && entryDetector.hasFreshPending() && !shieldActive) {
-                onNavigationDetected(readUrlBar())
+            if (pkg == CHROME) {
+                Log.i(TAG, "창 전환: 클릭대기=${entryDetector.hasFreshPending()} url=${readUrlBar() ?: "-"}")
+                if (entryDetector.hasFreshPending() && !shieldActive) {
+                    onNavigationDetected(readUrlBar())
+                }
             }
         }
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             val dy = scrollDeltaY(event)
             if (dy != 0) {
-                // 스캔을 기다리지 않고 지금 있는 테두리를 바로 민다. 화면이 위로
-                // 굴렀으면(dy > 0) 광고도 위로 가므로 테두리는 -dy만큼 움직인다.
+                // AI 점선은 스캔을 기다리지 않고 바로 민다 (확정 테두리는 아래
+                // 앵커 추적이 실측 좌표로 따라가므로 여기서 건드리지 않는다).
                 borderOverlay.offsetBy(-dy)
                 // 지금 도는 스캔은 이만큼 구르기 *전* 화면을 읽고 있다. 결과가
                 // 돌아왔을 때 그대로 그리면 테두리가 뒤로 튄다 — 보정에 쓴다.
@@ -338,6 +359,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
             }
         }
 
+        // 확정 테두리는 이벤트가 올 때마다 앵커 좌표를 8ms 주기로 재측정해 따라간다
+        trackedBorders.requestTracking()
         requestScan()
     }
 
@@ -420,7 +443,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 다른 앱 화면에 이전 앱의 테두리가 남아 있으면 그게 오탐이다.
             truncatedHolds = 0
             emptySince = 0L
-            withContext(Dispatchers.Main) { apply(emptyList(), emptyList()) }
+            withContext(Dispatchers.Main) { apply(emptyList(), emptyList(), emptyList(), false) }
             return
         }
 
@@ -438,16 +461,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // 다만 무한정 유지하면 안 된다. 무거운 페이지에서 스캔이 계속 잘리면 이미 사라진
         // 광고의 테두리가 영영 남는다. 몇 번까지만 붙잡고 그 뒤에는 부분 결과를 받아들인다.
         val shown = confirmedRegions
-        val regions =
-            if (result.truncated && shown.isNotEmpty() && truncatedHolds < MAX_TRUNCATED_HOLDS) {
-                truncatedHolds++
-                shown
-            } else {
-                truncatedHolds = 0
-                result.regions
-            }
+        val shownAnchors = confirmedAnchors
+        val holding =
+            result.truncated && shown.isNotEmpty() && truncatedHolds < MAX_TRUNCATED_HOLDS
+        if (holding) truncatedHolds++ else truncatedHolds = 0
+        val regions = if (holding) shown else result.regions
+        val anchors = if (holding) shownAnchors else result.anchors
 
         // 히스테리시스 — 나타날 때는 즉시, 사라질 때는 잠깐 기다린다.
+        var stableAnchors = anchors
         val stable = when {
             regions.isNotEmpty() -> {
                 emptySince = 0L
@@ -457,13 +479,20 @@ class AdGuardAccessibilityService : AccessibilityService() {
             else -> {
                 val now = SystemClock.uptimeMillis()
                 if (emptySince == 0L) emptySince = now
-                if (now - emptySince < CLEAR_DELAY_MS) shown    // 아직 기다린다
-                else {
+                if (now - emptySince < CLEAR_DELAY_MS) {
+                    stableAnchors = shownAnchors    // 유지하는 동안에도 추적은 계속돼야 한다
+                    shown                           // 아직 기다린다
+                } else {
                     emptySince = 0L
                     regions
                 }
             }
         }
+
+        // 닫기 막대는 실제로 닫을 수 있는 광고가 있을 때만 띄운다 — 눌러도 "닫기
+        // 버튼이 없어요"만 나오는 막대는 어르신에게 소음이다. 전면 광고는 뒤로
+        // 가기가 곧 닫기이므로 그 자체로 닫을 수 있는 광고다.
+        val closable = runCatching { hasClosableAd(root, stable) }.getOrDefault(false)
 
         // 캐시만 보는 Layer 2. 판별기를 부르지 않으므로 화면이 바뀔 때마다 돌려도 되고,
         // 그래야 점선이 카드를 따라다닌다. 다만 이건 이번 프레임의 **두 번째** 트리
@@ -479,7 +508,32 @@ class AdGuardAccessibilityService : AccessibilityService() {
             emptyList()
         }
 
-        withContext(Dispatchers.Main) { apply(stable, guessed) }
+        withContext(Dispatchers.Main) { apply(stable, stableAnchors, guessed, closable) }
+    }
+
+    /**
+     * 닫을 수 있는 광고가 있는가 — 닫기 버튼이 실재하거나 전면 광고(뒤로 가기로
+     * 닫힘)일 때. 스캔마다 도는 추가 순회이므로 예산으로 막는다. 예산이 끝나면
+     * 못 찾은 것으로 치는데, 막대를 안 띄울 뿐이라 조용히 실패해도 위험하지 않다.
+     */
+    private fun hasClosableAd(root: AccessibilityNodeInfo, regions: List<Rect>): Boolean {
+        if (regions.isEmpty()) return false
+        val screen = Rect().also { root.getBoundsInScreen(it) }
+        if (regions.any { it.height() >= screen.height() * FULLSCREEN_RATIO }) return true
+        val budget = CloseBudget()
+        return regions.any { findCloseButton(root, it, 0, budget) != null }
+    }
+
+    /** 닫기 버튼 탐색의 예산. 본 스캔보다 작게 잡는다 — 컨트롤은 광고 영역 안에만 있다. */
+    private class CloseBudget {
+        private val deadline = SystemClock.uptimeMillis() + CLOSE_TIME_BUDGET_MS
+        private var visited = 0
+
+        fun take(): Boolean {
+            if (visited >= CLOSE_NODE_BUDGET || SystemClock.uptimeMillis() > deadline) return false
+            visited++
+            return true
+        }
     }
 
     /**
@@ -541,9 +595,13 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun findCloseButton(
         node: AccessibilityNodeInfo,
         region: Rect,
-        depth: Int
+        depth: Int,
+        budget: CloseBudget? = null
     ): AccessibilityNodeInfo? {
         if (depth > CLOSE_SEARCH_DEPTH) return null
+        // 스캔 경로에서만 예산을 건다. 사용자가 버튼을 직접 눌렀을 때(closeAllAds)는
+        // 상한 없이 끝까지 찾는다 — 그 순간만큼은 찾는 것이 최우선이다.
+        if (budget != null && !budget.take()) return null
 
         val bounds = Rect().also { node.getBoundsInScreen(it) }
         // 이 가지가 광고 영역과 아예 겹치지 않으면 더 볼 필요가 없다
@@ -553,7 +611,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
             return node
         }
         for (i in 0 until node.childCount) {
-            findCloseButton(node.getChild(i) ?: continue, region, depth + 1)?.let { return it }
+            findCloseButton(node.getChild(i) ?: continue, region, depth + 1, budget)?.let { return it }
         }
         return null
     }
@@ -585,26 +643,46 @@ class AdGuardAccessibilityService : AccessibilityService() {
         AdEventLogger.logAdMarked(sourceKey, "광고 ${count}건 표시", layer)
     }
 
-    private fun apply(confirmed: List<Rect>, guessed: List<Rect>) {
+    private fun apply(
+        confirmed: List<Rect>,
+        anchors: List<Anchor?>,
+        guessed: List<Rect>,
+        closable: Boolean
+    ) {
         handler.removeCallbacks(recheck)
         if (confirmed.isNotEmpty() || guessed.isNotEmpty()) handler.postDelayed(recheck, RECHECK_MS)
 
-        // 스캔이 도는 동안 굴러간 만큼 결과를 되민다 (안 그러면 테두리가 뒤로 튄다)
+        // 스캔이 도는 동안 굴러간 만큼 결과를 되민다 (안 그러면 테두리가 뒤로 튄다).
+        // 확정 테두리는 다음 추적 표본(8ms 뒤)이 실측 좌표로 곧바로 보정한다.
         val dy = -scrollSinceScanStart
         val shifted = confirmed.shiftedBy(dy)
-        borderOverlay.show(AdMarkStyle.CONFIRMED, shifted)
+        trackedBorders.set(shifted, anchors)
         borderOverlay.show(AdMarkStyle.AI_GUESS, guessed.shiftedBy(dy))
+        // 닫기 막대는 닫을 수 있는 광고가 있을 때만
+        if (closable) borderOverlay.showCloseBar() else borderOverlay.hideCloseBar()
 
         confirmedRegions = shifted
+        confirmedAnchors = anchors
         aiRegions = guessed
         reportSighting(lastSourceKey, layer = 1, count = shifted.size)
         reportSighting(lastSourceKey, layer = 2, count = guessed.size)
         scheduleLayer2()
 
-        // 클릭 이벤트를 놓쳤어도 지금 광고망 과금 리다이렉터에 있다면 광고발
-        // 진입이다 — 기사 클릭은 리다이렉터를 거치지 않는다 (백업 신호).
-        lastSourceKey?.let { host ->
-            if (!shieldActive && AdEntryDetector.isAdRedirector(host)) onNavigationDetected(host)
+        // 스캔마다 이미 읽는 주소창 도메인으로 페이지 이동을 감지한다.
+        // 실제 웹 광고는 클릭 이벤트를 만들지 않아(실기기 확인) 클릭 좌표
+        // 판별이 안 통한다 — 이동 후 URL의 광고 지문(리다이렉터 도메인,
+        // gclid류 클릭 추적 파라미터)이 웹 광고의 주 판별 경로다.
+        val host = lastSourceKey
+        if (host != null && host !in targetApps) {          // 크롬의 웹 호스트일 때만
+            if (prevChromeHost != null && host != prevChromeHost && !shieldActive) {
+                Log.i(TAG, "페이지 이동: $prevChromeHost → $host")
+                // 직전 호스트도 넘긴다 — 리다이렉터를 스쳐 지나간 것을 봤다면
+                // 최종 랜딩에서 확정적으로 잡는다
+                onNavigationDetected(readUrlBar(), cameFromHost = prevChromeHost)
+            }
+            prevChromeHost = host
+        } else {
+            prevChromeHost = null
         }
     }
 
@@ -700,9 +778,19 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun trackClickForAdEntry(event: AccessibilityEvent) {
         if (SystemClock.uptimeMillis() < suppressAdClickUntil) return
         val ads = confirmedRegions + aiRegions
+        // 실전 진단용 — 실제 광고 위젯에서 클릭 이벤트가 어떤 모양으로 오는지 확인 (4b 개발 중 유지)
+        Log.i(
+            TAG,
+            "클릭 이벤트: pkg=${event.packageName} source=${event.source != null} " +
+                "광고영역=${ads.size} text=${(event.contentDescription ?: event.text.joinToString(" ")).take(40)}"
+        )
         if (ads.isEmpty()) return
         // 클릭 노드의 좌표를 모르면 판별하지 않는다 — 모르면 개입하지 않는 쪽이 안전하다
-        val src = event.source ?: return
+        val src = event.source
+        if (src == null) {
+            Log.i(TAG, "클릭 source=null — 좌표 판별 불가")
+            return
+        }
         val bounds = Rect().also { src.getBoundsInScreen(it) }
         if (bounds.width() <= 0 || bounds.height() <= 0) return
 
@@ -749,10 +837,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
      * 페이지 이동이 감지됐다. 광고발이면 가림막을 띄우고 판정을 시작하고,
      * 아니면 아무것도 하지 않는다.
      */
-    private fun onNavigationDetected(urlShown: String?) {
+    private fun onNavigationDetected(urlShown: String?, cameFromHost: String? = null) {
         if (shieldActive) return
         val host = urlShown?.let { UrlNormalizer.hostOf(it) }
-        val reason = entryDetector.reasonForNavigation(host) ?: return
+        // rawUrl은 정규화 전 원문이어야 한다 — 광고 클릭 파라미터가 판별 근거다
+        val reason = entryDetector.reasonForNavigation(host, urlShown, cameFromHost) ?: return
 
         handler.removeCallbacks(navPoll)
         shieldActive = true
@@ -831,7 +920,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
-        apply(emptyList(), emptyList())
+        apply(emptyList(), emptyList(), emptyList(), false)
     }
 
     override fun onDestroy() {
@@ -839,6 +928,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         handler.removeCallbacksAndMessages(null)
         scope.cancel()
         borderOverlay.dismissAll()
+        trackedBorders.destroy()
         overlayManager.dismiss()
         shieldOverlay.dismiss()
         super.onDestroy()
@@ -879,6 +969,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         /** 광고 영역 안에서 닫기 버튼을 찾아 내려가는 최대 깊이 */
         private const val CLOSE_SEARCH_DEPTH = 25
+
+        /** 스캔 경로의 닫기 버튼 탐색 예산 (본 스캔보다 작게 — 컨트롤은 광고 안에만 있다) */
+        private const val CLOSE_NODE_BUDGET = 2000
+        private const val CLOSE_TIME_BUDGET_MS = 120L
 
         /** 이보다 큰 것은 닫기 버튼이 아니라 광고 자체일 가능성이 높다 (dp). */
         private const val CLOSE_MAX_DP = 72

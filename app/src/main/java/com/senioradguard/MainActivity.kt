@@ -37,7 +37,9 @@ import com.senioradguard.service.AdGuardAccessibilityService
 import com.senioradguard.ui.BatteryOptimizationGuide
 import com.senioradguard.ui.ServiceStatus
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.text.input.KeyboardType
@@ -133,9 +135,12 @@ private fun HomeScreen(
 ) {
     val context = LocalContext.current
 
+    // 스크롤이 없으면 카드가 늘어난 만큼 아래 항목이 화면 밖으로 밀려 아예
+    // 누를 수 없게 된다. 실제로 보호 강도·가족 연결·모드 바꾸기가 그렇게 사라졌다.
     Column(
         modifier = modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {

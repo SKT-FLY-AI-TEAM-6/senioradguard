@@ -66,8 +66,8 @@ class RuleBasedUrlAnalyzer : UrlRiskAnalyzer {
 object PageFetcher {
 
     private const val MAX_HOPS = 6
-    private const val CONNECT_TIMEOUT_MS = 2500
-    private const val READ_TIMEOUT_MS = 2500
+    private const val CONNECT_TIMEOUT_MS = 1500
+    private const val READ_TIMEOUT_MS = 2000
     /** 본문 상한. 판정에 필요한 폼·링크는 앞부분에 있고, 무한 스트림 방어다. */
     private const val MAX_BODY_CHARS = 200_000
 

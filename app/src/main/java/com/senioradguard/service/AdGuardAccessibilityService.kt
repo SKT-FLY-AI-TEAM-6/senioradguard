@@ -260,6 +260,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private var shieldActive = false
 
     /**
+     * 이번 가림막의 결말이 이미 정해졌는가. 즉시 판정 패스트패스와 안정화 후
+     * 경로가 경합할 수 있어(둘 다 finishShield를 부른다) 먼저 온 쪽만 이긴다.
+     */
+    private var shieldResolved = false
+
+    /**
      * 선택 버튼(안전하게 돌아가기 / 그냥 볼게요)을 띄우고 사용자 결정을
      * 기다리는 중인가. 이 상태는 시간이 지나도 걷지 않는다 — 위험 안내가
      * 사용자 결정 없이 사라지면 안내의 의미가 없다. 대신 사용자가 뒤로가기·
@@ -1020,6 +1026,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         handler.removeCallbacks(navPoll)
         shieldActive = true
+        shieldResolved = false
 
         // 이번 진입의 광고 지문 — 판정이 나오면 연계 저장한다.
         // 클릭 좌표로 특정된 것이 최우선이고, 없으면(웹 광고는 클릭 이벤트가 없다)
@@ -1039,11 +1046,28 @@ class AdGuardAccessibilityService : AccessibilityService() {
         Log.i(TAG, "가림막 표시 — 사유=$reason 지문=${shieldFpKeys.firstOrNull()?.take(24) ?: "-"} url=${urlShown ?: "-"}")
 
         // 추적 리다이렉트가 끝나 주소창이 안정된 뒤에 판정한다.
-        // 초기 URL을 기준값으로 넣지 않는다 — 리다이렉터가 느리면 첫 재확인이
-        // 초기값과 같아서 "안정됐다"로 착각하고 정거장을 분석해 버린다 (실측).
+        // 리다이렉터 초기 URL은 기준값으로 넣지 않는다 — 느린 리다이렉터에서 첫
+        // 재확인이 초기값과 같으면 정거장을 "안정"으로 착각해 분석해 버린다 (실측).
+        // 단 광고 파라미터를 단 직행 랜딩은 그 자체가 목적지라 기준값으로 삼아
+        // 첫 재확인(250ms) 한 번으로 안정을 확정한다 — 속도 개선.
         urlSettleReadsLeft = URL_SETTLE_MAX_READS
-        lastSettleUrl = null
+        lastSettleUrl = urlShown?.takeIf {
+            val h = UrlNormalizer.hostOf(it)
+            h != null && !AdEntryDetector.isAdRedirector(h) && AdEntryDetector.isAdLanding(it)
+        }
         handler.postDelayed(urlSettle, URL_SETTLE_MS)
+
+        // 즉시 판정 패스트패스 — 진입 시점 URL이 이미 캐시·지문에 있으면
+        // 안정화를 기다리지 않고 바로 결말을 낸다 (재등장 광고 ~0.2초 목표).
+        // 리다이렉터 경유 URL은 저장된 적이 없어 자연히 미스 → 안정화 경로로.
+        urlShown?.let { initial ->
+            val fpForFast = shieldFpKeys
+            scope.launch {
+                val normalized = UrlNormalizer.normalize(initial) ?: return@launch
+                val stored = resolveFromStore(normalized, fpForFast) ?: return@launch
+                withContext(Dispatchers.Main) { finishShield(normalized, stored) }
+            }
+        }
     }
 
     private val urlSettle = object : Runnable {
@@ -1076,31 +1100,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
         }
         val fpKeys = shieldFpKeys
         scope.launch {
-            val now = System.currentTimeMillis()
-            val cached = runCatching {
-                urlVerdictDao.findValid(normalized, now)
-            }.getOrNull()?.toAssessment()
-            if (cached != null) {
-                Log.i(TAG, "URL 판정 캐시 히트 — $normalized ${cached.level}")
-                linkFingerprints(fpKeys, normalized)
-                withContext(Dispatchers.Main) { finishShield(normalized, cached) }
-                return@launch
-            }
-
-            // URL은 처음이지만 같은 광고(지문)를 전에 판정한 적이 있다면 그걸 쓴다 —
-            // 소재 로테이션으로 랜딩 주소만 바뀐 경우다 (실측: page_cd 57→67).
-            val linked = fpKeys.firstNotNullOfOrNull { k ->
-                runCatching { fingerprintDao.findLinkedVerdict(k, now) }.getOrNull()
-            }
-            val linkedAssessment = linked?.toAssessment()
-            if (linked != null && linkedAssessment != null) {
-                Log.i(TAG, "지문 판정 히트 — ${linkedAssessment.level} (새 URL: $normalized)")
-                // 새 변형 URL에도 판정을 옮겨 적어 다음엔 URL 캐시로도 잡히게 한다
-                runCatching {
-                    urlVerdictDao.upsert(linked.copy(normalizedUrl = normalized, analyzedAt = now))
-                }
-                linkFingerprints(fpKeys, normalized)
-                withContext(Dispatchers.Main) { finishShield(normalized, linkedAssessment) }
+            val stored = resolveFromStore(normalized, fpKeys)
+            if (stored != null) {
+                withContext(Dispatchers.Main) { finishShield(normalized, stored) }
                 return@launch
             }
 
@@ -1242,6 +1244,42 @@ class AdGuardAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * 저장된 판정 조회: URL 캐시 → 지문 연계 순. 히트하면 지문 연계를 갱신하고
+     * 판정을 돌려준다 — 즉시 판정 패스트패스와 안정화 후 경로가 함께 쓴다.
+     */
+    private suspend fun resolveFromStore(
+        normalized: String,
+        fpKeys: List<String>
+    ): RiskAssessment.Assessed? {
+        val now = System.currentTimeMillis()
+        val cached = runCatching {
+            urlVerdictDao.findValid(normalized, now)
+        }.getOrNull()?.toAssessment()
+        if (cached != null) {
+            Log.i(TAG, "URL 판정 캐시 히트 — $normalized ${cached.level}")
+            linkFingerprints(fpKeys, normalized)
+            return cached
+        }
+
+        // URL은 처음이지만 같은 광고(지문)를 전에 판정한 적이 있다면 그걸 쓴다 —
+        // 소재 로테이션으로 랜딩 주소만 바뀐 경우다 (실측: page_cd 57→67).
+        val linked = fpKeys.firstNotNullOfOrNull { k ->
+            runCatching { fingerprintDao.findLinkedVerdict(k, now) }.getOrNull()
+        }
+        val linkedAssessment = linked?.toAssessment()
+        if (linked != null && linkedAssessment != null) {
+            Log.i(TAG, "지문 판정 히트 — ${linkedAssessment.level} (새 URL: $normalized)")
+            // 새 변형 URL에도 판정을 옮겨 적어 다음엔 URL 캐시로도 잡히게 한다
+            runCatching {
+                urlVerdictDao.upsert(linked.copy(normalizedUrl = normalized, analyzedAt = now))
+            }
+            linkFingerprints(fpKeys, normalized)
+            return linkedAssessment
+        }
+        return null
+    }
+
+    /**
      * 광고 지문들 → URL 판정 연계 저장. 카드 전체 지문과 광고주 표기줄 지문을
      * 모두 저장한다 — 후자가 문구 변형을 하나의 캠페인으로 이어준다.
      * 지문을 못 특정했으면 아무것도 하지 않는다.
@@ -1258,7 +1296,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     /** 등급이 나왔다. 기획 3.1절의 대응대로 가림막을 끝맺는다. */
     private fun finishShield(url: String, assessment: RiskAssessment.Assessed) {
-        if (!shieldActive) return
+        if (!shieldActive || shieldResolved) return
+        shieldResolved = true
         handler.removeCallbacks(shieldTimeout)
         handler.removeCallbacks(urlSettle)
         when (assessment.level) {
@@ -1298,7 +1337,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
      * 복귀를 권한다. 사용자가 고르지 않으면 잠시 후 스스로 걷힌다.
      */
     private fun finishShieldUnverified(limitation: String) {
-        if (!shieldActive) return
+        if (!shieldActive || shieldResolved) return
+        shieldResolved = true
         handler.removeCallbacks(shieldTimeout)
         handler.removeCallbacks(urlSettle)
         shieldOverlay.showChoice(
@@ -1464,8 +1504,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
         private const val FP_FRESH_MS = 15_000L
 
         /** 주소창이 안정될 때까지의 재확인 주기와 횟수 (리다이렉트 체인 대기) */
-        private const val URL_SETTLE_MS = 400L
-        private const val URL_SETTLE_MAX_READS = 8
+        private const val URL_SETTLE_MS = 250L
+        private const val URL_SETTLE_MAX_READS = 10
 
         /** 고위험 복귀 후 안내 문구를 보여주는 시간 */
         private const val RESULT_SHOW_MS = 2_500L

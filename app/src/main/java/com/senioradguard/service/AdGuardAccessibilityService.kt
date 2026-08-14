@@ -1042,6 +1042,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun onNavigationDetected(urlShown: String?, cameFromHost: String? = null) {
         if (shieldActive) return
         val host = urlShown?.let { UrlNormalizer.hostOf(it) }
+        // 경유지에서 광고 출발 페이지로 "돌아온" 이동은 광고 진입이 아니다 —
+        // 직전-리다이렉터 규칙이 복귀까지 잡아 기사를 분석해버린다 (실측:
+        // 쿠팡 앱 딥링크 후 크롬 복귀). 광고 파라미터가 붙어 있으면 예외.
+        if (host != null && host == shieldCameFrom &&
+            urlShown != null && !AdEntryDetector.isAdLanding(urlShown)
+        ) {
+            return
+        }
         // rawUrl은 정규화 전 원문이어야 한다 — 광고 클릭 파라미터가 판별 근거다
         val reason = entryDetector.reasonForNavigation(host, urlShown, cameFromHost) ?: return
 
@@ -1126,9 +1134,20 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // (기사 → clickads.co.kr → 쿠팡 앱 딥링크, 크롬은 기사로 복귀).
         val backAtOrigin = urlShown != null && shieldCameFrom != null &&
             UrlNormalizer.hostOf(urlShown) == shieldCameFrom
-        val target = if (urlShown == null || backAtOrigin) shieldEntryUrl ?: urlShown else urlShown
+        var target = if (urlShown == null || backAtOrigin) shieldEntryUrl ?: urlShown else urlShown
         if (target !== urlShown) {
             Log.i(TAG, "딥링크 이탈 감지 — 진입 URL 체인을 직접 분석: ${target?.take(80)}")
+        }
+        // JS로만 넘어가는 경유지는 서버 체인으로 안 풀린다 — 쿼리에 내장된
+        // 목적지(origUrl= 등)를 꺼내 이어간다 (실측: mjbiz → link.coupang.com).
+        var unwraps = 0
+        while (unwraps < 3) {
+            val h = target?.let { UrlNormalizer.hostOf(it) } ?: break
+            if (!AdEntryDetector.isAdRedirector(h)) break
+            val inner = AdEntryDetector.embeddedDestination(target!!) ?: break
+            Log.i(TAG, "경유지 내장 목적지 추출 — ${UrlNormalizer.hostOf(inner) ?: "?"}")
+            target = inner
+            unwraps++
         }
         val normalized = target?.let { UrlNormalizer.normalize(it) }
         if (normalized == null) {

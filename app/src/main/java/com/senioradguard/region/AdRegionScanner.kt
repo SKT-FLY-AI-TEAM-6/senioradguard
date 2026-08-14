@@ -141,7 +141,7 @@ class AdRegionScanner {
                         inBrowser -> adLinkOf(node, screen)
                         else -> containerOf(node, screen)
                     }
-                    if (r != null && out.none { it.rect.contains(r.rect) || r.rect.contains(it.rect) }) {
+                    if (r != null && out.none { overlaps(it.rect, r.rect) }) {
                         out.add(r)
                     }
                     return
@@ -152,6 +152,19 @@ class AdRegionScanner {
             collectAdRegions(node.getChild(i) ?: continue, depth + 1, screen, out)
             if (out.size >= MAX_REGIONS || truncated) return
         }
+    }
+
+    /**
+     * 같은 광고를 두 경로(컨테이너 id, 라벨)가 조금 다른 좌표로 잡으면 테두리가
+     * 두 겹이 된다(실사용 리포트). 완전 포함이 아니어도 작은 쪽의 절반 이상이
+     * 겹치면 같은 광고로 본다.
+     */
+    private fun overlaps(a: Rect, b: Rect): Boolean {
+        val inter = Rect()
+        if (!inter.setIntersect(a, b)) return false
+        val interArea = inter.width().toLong() * inter.height()
+        val smaller = minOf(a.width().toLong() * a.height(), b.width().toLong() * b.height())
+        return smaller > 0 && interArea * 2 >= smaller
     }
 
     /**

@@ -132,6 +132,28 @@ class AdEntryDetector(private val clock: () -> Long) {
 
         private val adUtmMediums = setOf("cpc", "ppc", "paid", "display", "banner", "paid_social")
 
+        /**
+         * 리다이렉터가 목적지를 쿼리에 담아 두는 경우(origUrl= 등) 그 URL을 꺼낸다.
+         * JS로만 넘어가는 경유지는 서버 리다이렉트 체인으로 안 풀리는데
+         * (실측: api.mjbiz.co.kr/kw/rdw?origUrl=link.coupang.com…), 목적지가
+         * 쿼리에 그대로 있어 이걸 이어가면 체인이 계속된다.
+         * 리다이렉터 호스트의 URL에만 쓸 것 — 일반 페이지에선 오탐이 난다.
+         */
+        fun embeddedDestination(rawUrl: String): String? {
+            val query = rawUrl.substringAfter('?', "").substringBefore('#')
+            if (query.isEmpty()) return null
+            for (param in query.split('&')) {
+                val value = param.substringAfter('=', "")
+                val decoded = runCatching {
+                    java.net.URLDecoder.decode(value, "UTF-8")
+                }.getOrNull() ?: continue
+                if (decoded.startsWith("http://") || decoded.startsWith("https://")) {
+                    return decoded
+                }
+            }
+            return null
+        }
+
         /** 도착 URL에 광고 클릭 추적 파라미터가 붙어 있는가. */
         fun isAdLanding(rawUrl: String): Boolean {
             val query = rawUrl.substringAfter('?', "").substringBefore('#')

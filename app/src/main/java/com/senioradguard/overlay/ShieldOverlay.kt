@@ -36,6 +36,7 @@ class ShieldOverlay(private val context: Context) {
     private var iconView: TextView? = null
     private var titleView: TextView? = null
     private var subView: TextView? = null
+    private var buttonRow: LinearLayout? = null
 
     val isShowing: Boolean get() = root != null
 
@@ -68,6 +69,15 @@ class ShieldOverlay(private val context: Context) {
             text = sub
         }
 
+        // 판정 결과에서 쓰는 큰 버튼 두 개. 평소엔 감춰 둔다.
+        // 루트가 터치를 삼켜도 클릭 가능한 자식이 먼저 받으므로 버튼은 눌린다.
+        val buttons = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            visibility = android.view.View.GONE
+            setPadding(0, dp(28), 0, 0)
+        }
+
         val view = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -75,6 +85,7 @@ class ShieldOverlay(private val context: Context) {
             addView(titleText)
             addView(mainText)
             addView(subText)
+            addView(buttons)
             // 이 창의 존재 이유 — 아래 페이지로 가는 모든 터치를 삼킨다
             setOnTouchListener { _, _ -> true }
         }
@@ -95,6 +106,7 @@ class ShieldOverlay(private val context: Context) {
             iconView = titleText
             titleView = mainText
             subView = subText
+            buttonRow = buttons
         }
     }
 
@@ -102,7 +114,50 @@ class ShieldOverlay(private val context: Context) {
         iconView?.text = icon
         titleView?.text = title
         subView?.text = sub
+        buttonRow?.visibility = android.view.View.GONE
     }
+
+    /**
+     * 판정 결과 + 선택 버튼. 중위험 확인과 미분석 안내에 쓴다.
+     * 어르신 기준: 권장 행동(복귀)이 크고 진하게 위, 나머지는 회색으로 아래.
+     */
+    fun showChoice(
+        icon: String,
+        title: String,
+        sub: String,
+        primaryLabel: String,
+        onPrimary: () -> Unit,
+        secondaryLabel: String,
+        onSecondary: () -> Unit
+    ) {
+        if (root == null) show(icon, title, sub)
+        iconView?.text = icon
+        titleView?.text = title
+        subView?.text = sub
+        val row = buttonRow ?: return
+        row.removeAllViews()
+        row.addView(bigButton(primaryLabel, "#D32F2F", onPrimary))
+        row.addView(bigButton(secondaryLabel, "#4A4A4A", onSecondary))
+        row.visibility = android.view.View.VISIBLE
+    }
+
+    private fun bigButton(label: String, color: String, onTap: () -> Unit) =
+        TextView(context).apply {
+            text = label
+            textSize = 21f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(30), dp(18), dp(30), dp(18))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(Color.parseColor(color))
+                cornerRadius = dp(16).toFloat()
+            }
+            setOnClickListener { onTap() }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(8), 0, dp(8)) }
+        }
 
     fun dismiss() {
         root?.let { runCatching { windowManager.removeView(it) } }
@@ -110,5 +165,6 @@ class ShieldOverlay(private val context: Context) {
         titleView = null
         subView = null
         iconView = null
+        buttonRow = null
     }
 }

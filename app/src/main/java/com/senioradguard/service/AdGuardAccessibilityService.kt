@@ -18,6 +18,9 @@ import com.senioradguard.agent.CandidateExtractor
 import com.senioradguard.agent.GeminiClassifier
 import com.senioradguard.agent.StubClassifier
 import com.senioradguard.analysis.AdEntryDetector
+import com.senioradguard.analysis.RuleBasedUrlAnalyzer
+import com.senioradguard.analysis.UrlRiskAnalyzer
+import com.senioradguard.analysis.UrlRiskRules
 import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.detector.db.UrlVerdict
 import com.senioradguard.guard.InstallGuard
@@ -29,8 +32,10 @@ import com.senioradguard.overlay.ShieldOverlay
 import com.senioradguard.overlay.TrackedBorderOverlay
 import com.senioradguard.region.AdRegionScanner
 import com.senioradguard.region.Anchor
+import com.senioradguard.risk.RiskAssessment
 import com.senioradguard.risk.RiskLevel
 import com.senioradguard.risk.UrlNormalizer
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -181,6 +186,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private val shieldOverlay by lazy { ShieldOverlay(this) }
 
     private val urlVerdictDao by lazy { AppDatabase.getInstance(this).urlVerdictDao() }
+
+    /** 격리 분석기. 이 인터페이스가 온디바이스 LLM(4c)의 교체점이다. */
+    private val analyzer: UrlRiskAnalyzer = RuleBasedUrlAnalyzer()
 
     /** 광고 클릭 직전에 주소창이 보여주던 URL. 이동 감지의 비교 기준이다. */
     private var preClickUrl: String? = null
@@ -849,9 +857,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
         handler.postDelayed(shieldTimeout, SHIELD_MAX_MS)
         Log.i(TAG, "가림막 표시 — 사유=$reason url=${urlShown ?: "-"}")
 
-        // 추적 리다이렉트가 끝나 주소창이 안정된 뒤에 판정한다
+        // 추적 리다이렉트가 끝나 주소창이 안정된 뒤에 판정한다.
+        // 초기 URL을 기준값으로 넣지 않는다 — 리다이렉터가 느리면 첫 재확인이
+        // 초기값과 같아서 "안정됐다"로 착각하고 정거장을 분석해 버린다 (실측).
         urlSettleReadsLeft = URL_SETTLE_MAX_READS
-        lastSettleUrl = urlShown
+        lastSettleUrl = null
         handler.postDelayed(urlSettle, URL_SETTLE_MS)
     }
 
@@ -859,8 +869,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
         override fun run() {
             if (!shieldActive) return
             val url = readUrlBar()
-            val settled = url != null && url == lastSettleUrl
-            if (url != null) lastSettleUrl = url
+            val host = url?.let { UrlNormalizer.hostOf(it) }
+            // 과금 리다이렉터는 목적지가 아니라 지나가는 정거장이다. 그걸 분석하면
+            // 빈 경유 페이지에 저위험이 나온다 — 진짜 도착지가 뜰 때까지 기다린다.
+            val transit = host != null && AdEntryDetector.isAdRedirector(host)
+            val settled = !transit && url != null && url == lastSettleUrl
+            if (url != null && !transit) lastSettleUrl = url
             if (settled || --urlSettleReadsLeft <= 0) {
                 resolveShield(lastSettleUrl)
             } else {
@@ -869,44 +883,123 @@ class AdGuardAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** 확보한 URL로 캐시를 조회해 가림막의 결말을 정한다. */
+    /** 확보한 URL로 캐시를 조회하고, 미스면 격리 분석을 돌려 가림막의 결말을 정한다. */
     private fun resolveShield(urlShown: String?) {
         val normalized = urlShown?.let { UrlNormalizer.normalize(it) }
         if (normalized == null) {
-            // URL 미확보 — "추가 확인 필요" 상태. 분석할 대상이 없으므로 걷는다.
-            // (Unverified 안내 UI는 4e에서 보호 수준 정책과 함께 붙인다)
-            Log.i(TAG, "가림막 해제 — URL 미확보 (추가 확인 필요)")
-            dismissShieldNow()
+            finishShieldUnverified("주소를 확인하지 못했어요")
             return
         }
         scope.launch {
-            val verdict = runCatching {
+            val cached = runCatching {
                 urlVerdictDao.findValid(normalized, System.currentTimeMillis())
+            }.getOrNull()?.toAssessment()
+            if (cached != null) {
+                Log.i(TAG, "URL 판정 캐시 히트 — $normalized ${cached.level}")
+                withContext(Dispatchers.Main) { finishShield(normalized, cached) }
+                return@launch
+            }
+
+            // 격리 분석 — 사용자 브라우저와 분리된 수집(JS·쿠키·다운로드 없음) + 규칙 판정
+            val page = runCatching {
+                withTimeoutOrNull(ANALYZE_TIMEOUT_MS) { analyzer.analyze(urlShown) }
             }.getOrNull()
-            withContext(Dispatchers.Main) { finishShield(normalized, verdict) }
+            if (page == null) {
+                Log.i(TAG, "분석 실패 — $normalized (추가 확인 필요)")
+                withContext(Dispatchers.Main) { finishShieldUnverified("이 곳을 살펴보지 못했어요") }
+                return@launch
+            }
+
+            // 최종 도착지가 여전히 광고망 리다이렉터라면(JS로만 넘어가는 체인)
+            // 진짜 목적지를 본 것이 아니다 — 저위험으로 캐시하면 안 된다.
+            val finalHost = UrlNormalizer.hostOf(page.finalUrl)
+            if (finalHost != null && AdEntryDetector.isAdRedirector(finalHost)) {
+                Log.i(TAG, "분석 중단 — 최종지가 리다이렉터 (${page.finalUrl})")
+                withContext(Dispatchers.Main) {
+                    finishShieldUnverified("연결되는 곳을 끝까지 확인하지 못했어요")
+                }
+                return@launch
+            }
+
+            val a = page.assessment
+            // Unverified는 저장하지 않는다는 원칙 그대로 — 여기 오는 것은 항상 Assessed다
+            runCatching {
+                urlVerdictDao.upsert(
+                    UrlVerdict(
+                        normalizedUrl = normalized,
+                        riskLevel = a.level.name,
+                        reason = a.reason,
+                        finalUrl = page.finalUrl,
+                        analyzedAt = System.currentTimeMillis(),
+                        validUntil = System.currentTimeMillis() + UrlRiskRules.validityMs(a.level)
+                    )
+                )
+            }
+            Log.i(TAG, "분석 완료 — $normalized ${a.level} : ${a.reason} (최종=${page.finalUrl})")
+            withContext(Dispatchers.Main) { finishShield(normalized, a) }
         }
     }
 
-    private fun finishShield(url: String, verdict: UrlVerdict?) {
+    /** 등급이 나왔다. 기획 3.1절의 대응대로 가림막을 끝맺는다. */
+    private fun finishShield(url: String, assessment: RiskAssessment.Assessed) {
         if (!shieldActive) return
-        if (verdict?.toAssessment()?.level == RiskLevel.HIGH) {
-            performGlobalAction(GLOBAL_ACTION_BACK)
-            shieldOverlay.update("⚠️", "위험한 곳이에요", "이전 화면으로 안전하게 돌려보냈어요")
-            handler.removeCallbacks(shieldTimeout)
-            handler.postDelayed(dismissShieldRunnable, RESULT_SHOW_MS)
-            Log.i(TAG, "고위험 차단 — $url : ${verdict.reason}")
-            return
+        handler.removeCallbacks(shieldTimeout)
+        handler.removeCallbacks(urlSettle)
+        when (assessment.level) {
+            RiskLevel.HIGH -> {
+                // 계속 진행 없음 — 즉시 복귀
+                performGlobalAction(GLOBAL_ACTION_BACK)
+                shieldOverlay.update(
+                    "⚠️", "위험한 곳이에요",
+                    "${assessment.reason}\n이전 화면으로 안전하게 돌려보냈어요"
+                )
+                handler.postDelayed(dismissShieldRunnable, RESULT_SHOW_MS)
+                Log.i(TAG, "고위험 차단 — $url")
+            }
+            RiskLevel.MEDIUM -> {
+                // 이유를 보여주고 사용자가 선택한다 (안내형 동작 — 균형형 투터치 정책은 4e)
+                shieldOverlay.showChoice(
+                    "⚠️", "조심하세요", assessment.reason,
+                    "안전하게 돌아가기", {
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                        dismissShieldNow()
+                    },
+                    "그냥 볼게요", { dismissShieldNow() }
+                )
+                handler.postDelayed(dismissShieldRunnable, CHOICE_SHOW_MS)
+            }
+            RiskLevel.LOW -> {
+                shieldOverlay.update("✅", "확인했어요", assessment.reason)
+                handler.postDelayed(dismissShieldRunnable, OK_SHOW_MS)
+            }
         }
-        // 캐시 미스는 아직 분석기가 없어서다(4b-③에서 연결). 미검증을 안전처럼
-        // 안내하지 않기 위해 말없이 걷기만 한다. 저·중위험 정책 연결은 4e.
-        Log.i(TAG, "가림막 해제 — $url 판정=${verdict?.riskLevel ?: "미분석"}")
-        dismissShieldNow()
     }
 
-    /** 어떤 경로로든 가림막이 이 시간 이상 떠 있으면 강제로 걷는다. */
+    /**
+     * 분석하지 못했다 — **말없이 걷지 않는다.** 분석 못 한 화면을 저위험처럼
+     * 취급하지 않는 원칙(추가 확인 필요)대로, 확인하지 못했음을 알리고
+     * 복귀를 권한다. 사용자가 고르지 않으면 잠시 후 스스로 걷힌다.
+     */
+    private fun finishShieldUnverified(limitation: String) {
+        if (!shieldActive) return
+        handler.removeCallbacks(shieldTimeout)
+        handler.removeCallbacks(urlSettle)
+        shieldOverlay.showChoice(
+            "❓", "확인하지 못했어요",
+            "$limitation\n개인정보나 돈을 요구하면 나가세요",
+            "안전하게 돌아가기", {
+                performGlobalAction(GLOBAL_ACTION_BACK)
+                dismissShieldNow()
+            },
+            "그냥 볼게요", { dismissShieldNow() }
+        )
+        handler.postDelayed(dismissShieldRunnable, CHOICE_SHOW_MS)
+    }
+
+    /** 어떤 경로로든 가림막이 이 시간 이상 "확인 중"이면 미확인으로 끝맺는다. */
     private val shieldTimeout = Runnable {
-        Log.w(TAG, "가림막 시간 초과 — 강제 해제")
-        dismissShieldNow()
+        Log.w(TAG, "가림막 시간 초과")
+        finishShieldUnverified("확인이 너무 오래 걸려요")
     }
 
     private val dismissShieldRunnable = Runnable { dismissShieldNow() }
@@ -1000,14 +1093,24 @@ class AdGuardAccessibilityService : AccessibilityService() {
         private const val NAV_POLL_COUNT = 10
 
         /**
-         * 가림막 최대 표시 시간. 이 시간이 지나면 판정과 무관하게 강제로 걷는다 —
-         * 가림막이 화면에 눌러붙는 일은 어떤 경로로도 있어서는 안 된다.
+         * "확인 중" 상태의 최대 시간. 주소창 안정 대기(최대 2.4초) + 격리 분석
+         * (최대 3초)을 담고, 넘기면 미확인 안내로 끝맺는다 — 가림막이 결말 없이
+         * 눌러붙는 일은 어떤 경로로도 있어서는 안 된다.
          */
-        private const val SHIELD_MAX_MS = 4_000L
+        private const val SHIELD_MAX_MS = 7_000L
+
+        /** 격리 분석(네트워크 수집 + 규칙 판정)의 시간 상한 */
+        private const val ANALYZE_TIMEOUT_MS = 3_000L
+
+        /** 선택 버튼이 있는 결과(중위험·미확인)를 보여주는 최대 시간 — 이후 자동 해제 */
+        private const val CHOICE_SHOW_MS = 6_000L
+
+        /** 저위험 확인 표시를 보여주는 시간 */
+        private const val OK_SHOW_MS = 900L
 
         /** 주소창이 안정될 때까지의 재확인 주기와 횟수 (리다이렉트 체인 대기) */
         private const val URL_SETTLE_MS = 400L
-        private const val URL_SETTLE_MAX_READS = 6
+        private const val URL_SETTLE_MAX_READS = 8
 
         /** 고위험 복귀 후 안내 문구를 보여주는 시간 */
         private const val RESULT_SHOW_MS = 2_500L

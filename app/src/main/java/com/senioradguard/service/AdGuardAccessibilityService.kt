@@ -304,6 +304,17 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private val navRecheck = Runnable { requestScan() }
 
     /**
+     * 딥링크 복귀 바가 떠 있는 동안 참 — apply()가 스캔마다 바를 걷지 않게 한다.
+     * (NavigationGuard발 바는 navShowBack이 관리하고, 이 바는 시간·버튼이 관리)
+     */
+    private var backPromptSticky = false
+
+    private val backPromptTimeout = Runnable {
+        backPromptSticky = false
+        backPrompt.hide()
+    }
+
+    /**
      * 선택 버튼(안전하게 돌아가기 / 그냥 볼게요)을 띄우고 사용자 결정을
      * 기다리는 중인가. 이 상태는 시간이 지나도 걷지 않는다 — 위험 안내가
      * 사용자 결정 없이 사라지면 안내의 의미가 없다. 대신 사용자가 뒤로가기·
@@ -954,7 +965,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 동안만 스스로 깨워 12초 만료를 확인한다 (원본과 같은 장치).
             handler.removeCallbacks(navRecheck)
             handler.postDelayed(navRecheck, 1_000)
-        } else {
+        } else if (!backPromptSticky) {
             backPrompt.hide()
         }
     }
@@ -1508,18 +1519,27 @@ class AdGuardAccessibilityService : AccessibilityService() {
             }
             RiskLevel.LOW -> {
                 if (shieldDeepLinked) {
-                    // 광고가 다른 앱·화면을 열었다 — 페이지는 안전해도 갑자기 옮겨진
-                    // 어르신에겐 돌아갈 길이 필요하다 (NavigationGuard 이식).
-                    shieldOverlay.showChoice(
-                        "✅", "확인했어요",
-                        "${assessment.reason}\n광고가 이 화면을 열었어요",
-                        "이전 화면으로 돌아가기", {
-                            performGlobalAction(GLOBAL_ACTION_BACK)
-                            dismissShieldNow()
+                    // 광고가 다른 앱·화면을 열었지만 목적지는 안전하다 — 화면 전체를
+                    // 덮는 대신 팀원(ad_claude_fable) 스타일 하단 바로 돌아갈 길만
+                    // 12초간 준다. 갑자기 옮겨진 어르신에게 필요한 건 판정 화면이
+                    // 아니라 복귀 버튼이다.
+                    dismissShieldNow()
+                    backPromptSticky = true
+                    backPrompt.show(
+                        onStay = {
+                            handler.removeCallbacks(backPromptTimeout)
+                            backPromptSticky = false
+                            backPrompt.hide()
                         },
-                        "그냥 볼게요", { dismissShieldNow() }
+                        onBack = {
+                            handler.removeCallbacks(backPromptTimeout)
+                            backPromptSticky = false
+                            backPrompt.hide()
+                            leaveApp(3)
+                        }
                     )
-                    startAwaitingChoice()
+                    handler.removeCallbacks(backPromptTimeout)
+                    handler.postDelayed(backPromptTimeout, BACK_PROMPT_MS)
                 } else {
                     shieldOverlay.update("✅", "확인했어요", assessment.reason)
                     handler.postDelayed(dismissShieldRunnable, OK_SHOW_MS)
@@ -1693,6 +1713,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
          * 포함하므로 넉넉히 둔다 — 백그라운드라 사용자를 기다리게 하지 않는다.
          */
         private const val LLM_TIMEOUT_MS = 60_000L
+
+        /** 딥링크 복귀 바(그냥 두기/뒤로 가기)의 표시 시간 — 원본 PROMPT_MS와 동일 */
+        private const val BACK_PROMPT_MS = 12_000L
 
         /**
          * 선택 대기 중 사용자가 화면을 떠났는지 확인하는 주기. 선택 화면은

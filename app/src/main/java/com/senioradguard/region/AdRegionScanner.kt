@@ -163,14 +163,22 @@ class AdRegionScanner {
         val r = Rect()
         var cur: AccessibilityNodeInfo? = marker
         var up = 0
+        var fallback: Resolved? = null
         while (cur != null && up < MAX_CLIMB) {
             cur.getBoundsInScreen(r)
-            if (r.height() > screen.height() * 0.5) return null
+            if (r.height() > screen.height() * 0.5) break
             if (cur.isClickable) return Resolved(Rect(r), Anchor.of(cur))
+            // 클릭 플래그 없는 iframe 배너(구글 디스플레이·쿠팡 파트너스 등)를 위한
+            // 대비 — 광고 한 칸처럼 생긴 조상을 기억해 둔다. 실측(연합뉴스TV 기사):
+            // iframe 광고는 클릭을 JS로 받아 어느 조상에도 isClickable이 없어,
+            // AD 라벨을 찾고도 영역을 통째로 버리고 있었다.
+            if (r.width() >= screen.width() * 0.25 && r.height() >= screen.height() * 0.04) {
+                fallback = Resolved(Rect(r), Anchor.of(cur))
+            }
             cur = cur.parent
             up++
         }
-        return null
+        return fallback
     }
 
     /**

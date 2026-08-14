@@ -17,7 +17,8 @@ object AdLabelRules {
      */
     private val adContainerIds = listOf(
         "div-gpt-ad", "adsbygoogle", "google_ads",   // 구글 (표준 광고 슬롯 id)
-        "aceplanet", "mobondivbanner", "adfit", "clickads", "innorame", "criteo"
+        "aceplanet", "mobondivbanner", "adfit", "clickads", "innorame", "criteo",
+        "coupang-ad"   // 쿠팡 파트너스 배너 위젯 (실측: 연합뉴스TV의 haim-coupang-ad)
     )
 
     fun isAdContainer(id: String?): Boolean {

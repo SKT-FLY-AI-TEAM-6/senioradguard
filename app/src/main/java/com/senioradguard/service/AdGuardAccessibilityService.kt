@@ -1062,9 +1062,13 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // 리다이렉터 경유 URL은 저장된 적이 없어 자연히 미스 → 안정화 경로로.
         urlShown?.let { initial ->
             val fpForFast = shieldFpKeys
+            // 리다이렉터 주소로 히트하면 보여주되 저장은 안 한다 — 정거장은 일회용
+            val transit = UrlNormalizer.hostOf(initial)
+                ?.let { AdEntryDetector.isAdRedirector(it) } == true
             scope.launch {
                 val normalized = UrlNormalizer.normalize(initial) ?: return@launch
-                val stored = resolveFromStore(normalized, fpForFast) ?: return@launch
+                val stored = resolveFromStore(normalized, fpForFast, persist = !transit)
+                    ?: return@launch
                 withContext(Dispatchers.Main) { finishShield(normalized, stored) }
             }
         }
@@ -1246,10 +1250,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
     /**
      * 저장된 판정 조회: URL 캐시 → 지문 연계 순. 히트하면 지문 연계를 갱신하고
      * 판정을 돌려준다 — 즉시 판정 패스트패스와 안정화 후 경로가 함께 쓴다.
+     *
+     * @param persist false면 조회만 하고 저장(판정 복사·지문 연계)은 하지 않는다.
+     *   패스트패스가 리다이렉터 주소로 히트했을 때다 — 정거장 주소는 일회용이라
+     *   거기에 판정을 옮겨 적으면 쓰레기 행만 쌓인다 (실측: googleadservices).
      */
     private suspend fun resolveFromStore(
         normalized: String,
-        fpKeys: List<String>
+        fpKeys: List<String>,
+        persist: Boolean = true
     ): RiskAssessment.Assessed? {
         val now = System.currentTimeMillis()
         val cached = runCatching {
@@ -1257,7 +1266,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         }.getOrNull()?.toAssessment()
         if (cached != null) {
             Log.i(TAG, "URL 판정 캐시 히트 — $normalized ${cached.level}")
-            linkFingerprints(fpKeys, normalized)
+            if (persist) linkFingerprints(fpKeys, normalized)
             return cached
         }
 
@@ -1269,11 +1278,13 @@ class AdGuardAccessibilityService : AccessibilityService() {
         val linkedAssessment = linked?.toAssessment()
         if (linked != null && linkedAssessment != null) {
             Log.i(TAG, "지문 판정 히트 — ${linkedAssessment.level} (새 URL: $normalized)")
-            // 새 변형 URL에도 판정을 옮겨 적어 다음엔 URL 캐시로도 잡히게 한다
-            runCatching {
-                urlVerdictDao.upsert(linked.copy(normalizedUrl = normalized, analyzedAt = now))
+            if (persist) {
+                // 새 변형 URL에도 판정을 옮겨 적어 다음엔 URL 캐시로도 잡히게 한다
+                runCatching {
+                    urlVerdictDao.upsert(linked.copy(normalizedUrl = normalized, analyzedAt = now))
+                }
+                linkFingerprints(fpKeys, normalized)
             }
-            linkFingerprints(fpKeys, normalized)
             return linkedAssessment
         }
         return null

@@ -30,8 +30,20 @@ class AdClickTracker(private val now: () -> Long = System::currentTimeMillis) {
     data class Bounds(val left: Int, val top: Int, val right: Int, val bottom: Int)
 
     companion object {
-        /** 광고를 누르고 화면이 바뀌기까지 허용할 시간. */
-        const val TTL_MS = 3_000L
+        /**
+         * 광고를 누르고 목적지에 닿기까지 허용할 시간.
+         *
+         * 처음에 3초로 뒀다가 실기기에서 놓쳤다. 광고를 누른 시각과 주소가 바뀐
+         * 시각이 이랬다:
+         *
+         *   16:54:05  광고 클릭 감지
+         *   16:54:12  주소 변경: login.coupang.com   ← 7초 뒤
+         *
+         * 광고 서버 응답, 중계, 앱 딥링크 해석이 차례로 붙어 몇 초가 걸린다.
+         * 창을 넓히면 "광고를 눌러 닫은 뒤 스스로 쿠팡을 켠" 경우를 잘못 잡을
+         * 수 있지만, 10초 안에 그 두 가지를 다 하는 경우는 드물다.
+         */
+        const val TTL_MS = 10_000L
 
         /**
          * 광고 영역을 기억해 둘 시간. 스캔은 수백 ms마다 갱신되지만, 화면이

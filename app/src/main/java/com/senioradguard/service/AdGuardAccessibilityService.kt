@@ -218,6 +218,21 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private var lastCheckedHost: String? = null
 
     /**
+     * 마지막으로 화면에 떴다고 통보받은 패키지.
+     *
+     * 스캔은 타이머로 돌기 때문에 사용자가 다른 앱을 쓰는 동안에도
+     * `rootInActiveWindow`가 브라우저 창을 돌려줄 때가 있다. 실제로 파일 관리자를
+     * 쓰는 중에 백그라운드 크롬의 탭이 바뀌는 것을 "광고 경유 이동"으로 오판했다:
+     *
+     *   17:10:23  support.google.com
+     *   17:10:25  coupang.com        ← 1초 차이라 중계로 보였다
+     *
+     * 사용자가 브라우저를 보고 있을 때만 주소 변화를 판단한다.
+     */
+    @Volatile
+    private var foregroundPackage: String? = null
+
+    /**
      * 글자 없는 광고 이미지를 화면에서 읽는다. API 30부터만 가능하다 —
      * takeScreenshot이 그때 생겼고, 그 아래에서는 OCR 없이 동작한다.
      */
@@ -344,6 +359,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val pkg = event.packageName?.toString() ?: return
+
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            foregroundPackage = pkg
+        }
 
         // ── Layer 3: 설치 유도 감지 ──
         // 스토어는 targetApps가 아니므로 아래 필터보다 먼저 처리해야 한다.
@@ -874,6 +893,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
      */
     private fun onHostSeen(host: String?) {
         if (host == null || host == lastCheckedHost) return
+        // 사용자가 브라우저를 보고 있지 않으면 주소가 바뀌어도 의미가 없다.
+        val fg = foregroundPackage
+        if (fg != null && fg !in UrlGuard.URL_BAR_IDS.keys) {
+            lastCheckedHost = host
+            return
+        }
         lastCheckedHost = host
         Log.i(TAG, "주소 변경 감지: $host")
 

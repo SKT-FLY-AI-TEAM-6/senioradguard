@@ -99,7 +99,8 @@ AD_REDIRECT_PACKAGES = com.coupang.mobile, com.alibaba.aliexpresshd,
 ```
 Layer 1/2가 광고 탐지 → bounds와 시각을 메모리에 기록
 TYPE_VIEW_CLICKED → 눌린 노드가 광고 bounds와 겹치는지 확인
-겹치면 → pendingAdClick 플래그 3초 TTL (메모리, DB 아님)
+겹치면 → pendingAdClick 플래그 10초 TTL (메모리, DB 아님)
+         ※ 명세는 3초였으나 실기기에서 광고→도착이 4~7초라 놓쳤다
 TYPE_WINDOW_STATE_CHANGED → 플래그 유효 + 목록 매칭일 때만 오버레이, 플래그 즉시 소모
 플래그 없으면 → 오버레이 표시하지 않음
 ```

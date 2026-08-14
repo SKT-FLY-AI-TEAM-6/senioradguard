@@ -17,6 +17,7 @@ import com.senioradguard.agent.AgentPipeline
 import com.senioradguard.agent.CandidateExtractor
 import com.senioradguard.agent.GeminiClassifier
 import com.senioradguard.agent.StubClassifier
+import com.senioradguard.detector.UrlGuard
 import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.guard.InstallGuard
 import com.senioradguard.logger.AdEventLogger
@@ -24,6 +25,8 @@ import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.AdMarkStyle
 import com.senioradguard.overlay.OverlayManager
 import com.senioradguard.region.AdRegionScanner
+import com.senioradguard.risk.ProtectionLevel
+import com.senioradguard.risk.RiskLevel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -167,6 +170,21 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     /** 같은 광고를 보호자에게 반복해서 알리지 않도록 막는다. */
     private val sightings = SightingLog()
+
+    private val urlGuard by lazy { UrlGuard(this) }
+
+    /** 이미 경고한 도메인. 같은 페이지에서 스크롤할 때마다 경고하면 쓸 수 없다. */
+    private val warnedHosts = SightingLog()
+
+    /**
+     * 보호 강도. 보호자가 바꾸면 원격에서 내려오지만, 지금은 로컬 설정만 읽는다.
+     * (원격 동기화는 Phase 2-A의 가족 계정 구조가 들어온 뒤에 붙인다.)
+     */
+    private fun protectionLevel(): ProtectionLevel =
+        ProtectionLevel.of(
+            getSharedPreferences("settings", MODE_PRIVATE)
+                .getInt(PREF_PROTECTION_LEVEL, ProtectionLevel.DEFAULT.value)
+        )
 
     private val pipeline by lazy {
         // 키가 없으면 규칙 기반 대역으로 물러난다 — 키를 아직 안 받은 팀원도 앱을
@@ -395,6 +413,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         // 트리 접근은 이 백그라운드 경로에서 끝낸다 (apply는 메인 스레드).
         lastSourceKey = runCatching { extractor.sourceKeyOf(root) }.getOrNull()
+        checkHost(lastSourceKey)
 
         val result = scanner.scan(root)
         if (result.truncated) {
@@ -541,14 +560,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
     /**
      * 광고를 표시했다는 사실을 보호자에게 남긴다.
      *
-     * 광고 문구 자체는 올리지 않는다. 어르신이 무엇을 읽고 있었는지까지 보호자에게
-     * 넘길 이유가 없고, 보호자가 알아야 할 것은 "어디서 광고가 몇 건 떴는가"다.
-     * 출처는 도메인 또는 패키지명까지만 남는다.
+     * Layer 1은 화면에 "광고"라고 적혀 있는 것이라 확실하지만 위험하지는 않다(저위험).
+     * Layer 2는 추정이므로 확신도에 따라 중·고위험으로 갈린다. 등급이 개입 강도를
+     * 정하므로, 여기서 잘못 매기면 알려주기만 하면 될 것을 막아버리게 된다.
      */
-    private fun reportSighting(sourceKey: String?, layer: Int, count: Int) {
+    private fun reportSighting(sourceKey: String?, layer: Int, count: Int, risk: RiskLevel) {
         if (sourceKey == null || count == 0) return
         if (!sightings.shouldReport(sourceKey, layer)) return
-        AdEventLogger.logAdMarked(sourceKey, "광고 ${count}건 표시", layer)
+        AdEventLogger.logAdMarked(sourceKey, layer, risk, count)
     }
 
     private fun apply(confirmed: List<Rect>, guessed: List<Rect>) {
@@ -568,8 +587,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         confirmedRegions = shifted
         aiRegions = guessed
-        reportSighting(lastSourceKey, layer = 1, count = shifted.size)
-        reportSighting(lastSourceKey, layer = 2, count = guessed.size)
+        reportSighting(lastSourceKey, layer = 1, count = shifted.size, risk = RiskLevel.LOW)
+        // 캐시로 되살린 표시는 확신도를 모른다. 중위험으로 둔다 —
+        // 모르는 것을 고위험으로 올리면 사용자를 근거 없이 막게 된다.
+        reportSighting(lastSourceKey, layer = 2, count = guessed.size, risk = RiskLevel.MEDIUM)
         scheduleLayer2()
     }
 
@@ -657,10 +678,16 @@ class AdGuardAccessibilityService : AccessibilityService() {
                     if (generation == screenGeneration) {
                         borderOverlay.show(AdMarkStyle.AI_GUESS, result.regions)
                         aiRegions = result.regions
+                        // 방금 판별한 결과라 확신도를 안다. 표시된 것 중 가장 높은
+                        // 확신도로 등급을 매긴다 — 하나라도 고위험이면 고위험이다.
+                        val top = result.traces
+                            .filter { it.marked }
+                            .maxOfOrNull { it.finalConfidence } ?: 0f
                         reportSighting(
                             candidates.firstOrNull()?.sourceKey,
                             layer = 2,
-                            count = result.regions.size
+                            count = result.regions.size,
+                            risk = RiskLevel.ofConfidence(top)
                         )
                     }
                 }
@@ -680,9 +707,41 @@ class AdGuardAccessibilityService : AccessibilityService() {
         if (isAiEnabled()) handler.postDelayed(runLayer2, LAYER2_IDLE_MS)
     }
 
-    /** 기본 OFF 옵트인. 화면 텍스트가 외부로 나가므로 사용자가 켜야만 동작한다. */
+    /**
+     * 기본 OFF 옵트인. 화면 텍스트가 외부로 나가므로 사용자가 켜야만 동작한다.
+     * 보호 강도 1단계에서는 토글과 무관하게 Layer 2를 돌리지 않는다 —
+     * 보호자가 "라벨만"으로 낮춰뒀는데 어르신 기기가 계속 외부로 보내면 안 된다.
+     */
     private fun isAiEnabled(): Boolean =
-        getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_AI_CLASSIFY, false)
+        protectionLevel().usesAi &&
+            getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_AI_CLASSIFY, false)
+
+    /**
+     * 지금 페이지의 도메인이 차단 목록에 있는지 본다. 보호 강도 3단계에서만 돈다.
+     *
+     * 링크를 누르는 순간이 아니라 **도착한 뒤**에 확인한다 — 접근성 트리에는 href가
+     * 없어서 누르기 전에 알 방법이 없다([UrlGuard] 주석 참고). 페이지는 이미 열렸지만
+     * 개인정보를 넣거나 앱을 설치하기 전에 멈춰 세울 수 있다.
+     */
+    private suspend fun checkHost(host: String?) {
+        if (!protectionLevel().usesUrlBlock) return
+        if (host == null || !warnedHosts.shouldReport(host, layer = 3)) return
+        if (!urlGuard.isBlocked(host)) return
+
+        Log.i(TAG, "차단 도메인 감지: $host")
+        AdEventLogger.logBlockedDomain(host, blocked = true)
+        withContext(Dispatchers.Main) {
+            overlayManager.showWarning(
+                message = "위험한 사이트일 수 있어요!\n[$host]\n" +
+                    "광고·사기 사이트 목록에 있습니다.\n뒤로 돌아갈까요?",
+                packageName = host,
+                onConfirm = { AdEventLogger.logIgnored(host) },
+                onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
+                currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() },
+                onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) }
+            )
+        }
+    }
 
     override fun onInterrupt() {
         apply(emptyList(), emptyList())
@@ -758,6 +817,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
         private val CLOSE_ID_TOKENS = setOf(
             "close", "dismiss", "btnclose", "closebutton", "adclose", "cancel", "skip"
         )
+
+        /** "settings" prefs — 보호 강도(1/2/3). 보호자 설정과 공유한다. */
+        const val PREF_PROTECTION_LEVEL = "protection_level"
 
         /** "settings" prefs — AI 광고 판별 옵트인 키. MainActivity 토글과 공유한다. */
         const val PREF_AI_CLASSIFY = "ai_classify"

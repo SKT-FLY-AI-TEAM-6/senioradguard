@@ -189,12 +189,21 @@ private fun Notice(text: String) {
 
 @Composable
 private fun EventCard(event: AdEvent) {
-    // 무엇을 했는지 한눈에 구분되도록 색과 문구를 붙인다
-    val (label, color) = when (event.action) {
-        "blocked" -> "차단함" to Color(0xFFC62828)
-        "warned" -> "알림" to Color(0xFFEF6C00)
-        "ignored" -> "그냥 봄" to Color(0xFF616161)
-        else -> event.action to Color(0xFF616161)
+    // 위험 등급이 색을, 유형이 문구를 정한다. 등급만 보여주면 "무엇 때문에"가
+    // 빠지고, 유형만 보여주면 "얼마나 급한지"가 빠진다.
+    val (riskLabel, color) = when (event.risk) {
+        "high" -> "위험" to Color(0xFFC62828)
+        "medium" -> "주의" to Color(0xFFEF6C00)
+        else -> "알림" to Color(0xFF616161)
+    }
+    val what = when (event.type) {
+        "ad_labeled" -> "광고 표시"
+        "ad_guessed" -> "광고로 추정"
+        "blocked_domain" -> "위험 사이트 접속"
+        "store_redirect" -> "앱 설치 화면 이동"
+        "install_blocked" -> "앱 설치 시도"
+        "ignored" -> "경고를 그냥 봄"
+        else -> event.type.ifBlank { "알 수 없음" }
     }
 
     Card(modifier = Modifier.fillMaxWidth()) {
@@ -208,10 +217,17 @@ private fun EventCard(event: AdEvent) {
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(label, fontSize = 17.sp, fontWeight = FontWeight.Bold, color = color)
-                Text("Layer ${event.layer}", fontSize = 14.sp, color = Color(0xFF9E9E9E))
+                Text(riskLabel, fontSize = 17.sp, fontWeight = FontWeight.Bold, color = color)
+                Text(
+                    if (event.blocked) "차단함" else "알림만",
+                    fontSize = 14.sp,
+                    color = Color(0xFF9E9E9E)
+                )
             }
-            Text(event.adText.ifBlank { "(문구 없음)" }, fontSize = 17.sp)
+            Text(
+                if (event.count > 1) "$what ${event.count}건" else what,
+                fontSize = 17.sp
+            )
             Text(
                 text = "${event.appPackage.ifBlank { "알 수 없는 앱" }} · ${formatTime(event.timestamp)}",
                 fontSize = 14.sp,

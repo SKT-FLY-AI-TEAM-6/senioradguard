@@ -38,18 +38,23 @@ class BlacklistUpdateWorker(
                 format = BlacklistFormat.ADGUARD
             )
         )
-        private const val WORK_NAME = "blacklist_weekly_update"
+        // 주기가 바뀌었으므로 이름도 바꾼다. 같은 이름으로 KEEP을 쓰면 예전에
+        // 주 1회로 예약된 작업이 그대로 살아남아 새 주기가 적용되지 않는다.
+        private const val WORK_NAME = "blacklist_monthly_update"
 
         /**
-         * 앱 시작 시 1회 호출하면 이후 주 1회(Wi-Fi 등 네트워크 연결 시) 자동 갱신된다.
-         * 이미 예약돼 있으면 그대로 유지한다(KEEP).
+         * 앱 시작 시 1회 호출하면 이후 자동 갱신된다. 이미 예약돼 있으면 유지한다(KEEP).
+         *
+         * 주 1회에서 **월 1회로 늦췄다.** 14만 개 도메인을 받아 파싱하고 DB를 통째로
+         * 갈아끼우는 작업이라 배터리와 데이터를 눈에 띄게 쓴다. 광고 도메인 목록은
+         * 하루 이틀 사이에 뒤집히는 종류가 아니라 이 주기로 충분하다.
          */
         fun schedule(context: Context) {
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()
 
-            val request = PeriodicWorkRequestBuilder<BlacklistUpdateWorker>(7, TimeUnit.DAYS)
+            val request = PeriodicWorkRequestBuilder<BlacklistUpdateWorker>(30, TimeUnit.DAYS)
                 .setConstraints(constraints)
                 .build()
 

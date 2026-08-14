@@ -10,6 +10,7 @@ import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
 import com.google.firebase.database.ValueEventListener
+import com.senioradguard.risk.RiskLevel
 
 /** 앱 사용자의 역할. */
 enum class Role { SENIOR, GUARDIAN;
@@ -25,17 +26,27 @@ enum class Role { SENIOR, GUARDIAN;
     }
 }
 
-/** 보호자 화면에 뿌릴 차단 내역 한 건. */
+/**
+ * 보호자 화면에 뿌릴 차단 내역 한 건.
+ *
+ * **화면에 뜬 글자는 여기 없다.** 어르신이 무엇을 읽고 있었는지는 보호자가 알아야
+ * 할 정보가 아니다. 남는 것은 위험등급·유형·차단여부·시각·출처뿐이다.
+ */
 data class AdEvent(
     val eventId: String = "",
     val timestamp: Long = 0L,
+    /** 브라우저면 도메인, 앱이면 패키지명 */
     val appPackage: String = "",
-    /** 마스킹을 거친 광고 문구 */
-    val adText: String = "",
-    /** blocked / warned / ignored */
-    val action: String = "",
+    /** ad_labeled | ad_guessed | blocked_domain | store_redirect | install_blocked | ignored */
+    val type: String = "",
+    /** low | medium | high */
+    val risk: String = "",
+    /** 실제로 막았는가 (알림만 했으면 false) */
+    val blocked: Boolean = false,
     /** 1 | 2 | 3 */
-    val layer: Int = 0
+    val layer: Int = 0,
+    /** 한 번에 몇 건을 표시했는가 */
+    val count: Int = 0
 )
 
 /**
@@ -216,14 +227,23 @@ object FirebaseRepo {
      * 차단 내역 1건 기록. 어르신 모드에서 호출한다.
      * Firebase가 없으면 아무 일도 하지 않는다.
      */
-    fun logEvent(appPackage: String, adText: String, action: String, layer: Int) {
+    fun logEvent(
+        appPackage: String,
+        type: String,
+        risk: RiskLevel,
+        blocked: Boolean,
+        layer: Int,
+        count: Int = 1
+    ) {
         if (db == null) return
         val event = mapOf(
             "timestamp" to System.currentTimeMillis(),
             "appPackage" to appPackage,
-            "adText" to adText,
-            "action" to action,
-            "layer" to layer
+            "type" to type,
+            "risk" to risk.wire,
+            "blocked" to blocked,
+            "layer" to layer,
+            "count" to count
         )
 
         if (!authed) {
@@ -256,9 +276,11 @@ object FirebaseRepo {
                             eventId = child.key.orEmpty(),
                             timestamp = child.child("timestamp").getValue(Long::class.java) ?: 0L,
                             appPackage = child.child("appPackage").getValue(String::class.java).orEmpty(),
-                            adText = child.child("adText").getValue(String::class.java).orEmpty(),
-                            action = child.child("action").getValue(String::class.java).orEmpty(),
-                            layer = child.child("layer").getValue(Int::class.java) ?: 0
+                            type = child.child("type").getValue(String::class.java).orEmpty(),
+                            risk = child.child("risk").getValue(String::class.java).orEmpty(),
+                            blocked = child.child("blocked").getValue(Boolean::class.java) ?: false,
+                            layer = child.child("layer").getValue(Int::class.java) ?: 0,
+                            count = child.child("count").getValue(Int::class.java) ?: 0
                         )
                     }.getOrNull()
                 }.sortedByDescending { it.timestamp }

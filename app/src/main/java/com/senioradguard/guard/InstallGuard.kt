@@ -36,7 +36,7 @@ class InstallGuard(
         overlayManager.showWarning(
             message = "앱 설치 화면으로 이동했어요!\n광고로 인한 이동일 수 있습니다.\n뒤로 돌아갈까요?",
             packageName = storePackage,
-            onConfirm = { AdEventLogger.logIgnored(storePackage, "스토어 이동 경고를 그냥 봄") },
+            onConfirm = { AdEventLogger.logIgnored(storePackage) },
             onBlock = onBack,
             currentForegroundPackage = currentForegroundPackage,
             onForceHome = onForceHome
@@ -56,12 +56,12 @@ class InstallGuard(
             overlayManager.showWarning(
                 message = "광고일 수 있습니다!\n'$text' 버튼을 눌렀어요.\n앱이 설치될 수 있으니 확인해주세요.",
                 packageName = packageName,
-                onConfirm = { AdEventLogger.logIgnored(packageName, "'$text' 경고를 그냥 봄") },
+                onConfirm = { AdEventLogger.logIgnored(packageName) },
                 onBlock = onBack,
                 currentForegroundPackage = currentForegroundPackage,
                 onForceHome = onForceHome
             )
         }, 50)
-        AdEventLogger.logInstallBlocked(text)
+        AdEventLogger.logInstallBlocked(packageName)
     }
 }

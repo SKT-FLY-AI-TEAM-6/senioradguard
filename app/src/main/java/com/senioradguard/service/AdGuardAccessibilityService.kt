@@ -422,11 +422,21 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 페이지가 새로 떴다. 광고를 나중에 끼워 넣는 사이트를 위해 재스캔을 예약해 둔다.
             handler.removeCallbacks(lazyRescan)
             for (d in LAZY_RESCAN_MS) handler.postDelayed(lazyRescan, d)
-            // 광고 클릭 대기 중의 창 전환(앱→브라우저 포함)은 광고발 진입이다
-            if (pkg == CHROME) {
-                Log.i(TAG, "창 전환: 클릭대기=${entryDetector.hasFreshPending()} url=${readUrlBar() ?: "-"}")
-                if (entryDetector.hasFreshPending() && !shieldActive) {
-                    onNavigationDetected(readUrlBar())
+            if (pkg == CHROME && !shieldActive) {
+                val url = readUrlBar()
+                val host = url?.let { UrlNormalizer.hostOf(it) }
+                Log.i(TAG, "창 전환: 클릭대기=${entryDetector.hasFreshPending()} url=${url ?: "-"}")
+                when {
+                    // 광고 클릭 대기 중의 창 전환(앱→브라우저 포함)은 광고발 진입이다
+                    entryDetector.hasFreshPending() -> onNavigationDetected(url)
+                    // 스캔 주기를 기다리지 않는 이동 감지 — 주소창이 읽히고 호스트가
+                    // 바뀌었으면 스캔 경로와 같은 규칙으로 판정한다. 페이지가 뜨는
+                    // 순간은 접혔던 주소창이 다시 펴지는 순간이기도 하다.
+                    host != null && prevChromeHost != null && host != prevChromeHost -> {
+                        Log.i(TAG, "페이지 이동(창 전환): $prevChromeHost → $host")
+                        onNavigationDetected(url, cameFromHost = prevChromeHost)
+                        prevChromeHost = host
+                    }
                 }
             }
         }
@@ -859,9 +869,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 }
             }
             prevChromeHost = host
-        } else {
+        } else if (host != null && host != CHROME) {
+            // 유튜브 등 다른 대상 앱 화면 — 웹 출발 호스트 추적을 끝낸다
             prevChromeHost = null
         }
+        // host == CHROME(주소창이 접혀 출처가 패키지명으로 떨어진 스캔)이나 null이면
+        // prevChromeHost를 유지한다. 스크롤하면 크롬이 주소창을 접는데, 그때 끊어
+        // 버리면 기사 중간·하단 광고(대부분 스크롤 후 클릭)의 랜딩 이동을 통째로
+        // 놓친다 — "특정 사이트에서만 된다"는 리포트의 실제 원인.
     }
 
     private fun List<Rect>.shiftedBy(dy: Int): List<Rect> =

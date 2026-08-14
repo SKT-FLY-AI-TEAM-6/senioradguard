@@ -16,13 +16,18 @@
 3번을 빼먹으면 파일에 웹 클라이언트 ID(`client_type: 3`)가 없어 로그인이 실패한다.
 빌드 시 `google-services.json에 웹 클라이언트 ID가 없습니다` 경고가 나오면 이 상태다.
 
-## 2. Firestore 만들기
+## 2. Realtime Database 만들기
 
-콘솔 → **빌드 → Firestore Database** 생성. (Realtime Database 아님 — 2-A에서 옮겼다)
+콘솔 → **빌드 → Realtime Database** 생성.
+
+Firestore가 아니다. 한 번 Firestore로 옮겼다가 되돌렸다 — 이 데이터는 "가족 하나에
+이벤트가 시간순으로 쌓이고 그걸 통째로 구독한다"가 전부라 Realtime Database가
+정확히 그 모양이고, 실기기 2대 연동도 이 방식으로 검증했다. 질의가 필요해지면
+그때 옮긴다.
 
 ## 3. 보안 규칙 올리기
 
-`firestore.rules` 내용을 콘솔 → Firestore → **규칙** 탭에 붙여넣고 게시.
+`database.rules.json` 내용을 콘솔 → Realtime Database → **규칙** 탭에 붙여넣고 게시.
 
 **올리기 전에는 아무나 DB 전체를 읽고 지울 수 있다.**
 

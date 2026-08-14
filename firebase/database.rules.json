@@ -1,0 +1,70 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+
+    "families": {
+      "$familyId": {
+        "members": {
+          ".read": "auth != null && data.child(auth.uid).exists()",
+
+          "$uid": {
+            "//": "자기 문서만 쓴다. 남의 역할이나 FCM 토큰을 바꿀 수 없다. 첫 참여 때는 아직 구성원이 아니므로 여기서 자기 노드를 만드는 것을 허용해야 아무나 가족에 들어올 수 있다.",
+            ".write": "auth != null && auth.uid === $uid",
+
+            "role": { ".validate": "newData.isString() && (newData.val() === 'senior' || newData.val() === 'guardian')" },
+            "deviceName": { ".validate": "newData.isString() && newData.val().length <= 64" },
+            "fcmToken": { ".validate": "newData.isString() && newData.val().length <= 512" },
+            "joinedAt": { ".validate": "newData.isNumber()" },
+            "$other": { ".validate": false }
+          }
+        },
+
+        "settings": {
+          "//": "보호 강도는 보호자가 어르신 것을 바꿔야 하므로 구성원 누구나 쓸 수 있다.",
+          ".read": "auth != null && root.child('families').child($familyId).child('members').child(auth.uid).exists()",
+          ".write": "auth != null && root.child('families').child($familyId).child('members').child(auth.uid).exists()",
+
+          "$uid": {
+            "protectionLevel": { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 3" }
+          }
+        },
+
+        "events": {
+          ".read": "auth != null && root.child('families').child($familyId).child('members').child(auth.uid).exists()",
+          ".indexOn": "timestamp",
+
+          "$eventId": {
+            "//": "기록은 남기기만 한다. 고치거나 지우면 보호자가 본 내역이 사라진다.",
+            ".write": "auth != null && root.child('families').child($familyId).child('members').child(auth.uid).exists() && !data.exists()",
+            ".validate": "newData.hasChildren(['timestamp', 'type', 'riskLevel'])",
+
+            "timestamp": { ".validate": "newData.isNumber()" },
+            "packageName": { ".validate": "newData.isString() && newData.val().length <= 128" },
+            "type": { ".validate": "newData.isString() && newData.val().length <= 32" },
+            "riskLevel": { ".validate": "newData.isString() && (newData.val() === 'low' || newData.val() === 'medium' || newData.val() === 'high')" },
+            "blocked": { ".validate": "newData.isBoolean()" },
+            "count": { ".validate": "newData.isNumber()" },
+            "$other": { ".validate": false }
+          }
+        },
+
+        "reports": {
+          ".read": "auth != null && root.child('families').child($familyId).child('members').child(auth.uid).exists()",
+          ".write": "auth != null && root.child('families').child($familyId).child('members').child(auth.uid).exists()"
+        }
+      }
+    },
+
+    "invites": {
+      "//": "아직 가족이 아닌 사람이 읽어야 하므로 로그인만 요구한다. 담긴 것은 familyId 하나뿐이라 노출돼도 가족 데이터에는 닿지 못한다 — 실제 접근은 위의 members 확인이 막는다.",
+      "$code": {
+        ".read": "auth != null",
+        ".write": "auth != null",
+        "familyId": { ".validate": "newData.isString()" },
+        "createdAt": { ".validate": "newData.isNumber()" },
+        "$other": { ".validate": false }
+      }
+    }
+  }
+}

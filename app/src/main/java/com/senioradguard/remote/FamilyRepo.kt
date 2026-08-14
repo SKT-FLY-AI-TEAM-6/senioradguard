@@ -5,10 +5,12 @@ import android.os.Build
 import android.util.Log
 import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.firestore.FieldValue
-import com.google.firebase.firestore.FirebaseFirestore
-import com.google.firebase.firestore.ListenerRegistration
-import com.google.firebase.firestore.Query
+import com.google.firebase.database.DataSnapshot
+import com.google.firebase.database.DatabaseError
+import com.google.firebase.database.DatabaseReference
+import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.Query
+import com.google.firebase.database.ValueEventListener
 import com.senioradguard.risk.ProtectionLevel
 import com.senioradguard.risk.RiskLevel
 import kotlinx.coroutines.tasks.await
@@ -25,29 +27,28 @@ data class FamilyEvent(
 )
 
 /**
- * 가족 단위 Firestore 저장소.
+ * 가족 단위 저장소. **Realtime Database**를 쓴다.
  *
  * ```
  * families/{familyId}
- *   members/{uid}   role, fcmToken, deviceName
+ *   members/{uid}   role, deviceName, fcmToken, joinedAt
  *   settings/{uid}  protectionLevel, whitelist[]
- *   events/{id}     timestamp, riskLevel, type, blocked, packageName
+ *   events/{id}     timestamp, riskLevel, type, blocked, packageName, count
  *   reports/{YYYY-MM}  adsBlocked, urlsBlocked, appsBlocked
  * invites/{code}    familyId          ← 6자리 코드로 가족을 찾는 역인덱스
  * ```
  *
- * ## 왜 초대 코드를 별도 컬렉션에 두는가
- * 코드로 가족을 찾으려면 누군가는 그 코드를 **읽을 수 있어야** 한다. 가족 문서에
- * 코드를 넣어두고 질의하면, 아직 가족이 아닌 사람에게 가족 문서 읽기를 열어줘야
- * 한다. `invites/{code}`에는 familyId 하나만 두므로 열어줘도 잃을 게 없다.
+ * ## 왜 Firestore가 아닌가
+ * 한 번 Firestore로 옮겼다가 되돌렸다. 이 데이터는 "가족 하나에 이벤트가 시간순으로
+ * 쌓이고 그걸 통째로 구독한다"가 전부다 — Realtime Database가 정확히 그런 모양이고,
+ * 실기기 2대 연동도 이미 이 방식으로 검증했다. Firestore의 복합 질의·오프라인
+ * 캐시는 지금 쓰지 않는 기능이라 값을 못 한다. 가족 수가 늘고 월간 리포트 집계처럼
+ * 질의가 필요해지면 그때 옮긴다.
  *
- * ## 익명 인증에서 Google 로그인으로
- * 익명 계정은 기기마다 새로 생긴다. 어르신이 폰을 바꾸면 가족 연결이 통째로
- * 사라지고, 보호자가 두 기기에서 같은 가족을 볼 수도 없다. 가족이라는 개념을
- * 두는 순간 기기가 아니라 사람을 식별해야 한다.
- *
- * **어르신에게 로그인을 요구하는 것은 분명한 UX 손실이다.** 그 대가로 얻는 것은
- * 기기 교체·재설치에도 유지되는 연결이다.
+ * ## 왜 초대 코드를 별도 노드에 두는가
+ * 코드로 가족을 찾으려면 누군가는 그 코드를 **읽을 수 있어야** 한다. 가족 노드 안에
+ * 코드를 넣으면 아직 가족이 아닌 사람에게 가족 전체 읽기를 열어줘야 한다.
+ * `invites/{code}`에는 familyId 하나만 있으므로 열어줘도 잃을 게 없다.
  */
 object FamilyRepo {
 
@@ -57,7 +58,10 @@ object FamilyRepo {
     private const val KEY_ROLE = "role"
     private const val KEY_INVITE = "invite_code"
 
-    private var db: FirebaseFirestore? = null
+    /** 보호자 화면에 한 번에 보여줄 최근 내역 수. */
+    private const val EVENT_LIMIT = 50
+
+    private var db: DatabaseReference? = null
 
     /** Firebase와 로그인이 모두 준비됐는가. */
     val isReady: Boolean get() = db != null && uid() != null
@@ -69,9 +73,9 @@ object FamilyRepo {
                 Log.i(TAG, "google-services.json 없음 — 원격 기능 비활성화")
                 return@runCatching null
             }
-            FirebaseFirestore.getInstance()
+            FirebaseDatabase.getInstance().reference
         }.getOrElse {
-            Log.e(TAG, "Firestore 초기화 실패: ${it.message}")
+            Log.e(TAG, "Realtime Database 초기화 실패: ${it.message}")
             null
         }
     }
@@ -101,29 +105,30 @@ object FamilyRepo {
 
     /**
      * 보호자가 가족을 만든다. 이미 만든 가족이 있으면 그대로 쓴다.
-     * @return 어르신에게 불러줄 6자리 초대 코드. 실패하면 null.
+     * @return 만들어진 familyId. 실패하면 null.
      */
     suspend fun createFamily(context: Context, code: String): String? {
-        val store = db ?: return null
+        val root = db ?: return null
         val uid = uid() ?: return null
 
         return runCatching {
-            val familyId = savedFamilyId(context) ?: store.collection("families").document().id
+            val familyId = savedFamilyId(context)
+                ?: root.child("families").push().key
+                ?: return null
 
-            store.collection("families").document(familyId)
-                .collection("members").document(uid)
-                .set(memberDoc(Role.GUARDIAN))
+            root.child("families").child(familyId).child("members").child(uid)
+                .setValue(memberDoc(Role.GUARDIAN))
                 .await()
 
-            // 역인덱스. 코드가 겹치면 나중 것이 이깁니다 — 6자리라 충돌은 드물고,
-            // 겹쳐도 앞사람 가족이 사라지는 게 아니라 코드만 새 가족을 가리킨다.
-            store.collection("invites").document(code)
-                .set(mapOf("familyId" to familyId, "createdAt" to FieldValue.serverTimestamp()))
+            // 역인덱스. 6자리라 충돌은 드물고, 겹쳐도 앞선 가족이 사라지는 게
+            // 아니라 코드만 새 가족을 가리킨다.
+            root.child("invites").child(code)
+                .setValue(mapOf("familyId" to familyId, "createdAt" to System.currentTimeMillis()))
                 .await()
 
             save(context, Role.GUARDIAN, familyId)
-            // 코드를 기억해 둔다. 보호자가 나중에 다시 불러줘야 할 때
-            // 화면에서 확인할 수 있어야 한다.
+            // 코드를 기억해 둔다. 보호자가 나중에 다시 불러줘야 할 때 화면에서
+            // 확인할 수 있어야 한다.
             prefs(context).edit().putString(KEY_INVITE, code).apply()
             familyId
         }.getOrElse {
@@ -134,16 +139,15 @@ object FamilyRepo {
 
     /** 어르신이 코드를 넣어 가족에 들어간다. @return 성공 여부. */
     suspend fun joinFamily(context: Context, code: String): Boolean {
-        val store = db ?: return false
+        val root = db ?: return false
         val uid = uid() ?: return false
 
         return runCatching {
-            val familyId = store.collection("invites").document(code).get().await()
-                .getString("familyId") ?: return false
+            val familyId = root.child("invites").child(code).child("familyId")
+                .get().await().getValue(String::class.java) ?: return false
 
-            store.collection("families").document(familyId)
-                .collection("members").document(uid)
-                .set(memberDoc(Role.SENIOR))
+            root.child("families").child(familyId).child("members").child(uid)
+                .setValue(memberDoc(Role.SENIOR))
                 .await()
 
             save(context, Role.SENIOR, familyId)
@@ -164,18 +168,17 @@ object FamilyRepo {
     private fun memberDoc(role: Role) = mapOf(
         "role" to role.wire,
         "deviceName" to "${Build.MANUFACTURER} ${Build.MODEL}",
-        "joinedAt" to FieldValue.serverTimestamp()
+        "joinedAt" to System.currentTimeMillis()
     )
 
     /** FCM 토큰 등록. 토큰은 앱 재설치·복원 때 바뀌므로 실행마다 갱신한다. */
     fun updateFcmToken(context: Context, token: String) {
-        val store = db ?: return
+        val root = db ?: return
         val uid = uid() ?: return
         val familyId = savedFamilyId(context) ?: return
 
-        store.collection("families").document(familyId)
-            .collection("members").document(uid)
-            .set(mapOf("fcmToken" to token), com.google.firebase.firestore.SetOptions.merge())
+        root.child("families").child(familyId).child("members").child(uid)
+            .child("fcmToken").setValue(token)
     }
 
     // ── 이벤트 ──────────────────────────────────────────────
@@ -188,56 +191,60 @@ object FamilyRepo {
         blocked: Boolean,
         count: Int = 1
     ) {
-        val store = db ?: return
+        val root = db ?: return
         val familyId = savedFamilyId(context) ?: return
         if (uid() == null) return
 
-        store.collection("families").document(familyId)
-            .collection("events")
-            .add(
-                mapOf(
-                    "timestamp" to System.currentTimeMillis(),
-                    "packageName" to packageName,
-                    "type" to type,
-                    "riskLevel" to risk.wire,
-                    "blocked" to blocked,
-                    "count" to count
-                )
+        val events = root.child("families").child(familyId).child("events")
+        val id = events.push().key ?: return
+        events.child(id).setValue(
+            mapOf(
+                "timestamp" to System.currentTimeMillis(),
+                "packageName" to packageName,
+                "type" to type,
+                "riskLevel" to risk.wire,
+                "blocked" to blocked,
+                "count" to count
             )
+        )
     }
 
     /** 가족의 차단 내역을 실시간 구독한다. @return 구독 해제 함수. */
-    fun observeEvents(
-        familyId: String,
-        limit: Long = 50,
-        onChange: (List<FamilyEvent>) -> Unit
-    ): () -> Unit {
-        val store = db ?: return {}
+    fun observeEvents(familyId: String, onChange: (List<FamilyEvent>) -> Unit): () -> Unit {
+        val root = db ?: return {}
 
-        val registration: ListenerRegistration = store.collection("families")
-            .document(familyId).collection("events")
-            .orderBy("timestamp", Query.Direction.DESCENDING)
-            .limit(limit)
-            .addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    Log.e(TAG, "이벤트 구독 실패: ${error.message}")
-                    return@addSnapshotListener
-                }
+        // 최근 것만 받는다. 전체를 구독하면 몇 달치가 매번 통째로 내려온다.
+        // Realtime Database는 오름차순만 주므로 받은 뒤 뒤집는다.
+        val query: Query = root.child("families").child(familyId).child("events")
+            .orderByChild("timestamp")
+            .limitToLast(EVENT_LIMIT)
+
+        val listener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
                 onChange(
-                    snapshot?.documents.orEmpty().map { doc ->
+                    snapshot.children.map { child ->
                         FamilyEvent(
-                            eventId = doc.id,
-                            timestamp = doc.getLong("timestamp") ?: 0L,
-                            packageName = doc.getString("packageName").orEmpty(),
-                            type = doc.getString("type").orEmpty(),
-                            riskLevel = doc.getString("riskLevel").orEmpty(),
-                            blocked = doc.getBoolean("blocked") ?: false,
-                            count = (doc.getLong("count") ?: 0L).toInt()
+                            eventId = child.key.orEmpty(),
+                            timestamp = child.child("timestamp").getValue(Long::class.java) ?: 0L,
+                            packageName = child.child("packageName")
+                                .getValue(String::class.java).orEmpty(),
+                            type = child.child("type").getValue(String::class.java).orEmpty(),
+                            riskLevel = child.child("riskLevel")
+                                .getValue(String::class.java).orEmpty(),
+                            blocked = child.child("blocked").getValue(Boolean::class.java) ?: false,
+                            count = (child.child("count").getValue(Long::class.java) ?: 0L).toInt()
                         )
-                    }
+                    }.sortedByDescending { it.timestamp }
                 )
             }
-        return { registration.remove() }
+
+            override fun onCancelled(error: DatabaseError) {
+                Log.e(TAG, "이벤트 구독 실패: ${error.message}")
+            }
+        }
+
+        query.addValueEventListener(listener)
+        return { query.removeEventListener(listener) }
     }
 
     // ── 설정 ────────────────────────────────────────────────
@@ -248,24 +255,28 @@ object FamilyRepo {
         memberUid: String,
         onChange: (ProtectionLevel) -> Unit
     ): () -> Unit {
-        val store = db ?: return {}
-        val registration = store.collection("families").document(familyId)
-            .collection("settings").document(memberUid)
-            .addSnapshotListener { doc, _ ->
-                val level = doc?.getLong("protectionLevel")?.toInt()
-                onChange(ProtectionLevel.of(level))
+        val root = db ?: return {}
+        val node = root.child("families").child(familyId)
+            .child("settings").child(memberUid).child("protectionLevel")
+
+        val listener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                onChange(ProtectionLevel.of(snapshot.getValue(Int::class.java)))
             }
-        return { registration.remove() }
+
+            override fun onCancelled(error: DatabaseError) {
+                Log.e(TAG, "보호 강도 구독 실패: ${error.message}")
+            }
+        }
+        node.addValueEventListener(listener)
+        return { node.removeEventListener(listener) }
     }
 
     fun setProtectionLevel(context: Context, memberUid: String, level: ProtectionLevel) {
-        val store = db ?: return
+        val root = db ?: return
         val familyId = savedFamilyId(context) ?: return
-        store.collection("families").document(familyId)
-            .collection("settings").document(memberUid)
-            .set(
-                mapOf("protectionLevel" to level.value),
-                com.google.firebase.firestore.SetOptions.merge()
-            )
+        root.child("families").child(familyId)
+            .child("settings").child(memberUid).child("protectionLevel")
+            .setValue(level.value)
     }
 }

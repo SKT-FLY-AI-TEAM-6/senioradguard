@@ -125,7 +125,6 @@ dependencies {
     // 온디바이스 한국어 OCR. 화면 픽셀이 기기 밖으로 나가지 않는다.
     implementation(libs.mlkit.text.korean)
     implementation(libs.firebase.database.ktx)
-    implementation(libs.firebase.firestore.ktx)
     // Google 로그인 — GoogleSignInClient는 폐기됐고 Credential Manager가 후속이다
     implementation(libs.androidx.credentials)
     implementation(libs.androidx.credentials.play.services)

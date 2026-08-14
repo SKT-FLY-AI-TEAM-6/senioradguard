@@ -1160,11 +1160,32 @@ class AdGuardAccessibilityService : AccessibilityService() {
     ) {
         val text = LlmRiskJudge.sanitize(page.html ?: return)
         if (text.length < 40) return   // 판단할 내용 자체가 없다
-        val raised = withTimeoutOrNull(LLM_TIMEOUT_MS) {
-            LlmRiskJudge.parse(
-                onDeviceLlm.generate(LlmRiskJudge.buildPrompt(page.finalUrl, text))
-            )
+        val response = withTimeoutOrNull(LLM_TIMEOUT_MS) {
+            onDeviceLlm.generate(LlmRiskJudge.buildPrompt(page.finalUrl, text))
         } ?: return
+        val raised = LlmRiskJudge.parse(response)
+
+        if (raised == null) {
+            // 상향 없음. 명시적 저위험 동의는 흔적을 남긴다 — AI가 재검토했다는
+            // 사실이 사용자(와 DB 뷰어)에게 보여야 신뢰가 생긴다.
+            if ("저위험" in response) {
+                Log.i(TAG, "LLM 동의 — $normalized 저위험 유지")
+                runCatching {
+                    urlVerdictDao.upsert(
+                        UrlVerdict(
+                            normalizedUrl = normalized,
+                            riskLevel = RiskLevel.LOW.name,
+                            reason = "${page.assessment.reason} · AI도 확인했어요",
+                            finalUrl = page.finalUrl,
+                            analyzedAt = System.currentTimeMillis(),
+                            validUntil = System.currentTimeMillis() +
+                                UrlRiskRules.validityMs(RiskLevel.LOW)
+                        )
+                    )
+                }
+            }
+            return
+        }
 
         Log.i(TAG, "LLM 상향 — $normalized ${raised.level} : ${raised.reason}")
         runCatching {

@@ -922,7 +922,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
         handler.post {
             if (viaChain) {
                 // 중계를 스쳐 지나온 **직후 도착한 주소**가 광고의 목적지다.
-                // 감시 창을 열어 기다릴 것 없이 여기가 답이다.
+                val origin = chainTracker.originBeforeRelay
+                val samePlace = origin != null &&
+                    origin == RedirectChainTracker.registrable(host)
+                if (samePlace) {
+                    // 중계를 거쳐 원래 페이지로 되돌아온 경우다. 사용자는 있던
+                    // 자리에 그대로 있으므로 "이동했습니다"는 틀린 말이 된다.
+                    Log.i(TAG, "광고 경유였으나 제자리로 복귀: $host")
+                    return@post
+                }
                 redirectWatchUntil = 0
                 Log.i(TAG, "광고 경유 도착: $host")
                 warnRedirect(host)
@@ -1033,6 +1041,19 @@ class AdGuardAccessibilityService : AccessibilityService() {
         if (host == null || !warnedHosts.shouldReport(host, layer = 3)) return
         if (!urlGuard.isBlocked(host)) return
 
+        // 스쳐 지나가는 중계는 사용자가 "보고 있는" 페이지가 아니다. 광고 네트워크
+        // 도메인은 대개 차단 목록에도 들어 있어서, 그대로 두면 광고를 누를 때마다
+        // "위험한 사이트입니다"가 뜬다 (실측: krrtb.c.appier.net을 0.4초 지나가며 경고).
+        // 잠깐 기다렸다가 아직도 그 주소에 있을 때만 알린다.
+        kotlinx.coroutines.delay(SETTLE_BEFORE_WARN_MS)
+        val stillThere = withContext(Dispatchers.Main) {
+            rootInActiveWindow?.let { urlGuard.hostOf(it) }
+        }
+        if (stillThere != host) {
+            Log.i(TAG, "차단 도메인이었으나 지나감: $host → $stillThere")
+            return
+        }
+
         Log.i(TAG, "차단 도메인 감지: $host")
         AdEventLogger.logBlockedDomain(host, blocked = true)
         withContext(Dispatchers.Main) {
@@ -1106,6 +1127,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
          * 광고를 누른 뒤 목적지를 지켜보는 시간. 광고는 중간 도메인을 한두 번
          * 거치고, 느린 회선에서는 최종 페이지까지 몇 초가 걸린다.
          */
+        /**
+         * 차단 도메인을 발견하고 경고하기 전에 기다리는 시간.
+         * 이 시간 안에 다른 곳으로 넘어갔으면 사용자가 머문 페이지가 아니다.
+         */
+        private const val SETTLE_BEFORE_WARN_MS = 1_500L
+
         private const val REDIRECT_WATCH_MS = 8_000L
 
         /** 감시 창 안에서 다시 확인할 시각. 주소창이 늦게 갱신되는 것을 메운다. */

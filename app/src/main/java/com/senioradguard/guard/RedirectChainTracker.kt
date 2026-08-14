@@ -60,6 +60,16 @@ class RedirectChainTracker(private val now: () -> Long = System::currentTimeMill
     private val history = ArrayDeque<Visit>()
 
     /**
+     * 중계를 타기 직전에 보고 있던 사이트.
+     *
+     * 광고를 눌렀는데 중계를 거쳐 **원래 페이지로 되돌아오는** 경우가 있다
+     * (실측: tenbizt.com → krrtb.c.appier.net → tenbizt.com). 사용자는 있던
+     * 자리에 그대로 있으므로 "광고를 통해 이동했습니다"는 틀린 말이 된다.
+     */
+    var originBeforeRelay: String? = null
+        private set
+
+    /**
      * 주소가 바뀔 때마다 부른다.
      *
      * @return 광고를 거쳐 온 것으로 보이면 true
@@ -80,7 +90,11 @@ class RedirectChainTracker(private val now: () -> Long = System::currentTimeMill
         // 직전 방문이 "스쳐 지나간 제3의 도메인"이면 중계를 거친 것이다.
         if (previous == null) return false
         if (previous.site == site) return false
-        return t - previous.at <= TRANSIENT_MS && wasTransient(previous)
+        if (t - previous.at > TRANSIENT_MS || !wasTransient(previous)) return false
+
+        // 중계(previous) 앞에 있던 사이트가 원래 자리다.
+        originBeforeRelay = history.elementAtOrNull(history.size - 3)?.site
+        return true
     }
 
     /** 직전 방문이 그 앞 방문과도 다른 사이트여야 "끼어든 중계"다. */

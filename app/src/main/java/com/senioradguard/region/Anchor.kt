@@ -39,19 +39,28 @@ class Anchor private constructor(
      */
     fun gatherText(maxNodes: Int = 40): List<String>? {
         if (!node.refresh()) return null
-        val out = mutableListOf<String>()
+        val texts = mutableListOf<String>()
+        val descs = mutableListOf<String>()
         var visited = 0
         fun walk(n: AccessibilityNodeInfo, depth: Int) {
             if (depth > 15 || visited >= maxNodes) return
             visited++
-            n.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
-            n.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+            n.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { texts.add(it) }
+            n.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { descs.add(it) }
             for (i in 0 until n.childCount) {
                 walk(n.getChild(i) ?: continue, depth + 1)
             }
         }
         walk(node, 0)
-        return out.takeIf { it.isNotEmpty() }
+        // 텍스트 노드가 있으면 그것만 쓴다. 이미지 설명(contentDescription)은
+        // 소재 로테이션마다 바뀌어 문구가 같은 광고의 지문을 흔든다
+        // (실측: 문구는 같고 이미지만 바뀐 광고가 다른 지문이 돼 연계를 놓쳤다).
+        // 이미지 전용 광고만 설명으로 폴백한다.
+        return when {
+            texts.isNotEmpty() -> texts
+            descs.isNotEmpty() -> descs
+            else -> null
+        }
     }
 
     /** 지금 좌표. 사라졌거나 **다른 요소로 바뀌었으면** null */

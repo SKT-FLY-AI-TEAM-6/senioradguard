@@ -203,6 +203,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
     /** 지문을 마지막으로 모은 출처. 출처·개수가 그대로면 다시 모으지 않는다 (IPC 절약) */
     private var fpSourceKey: String? = null
 
+    /**
+     * 지문을 모을 당시 각 영역의 높이. 높이가 크게 달라졌으면(화면 가장자리에
+     * 일부만 걸쳤다가 전부 드러난 경우) 그때의 지문은 잘린 텍스트로 만든
+     * 불완전한 것이므로 다시 모은다 — 스크롤 후 주의 표시가 광고로 되돌아가던
+     * 원인이다 (실측).
+     */
+    private var fpHeights: List<Int> = emptyList()
+
     /** 마지막으로 광고가 떠 있던 화면의 지문들. 이동 후에는 이게 "출발 페이지의 광고"다 */
     @Volatile
     private var lastAdFingerprints: List<String?> = emptyList()
@@ -531,9 +539,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // 같은 화면에서 광고가 같은 수로 교체되는 드문 경우는 지문이 한 스캔
         // 늦게 갱신될 수 있는데, 지문은 표시·연계 보조라 치명적이지 않다.
         val src = lastSourceKey ?: "unknown"
+        // 높이가 20% 넘게 달라진 영역이 있으면 그때 모은 지문은 못 믿는다
+        val heightsStable = stable.size == fpHeights.size && stable.indices.all { i ->
+            val h = stable[i].height()
+            fpHeights[i] > 0 && kotlin.math.abs(h - fpHeights[i]) <= h / 5
+        }
         val fingerprints =
             if (src == fpSourceKey && stable.size == confirmedFingerprints.size &&
-                confirmedFingerprints.isNotEmpty() &&
+                confirmedFingerprints.isNotEmpty() && heightsStable &&
                 // null이 하나라도 있으면 재수집한다 — 페이지 로드 직후 첫 스캔은
                 // 광고 텍스트가 아직 안 채워져 수집이 비기도 한다 (실측).
                 // null을 재사용 조건에 넣으면 그 실패가 영영 굳는다.
@@ -542,6 +555,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 confirmedFingerprints
             } else {
                 fpSourceKey = src
+                fpHeights = stable.map { it.height() }
                 stableAnchors.map { a ->
                     runCatching { a?.gatherText() }.getOrNull()?.let { CardText.cacheKey(src, it) }
                 }.also { list ->

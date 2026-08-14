@@ -17,13 +17,18 @@ import com.senioradguard.agent.AgentPipeline
 import com.senioradguard.agent.CandidateExtractor
 import com.senioradguard.agent.GeminiClassifier
 import com.senioradguard.agent.StubClassifier
+import com.senioradguard.analysis.AdEntryDetector
 import com.senioradguard.detector.db.AppDatabase
+import com.senioradguard.detector.db.UrlVerdict
 import com.senioradguard.guard.InstallGuard
 import com.senioradguard.logger.AdEventLogger
 import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.AdMarkStyle
 import com.senioradguard.overlay.OverlayManager
+import com.senioradguard.overlay.ShieldOverlay
 import com.senioradguard.region.AdRegionScanner
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.UrlNormalizer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -150,6 +155,28 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    // ──────────────────────────────────────────────────────────
+    // 광고발 진입 감지 + 가림막 (4b-①②)
+    // ──────────────────────────────────────────────────────────
+
+    private val entryDetector = AdEntryDetector(SystemClock::uptimeMillis)
+
+    // 테두리 오버레이와 같은 이유로 서비스 자신의 컨텍스트여야 한다
+    private val shieldOverlay by lazy { ShieldOverlay(this) }
+
+    private val urlVerdictDao by lazy { AppDatabase.getInstance(this).urlVerdictDao() }
+
+    /** 광고 클릭 직전에 주소창이 보여주던 URL. 이동 감지의 비교 기준이다. */
+    private var preClickUrl: String? = null
+
+    /** "광고 모두 닫기"가 광고 안의 X를 대신 누르는 동안은 클릭 판별을 멈춘다 */
+    private var suppressAdClickUntil = 0L
+
+    private var shieldActive = false
+    private var navPollsLeft = 0
+    private var urlSettleReadsLeft = 0
+    private var lastSettleUrl: String? = null
 
     /**
      * 스캔 진행 중 플래그. 트리 순회는 수십~수백 ms가 걸릴 수 있는데 이벤트는 그보다
@@ -283,6 +310,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
             val clickedText = event.contentDescription?.toString()
                 ?: event.text.joinToString(separator = " ")
             installGuard.onClick(clickedText, pkg)
+            trackClickForAdEntry(event)
             // 클릭만으로는 화면이 바뀌지 않아 Layer 1이 다시 스캔할 게 없다.
             // (화면이 바뀌면 CONTENT_CHANGED가 따로 온다)
             return
@@ -292,6 +320,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 페이지가 새로 떴다. 광고를 나중에 끼워 넣는 사이트를 위해 재스캔을 예약해 둔다.
             handler.removeCallbacks(lazyRescan)
             for (d in LAZY_RESCAN_MS) handler.postDelayed(lazyRescan, d)
+            // 광고 클릭 대기 중의 창 전환(앱→브라우저 포함)은 광고발 진입이다
+            if (pkg == CHROME && entryDetector.hasFreshPending() && !shieldActive) {
+                onNavigationDetected(readUrlBar())
+            }
         }
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
@@ -465,6 +497,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
      * 광고 자체를 닫는 동작이라 페이지를 잃지 않는다.
      */
     private fun closeAllAds() {
+        // 우리가 대신 누르는 X는 광고 영역 안에 있어 클릭 이벤트가 광고 클릭처럼
+        // 보인다. 잠깐 판별을 멈춰 가림막이 헛뜨는 것을 막는다.
+        suppressAdClickUntil = SystemClock.uptimeMillis() + CLOSE_SUPPRESS_MS
         val root = rootInActiveWindow ?: return
         val screen = Rect().also { root.getBoundsInScreen(it) }
         val targets = confirmedRegions + aiRegions
@@ -565,6 +600,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
         reportSighting(lastSourceKey, layer = 1, count = shifted.size)
         reportSighting(lastSourceKey, layer = 2, count = guessed.size)
         scheduleLayer2()
+
+        // 클릭 이벤트를 놓쳤어도 지금 광고망 과금 리다이렉터에 있다면 광고발
+        // 진입이다 — 기사 클릭은 리다이렉터를 거치지 않는다 (백업 신호).
+        lastSourceKey?.let { host ->
+            if (!shieldActive && AdEntryDetector.isAdRedirector(host)) onNavigationDetected(host)
+        }
     }
 
     private fun List<Rect>.shiftedBy(dy: Int): List<Rect> =
@@ -646,6 +687,149 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun isAiEnabled(): Boolean =
         getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_AI_CLASSIFY, false)
 
+    // ──────────────────────────────────────────────────────────
+    // 가림막 흐름 — 광고 클릭 → 이동 감시 → URL 확보 → 판정 → 해제/복귀
+    //
+    // 브라우저 전환만으로는 광고 클릭인지 기사 클릭인지 알 수 없다. 판별은
+    // AdEntryDetector가 하고(클릭 좌표 + 시간 창 + 리다이렉터), 확실할 때만
+    // 가림막을 띄운다. 판별 불가면 아무것도 하지 않는다 — 기사 클릭마다
+    // 가림막이 뜨는 순간 서비스는 못 쓰는 물건이 된다.
+    // ──────────────────────────────────────────────────────────
+
+    /** 클릭이 표시 중인 광고 영역 안이었는지 대조한다. */
+    private fun trackClickForAdEntry(event: AccessibilityEvent) {
+        if (SystemClock.uptimeMillis() < suppressAdClickUntil) return
+        val ads = confirmedRegions + aiRegions
+        if (ads.isEmpty()) return
+        // 클릭 노드의 좌표를 모르면 판별하지 않는다 — 모르면 개입하지 않는 쪽이 안전하다
+        val src = event.source ?: return
+        val bounds = Rect().also { src.getBoundsInScreen(it) }
+        if (bounds.width() <= 0 || bounds.height() <= 0) return
+
+        if (ads.any { Rect.intersects(it, bounds) }) {
+            entryDetector.recordAdClick()
+            preClickUrl = readUrlBar()
+            navPollsLeft = NAV_POLL_COUNT
+            handler.removeCallbacks(navPoll)
+            handler.postDelayed(navPoll, NAV_POLL_MS)
+            Log.i(TAG, "광고 영역 클릭 — 진입 감시 시작 (사전 URL=${preClickUrl ?: "-"})")
+        } else {
+            entryDetector.recordNonAdClick()
+        }
+    }
+
+    /**
+     * 크롬 주소창이 지금 보여주는 URL. 크롬이 아니거나 주소창이 접혀 있으면 null.
+     * 노드 한 개 조회라 메인 스레드에서 불러도 부담이 없다 (sourceKeyOf와 같은 방식).
+     */
+    private fun readUrlBar(): String? {
+        val root = rootInActiveWindow ?: return null
+        if (root.packageName?.toString() != CHROME) return null
+        return root.findAccessibilityNodeInfosByViewId("$CHROME:id/url_bar")
+            ?.firstOrNull()?.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * 크롬 안의 같은 탭 이동은 창 전환 이벤트가 안 올 수 있어, 광고 클릭 후
+     * 잠깐 동안 주소창이 바뀌는지 직접 살핀다.
+     */
+    private val navPoll = object : Runnable {
+        override fun run() {
+            if (shieldActive) return
+            val url = readUrlBar()
+            if (url != null && url != preClickUrl) {
+                onNavigationDetected(url)
+                return
+            }
+            if (--navPollsLeft > 0) handler.postDelayed(this, NAV_POLL_MS)
+        }
+    }
+
+    /**
+     * 페이지 이동이 감지됐다. 광고발이면 가림막을 띄우고 판정을 시작하고,
+     * 아니면 아무것도 하지 않는다.
+     */
+    private fun onNavigationDetected(urlShown: String?) {
+        if (shieldActive) return
+        val host = urlShown?.let { UrlNormalizer.hostOf(it) }
+        val reason = entryDetector.reasonForNavigation(host) ?: return
+
+        handler.removeCallbacks(navPoll)
+        shieldActive = true
+        shieldOverlay.show("🔍", "잠깐만요", "안전한 곳인지 확인하고 있어요")
+        handler.postDelayed(shieldTimeout, SHIELD_MAX_MS)
+        Log.i(TAG, "가림막 표시 — 사유=$reason url=${urlShown ?: "-"}")
+
+        // 추적 리다이렉트가 끝나 주소창이 안정된 뒤에 판정한다
+        urlSettleReadsLeft = URL_SETTLE_MAX_READS
+        lastSettleUrl = urlShown
+        handler.postDelayed(urlSettle, URL_SETTLE_MS)
+    }
+
+    private val urlSettle = object : Runnable {
+        override fun run() {
+            if (!shieldActive) return
+            val url = readUrlBar()
+            val settled = url != null && url == lastSettleUrl
+            if (url != null) lastSettleUrl = url
+            if (settled || --urlSettleReadsLeft <= 0) {
+                resolveShield(lastSettleUrl)
+            } else {
+                handler.postDelayed(this, URL_SETTLE_MS)
+            }
+        }
+    }
+
+    /** 확보한 URL로 캐시를 조회해 가림막의 결말을 정한다. */
+    private fun resolveShield(urlShown: String?) {
+        val normalized = urlShown?.let { UrlNormalizer.normalize(it) }
+        if (normalized == null) {
+            // URL 미확보 — "추가 확인 필요" 상태. 분석할 대상이 없으므로 걷는다.
+            // (Unverified 안내 UI는 4e에서 보호 수준 정책과 함께 붙인다)
+            Log.i(TAG, "가림막 해제 — URL 미확보 (추가 확인 필요)")
+            dismissShieldNow()
+            return
+        }
+        scope.launch {
+            val verdict = runCatching {
+                urlVerdictDao.findValid(normalized, System.currentTimeMillis())
+            }.getOrNull()
+            withContext(Dispatchers.Main) { finishShield(normalized, verdict) }
+        }
+    }
+
+    private fun finishShield(url: String, verdict: UrlVerdict?) {
+        if (!shieldActive) return
+        if (verdict?.toAssessment()?.level == RiskLevel.HIGH) {
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            shieldOverlay.update("⚠️", "위험한 곳이에요", "이전 화면으로 안전하게 돌려보냈어요")
+            handler.removeCallbacks(shieldTimeout)
+            handler.postDelayed(dismissShieldRunnable, RESULT_SHOW_MS)
+            Log.i(TAG, "고위험 차단 — $url : ${verdict.reason}")
+            return
+        }
+        // 캐시 미스는 아직 분석기가 없어서다(4b-③에서 연결). 미검증을 안전처럼
+        // 안내하지 않기 위해 말없이 걷기만 한다. 저·중위험 정책 연결은 4e.
+        Log.i(TAG, "가림막 해제 — $url 판정=${verdict?.riskLevel ?: "미분석"}")
+        dismissShieldNow()
+    }
+
+    /** 어떤 경로로든 가림막이 이 시간 이상 떠 있으면 강제로 걷는다. */
+    private val shieldTimeout = Runnable {
+        Log.w(TAG, "가림막 시간 초과 — 강제 해제")
+        dismissShieldNow()
+    }
+
+    private val dismissShieldRunnable = Runnable { dismissShieldNow() }
+
+    private fun dismissShieldNow() {
+        handler.removeCallbacks(shieldTimeout)
+        handler.removeCallbacks(urlSettle)
+        handler.removeCallbacks(dismissShieldRunnable)
+        shieldOverlay.dismiss()
+        shieldActive = false
+    }
+
     override fun onInterrupt() {
         apply(emptyList(), emptyList())
     }
@@ -656,6 +840,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         scope.cancel()
         borderOverlay.dismissAll()
         overlayManager.dismiss()
+        shieldOverlay.dismiss()
         super.onDestroy()
     }
 
@@ -711,6 +896,30 @@ class AdGuardAccessibilityService : AccessibilityService() {
         private val CLOSE_ID_TOKENS = setOf(
             "close", "dismiss", "btnclose", "closebutton", "adclose", "cancel", "skip"
         )
+
+        // ── 가림막(광고발 진입 확인)이 쓰는 값들 ──
+
+        private const val CHROME = "com.android.chrome"
+
+        /** 광고 클릭 후 같은 탭 이동을 살피는 주기와 횟수 (합쳐서 클릭 시간 창과 비슷하게) */
+        private const val NAV_POLL_MS = 300L
+        private const val NAV_POLL_COUNT = 10
+
+        /**
+         * 가림막 최대 표시 시간. 이 시간이 지나면 판정과 무관하게 강제로 걷는다 —
+         * 가림막이 화면에 눌러붙는 일은 어떤 경로로도 있어서는 안 된다.
+         */
+        private const val SHIELD_MAX_MS = 4_000L
+
+        /** 주소창이 안정될 때까지의 재확인 주기와 횟수 (리다이렉트 체인 대기) */
+        private const val URL_SETTLE_MS = 400L
+        private const val URL_SETTLE_MAX_READS = 6
+
+        /** 고위험 복귀 후 안내 문구를 보여주는 시간 */
+        private const val RESULT_SHOW_MS = 2_500L
+
+        /** "광고 모두 닫기" 동안 광고 클릭 판별을 멈추는 시간 */
+        private const val CLOSE_SUPPRESS_MS = 1_500L
 
         /** "settings" prefs — AI 광고 판별 옵트인 키. MainActivity 토글과 공유한다. */
         const val PREF_AI_CLASSIFY = "ai_classify"

@@ -21,9 +21,11 @@ import com.senioradguard.detector.UrlGuard
 import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.guard.InstallGuard
 import com.senioradguard.logger.AdEventLogger
+import com.senioradguard.ocr.OcrScanner
 import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.AdMarkStyle
 import com.senioradguard.overlay.OverlayManager
+import com.senioradguard.region.AdLabelRules
 import com.senioradguard.region.AdRegionScanner
 import com.senioradguard.risk.ProtectionLevel
 import com.senioradguard.risk.RiskLevel
@@ -172,6 +174,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private val sightings = SightingLog()
 
     private val urlGuard by lazy { UrlGuard(this) }
+
+    /**
+     * 글자 없는 광고 이미지를 화면에서 읽는다. API 30부터만 가능하다 —
+     * takeScreenshot이 그때 생겼고, 그 아래에서는 OCR 없이 동작한다.
+     */
+    private val ocrScanner by lazy {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) OcrScanner(this) else null
+    }
 
     /** 이미 경고한 도메인. 같은 페이지에서 스크롤할 때마다 경고하면 쓸 수 없다. */
     private val warnedHosts = SightingLog()
@@ -415,6 +425,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
         lastSourceKey = runCatching { extractor.sourceKeyOf(root) }.getOrNull()
         checkHost(lastSourceKey)
 
+        val ocrRegions = readImageAds()
+
         val result = scanner.scan(root)
         if (result.truncated) {
             Log.d(TAG, "scan truncated: visited=${result.visited} ${result.elapsedMs}ms")
@@ -432,7 +444,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 shown
             } else {
                 truncatedHolds = 0
-                result.regions
+                // OCR로 찾은 것은 Layer 1과 같은 근거다 — 화면에 "광고"라고 적혀
+                // 있는 것을 읽었을 뿐, 추정이 아니다. 그래서 실선으로 함께 그린다.
+                (result.regions + ocrRegions).distinct()
             }
 
         // 히스테리시스 — 나타날 때는 즉시, 사라질 때는 잠깐 기다린다.
@@ -568,6 +582,37 @@ class AdGuardAccessibilityService : AccessibilityService() {
         if (sourceKey == null || count == 0) return
         if (!sightings.shouldReport(sourceKey, layer)) return
         AdEventLogger.logAdMarked(sourceKey, layer, risk, count)
+    }
+
+    /**
+     * 화면에 그려진 "광고" 글자를 OCR로 찾는다. 노드 트리에 안 실리는 글자가 대상이다.
+     *
+     * 읽어낸 글자는 **AdLabelRules로만** 보낸다. 화면 픽셀에서 뽑은 내용을 Layer 2로
+     * 넘기면 이미지 속 글자가 외부 판별기로 나가게 된다 — 온디바이스로 읽는 의미가
+     * 사라진다.
+     *
+     * 스크롤 중에는 돌리지 않는다. 캡처는 초당 1회가 한계라 스크롤을 따라갈 수 없고,
+     * 읽는 사이에 표시할 자리가 이미 사라진다.
+     */
+    private suspend fun readImageAds(): List<Rect> {
+        val ocr = ocrScanner ?: return emptyList()
+        if (!ocr.ready() || scrollSinceScanStart != 0) return emptyList()
+
+        val lines = ocr.readScreen()
+        if (lines.isEmpty()) return emptyList()
+
+        val hits = lines.filter { (text, _) -> AdLabelRules.isAdLabel(text) }
+        Log.i(TAG, "ocr 줄=${lines.size} 광고=${hits.size}")
+        if (hits.isEmpty()) return emptyList()
+
+        // "광고" 두 글자를 감싸는 상자는 광고 자체가 아니라 라벨이다. 그 자리를
+        // 기준으로 아래쪽 배너만큼 넓혀 광고 영역으로 삼는다. 트리가 없어
+        // Layer 1처럼 진짜 컨테이너를 찾을 수는 없으므로 근사치다.
+        val screenWidth = resources.displayMetrics.widthPixels
+        val bannerHeight = (resources.displayMetrics.heightPixels * OCR_BANNER_RATIO).toInt()
+        return hits.map { (_, box) ->
+            Rect(0, box.top, screenWidth, box.top + bannerHeight)
+        }
     }
 
     private fun apply(confirmed: List<Rect>, guessed: List<Rect>) {
@@ -802,6 +847,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // ── "광고 모두 닫기"가 X 버튼을 찾을 때 쓰는 값들 ──
 
         /** 광고 영역 안에서 닫기 버튼을 찾아 내려가는 최대 깊이 */
+        /** OCR로 찾은 "광고" 라벨 아래로 광고 영역으로 볼 높이 (화면 대비). */
+        private const val OCR_BANNER_RATIO = 0.12
+
         private const val CLOSE_SEARCH_DEPTH = 25
 
         /** 이보다 큰 것은 닫기 버튼이 아니라 광고 자체일 가능성이 높다 (dp). */

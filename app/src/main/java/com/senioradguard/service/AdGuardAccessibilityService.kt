@@ -734,7 +734,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
             overlayManager.showWarning(
                 message = "위험한 사이트일 수 있어요!\n[$host]\n" +
                     "광고·사기 사이트 목록에 있습니다.\n뒤로 돌아갈까요?",
-                packageName = host,
+                // packageName은 currentForegroundPackage()와 대조하는 값이라
+                // 도메인이 아니라 실제 패키지를 넘겨야 한다. 도메인을 넘기면
+                // 2단계 홈 이동이 영영 발동하지 않는다.
+                packageName = rootInActiveWindow?.packageName?.toString().orEmpty(),
                 onConfirm = { AdEventLogger.logIgnored(host) },
                 onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
                 currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() },

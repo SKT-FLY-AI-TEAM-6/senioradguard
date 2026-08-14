@@ -65,7 +65,9 @@ class AgentPipeline(
         val weakSignal: Boolean,
         val finalConfidence: Float,
         val marked: Boolean,
-        val reason: String
+        val reason: String,
+        /** 판별기 왕복에 걸린 시간(ms). 캐시 히트는 traces에 담기지 않는다. */
+        val elapsedMs: Long
     )
 
     data class Result(
@@ -133,8 +135,13 @@ class AgentPipeline(
                 continue
             }
 
-            val raw = runCatching { classifier.classify(CardText.forClassifier(candidate.texts), candidate.sourceKey) }
-                .getOrNull()
+            // 판별에 실제로 걸린 시간을 잰다. 화면에 점선이 뜨기까지의 체감
+            // 지연이 거의 이 값이라, 눈으로 볼 수 있어야 조정할 수 있다.
+            val startedAt = now()
+            val raw = runCatching {
+                classifier.classify(CardText.forClassifier(candidate.texts), candidate.sourceKey)
+            }.getOrNull()
+            val elapsed = now() - startedAt
             // 판별에 실패하면 캐시에 남기지 않는다. 실패를 저장하면 TTL 동안
             // 그 카드를 다시 볼 기회가 사라진다.
             if (raw == null) continue
@@ -151,7 +158,8 @@ class AgentPipeline(
                     weakSignal = CrossValidator.hasWeakSignal(candidate.viewIds),
                     finalConfidence = verdict.confidence,
                     marked = CrossValidator.shouldMark(verdict),
-                    reason = verdict.reason
+                    reason = verdict.reason,
+                    elapsedMs = elapsed
                 )
             )
 

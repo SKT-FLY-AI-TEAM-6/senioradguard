@@ -827,6 +827,17 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 val result = pipeline.run(candidates)
                 // 유휴 1회에 한 줄. 이벤트마다가 아니라 스크롤이 멈췄을 때만 찍히므로
                 // 부담이 없고, 캐시가 실제로 듣는지 눈으로 볼 수 있는 유일한 창이다.
+                // 판별 1건마다 한 줄. 캐시 히트는 여기 안 나오므로 실제 LLM 왕복만
+                // 보인다 — 점선이 뜨기까지의 체감 지연이 거의 이 값이다.
+                for (t in result.traces) {
+                    Log.i(
+                        TAG,
+                        "  판별 ${t.elapsedMs}ms 출처=${t.sourceKey} 글자수=${t.chars} " +
+                            "isAd=${t.rawIsAd} conf=${"%.2f".format(t.rawConfidence)} " +
+                            "→ ${"%.2f".format(t.finalConfidence)} 표시=${t.marked} " +
+                            ":: ${t.reason.take(60)}"
+                    )
+                }
                 Log.i(
                     TAG,
                     "layer2 출처=${candidates.firstOrNull()?.sourceKey ?: "-"} " +

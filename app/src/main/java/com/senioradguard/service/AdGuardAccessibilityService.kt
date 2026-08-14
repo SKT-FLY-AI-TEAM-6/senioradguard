@@ -271,6 +271,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
     /** 가림막을 띄운 이동의 출발 호스트 — 주소창이 여기로 돌아오면 딥링크 이탈이다 */
     private var shieldCameFrom: String? = null
 
+    /** 사전 표시 로그 중복 억제용 — 직전에 기록한 건수 */
+    private var lastPreWarnedLogged = -1
+
     /**
      * 선택 버튼(안전하게 돌아가기 / 그냥 볼게요)을 띄우고 사용자 결정을
      * 기다리는 중인가. 이 상태는 시간이 지나도 걷지 않는다 — 위험 안내가
@@ -664,7 +667,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
             styleFor(linked?.toAssessment()?.level)
         }
         val preWarned = styles.count { it != TrackedBorderOverlay.BorderStyle.AD }
-        if (preWarned > 0) Log.i(TAG, "지문 연계 사전 표시 — ${preWarned}건 (출처=$src)")
+        // 같은 화면에 머무는 동안 스캔마다 반복 출력되면 로그가 홍수가 된다 —
+        // 값이 바뀔 때만 남긴다 (실측: 초당 5줄씩 수 분간 반복)
+        if (preWarned != lastPreWarnedLogged) {
+            if (preWarned > 0) Log.i(TAG, "지문 연계 사전 표시 — ${preWarned}건 (출처=$src)")
+            lastPreWarnedLogged = preWarned
+        }
 
         // 캐시만 보는 Layer 2. 판별기를 부르지 않으므로 화면이 바뀔 때마다 돌려도 되고,
         // 그래야 점선이 카드를 따라다닌다. 다만 이건 이번 프레임의 **두 번째** 트리

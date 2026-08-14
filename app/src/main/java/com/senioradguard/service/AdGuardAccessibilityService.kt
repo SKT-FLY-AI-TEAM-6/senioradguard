@@ -19,6 +19,7 @@ import com.senioradguard.agent.CardText
 import com.senioradguard.agent.GeminiClassifier
 import com.senioradguard.agent.StubClassifier
 import com.senioradguard.analysis.AdEntryDetector
+import com.senioradguard.analysis.AdvertiserMark
 import com.senioradguard.analysis.RuleBasedUrlAnalyzer
 import com.senioradguard.analysis.UrlRiskAnalyzer
 import com.senioradguard.analysis.UrlRiskRules
@@ -196,9 +197,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     // ── 지문 연계 (4b-④) — 재등장 광고를 클릭 전에 알아본다 ──
 
-    /** [confirmedRegions]와 1:1 — 각 광고 카드의 지문 (CardText 키). 스캔 스레드에서 계산 */
+    /**
+     * [confirmedRegions]와 1:1 — 각 광고 카드의 지문 키 목록.
+     * [0]은 카드 전체 문구 지문, 있다면 [1]은 광고주 표기줄 지문(거친 지문).
+     * 같은 캠페인이 문구를 바꿔 돌려도(실측: 굿리치 변형 4종이 지문 4개가 됨)
+     * 광고주 표기줄은 같아서 거친 지문이 캠페인 전체를 이어준다.
+     * 빈 목록 = 수집 실패. 스캔 스레드에서 계산.
+     */
     @Volatile
-    private var confirmedFingerprints: List<String?> = emptyList()
+    private var confirmedFpKeys: List<List<String>> = emptyList()
 
     /** 지문을 마지막으로 모은 출처. 출처·개수가 그대로면 다시 모으지 않는다 (IPC 절약) */
     private var fpSourceKey: String? = null
@@ -211,17 +218,17 @@ class AdGuardAccessibilityService : AccessibilityService() {
      */
     private var fpHeights: List<Int> = emptyList()
 
-    /** 마지막으로 광고가 떠 있던 화면의 지문들. 이동 후에는 이게 "출발 페이지의 광고"다 */
+    /** 마지막으로 광고가 떠 있던 화면의 지문 키들. 이동 후에는 이게 "출발 페이지의 광고"다 */
     @Volatile
-    private var lastAdFingerprints: List<String?> = emptyList()
+    private var lastAdFpKeys: List<List<String>> = emptyList()
     @Volatile
     private var lastAdFingerprintsAt = 0L
 
-    /** 클릭 좌표로 특정된 광고의 지문 */
-    private var pendingFingerprint: String? = null
+    /** 클릭 좌표로 특정된 광고의 지문 키들 */
+    private var pendingFpKeys: List<String> = emptyList()
 
-    /** 이번 가림막이 다루는 광고의 지문 — 판정이 나오면 연계 저장한다 */
-    private var shieldFingerprint: String? = null
+    /** 이번 가림막이 다루는 광고의 지문 키들 — 판정이 나오면 전부 연계 저장한다 */
+    private var shieldFpKeys: List<String> = emptyList()
 
     /** 광고 클릭 직전에 주소창이 보여주던 URL. 이동 감지의 비교 기준이다. */
     private var preClickUrl: String? = null
@@ -544,32 +551,43 @@ class AdGuardAccessibilityService : AccessibilityService() {
             val h = stable[i].height()
             fpHeights[i] > 0 && kotlin.math.abs(h - fpHeights[i]) <= h / 5
         }
-        val fingerprints =
-            if (src == fpSourceKey && stable.size == confirmedFingerprints.size &&
-                confirmedFingerprints.isNotEmpty() && heightsStable &&
-                // null이 하나라도 있으면 재수집한다 — 페이지 로드 직후 첫 스캔은
+        val fpKeys: List<List<String>> =
+            if (src == fpSourceKey && stable.size == confirmedFpKeys.size &&
+                confirmedFpKeys.isNotEmpty() && heightsStable &&
+                // 빈 키가 하나라도 있으면 재수집한다 — 페이지 로드 직후 첫 스캔은
                 // 광고 텍스트가 아직 안 채워져 수집이 비기도 한다 (실측).
-                // null을 재사용 조건에 넣으면 그 실패가 영영 굳는다.
-                confirmedFingerprints.none { it == null }
+                // 실패를 재사용 조건에 넣으면 그 실패가 영영 굳는다.
+                confirmedFpKeys.none { it.isEmpty() }
             ) {
-                confirmedFingerprints
+                confirmedFpKeys
             } else {
                 fpSourceKey = src
                 fpHeights = stable.map { it.height() }
                 stableAnchors.map { a ->
-                    runCatching { a?.gatherText() }.getOrNull()?.let { CardText.cacheKey(src, it) }
+                    val texts = runCatching { a?.gatherText() }.getOrNull()
+                    if (texts == null) {
+                        emptyList()
+                    } else {
+                        val keys = mutableListOf(CardText.cacheKey(src, texts))
+                        // 광고주 표기줄(등록번호·심의필)이 있으면 거친 지문도 만든다 —
+                        // 문구 변형이 계속 바뀌는 캠페인을 하나로 잇는 열쇠다
+                        val adv = AdvertiserMark.advertiserLines(texts)
+                        if (adv.isNotEmpty()) keys += CardText.cacheKey("adv|$src", adv)
+                        keys
+                    }
                 }.also { list ->
-                    val misses = list.count { it == null }
+                    val misses = list.count { it.isEmpty() }
                     if (list.isNotEmpty() && misses > 0) {
                         Log.i(TAG, "지문 수집 미완 — $misses/${list.size} (출처=$src)")
                     }
                 }
             }
 
-        // 연계된 판정이 있으면 클릭 전에 최종 등급(주의/위험)으로 표시한다
-        val styles = fingerprints.map { fp ->
-            val linked = fp?.let {
-                runCatching { fingerprintDao.findLinkedVerdict(it, System.currentTimeMillis()) }
+        // 연계된 판정이 있으면 클릭 전에 최종 등급(주의/위험/확인)으로 표시한다.
+        // 카드 전체 지문 → 광고주 지문 순서로 조회한다.
+        val styles = fpKeys.map { keys ->
+            val linked = keys.firstNotNullOfOrNull { k ->
+                runCatching { fingerprintDao.findLinkedVerdict(k, System.currentTimeMillis()) }
                     .getOrNull()
             }
             styleFor(linked?.toAssessment()?.level)
@@ -592,7 +610,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         }
 
         withContext(Dispatchers.Main) {
-            apply(stable, stableAnchors, fingerprints, styles, guessed, closable)
+            apply(stable, stableAnchors, fpKeys, styles, guessed, closable)
         }
     }
 
@@ -738,7 +756,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun apply(
         confirmed: List<Rect>,
         anchors: List<Anchor?>,
-        fingerprints: List<String?>,
+        fpKeys: List<List<String>>,
         styles: List<TrackedBorderOverlay.BorderStyle>,
         guessed: List<Rect>,
         closable: Boolean
@@ -757,11 +775,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         confirmedRegions = shifted
         confirmedAnchors = anchors
-        confirmedFingerprints = fingerprints
+        confirmedFpKeys = fpKeys
         // 이동 후에도 "출발 페이지의 광고"를 기억해야 클릭 이벤트 없는 웹 광고를
         // 지문에 연결할 수 있다 (이동을 감지했을 땐 이미 화면이 랜딩으로 바뀌어 있다)
-        if (fingerprints.any { it != null }) {
-            lastAdFingerprints = fingerprints
+        if (fpKeys.any { it.isNotEmpty() }) {
+            lastAdFpKeys = fpKeys
             lastAdFingerprintsAt = SystemClock.uptimeMillis()
         }
         aiRegions = guessed
@@ -899,7 +917,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
             entryDetector.recordAdClick()
             // 클릭된 광고가 확정 영역 중 어느 것인지 알면 지문을 정확히 특정할 수 있다
             val idx = confirmedRegions.indexOfFirst { Rect.intersects(it, bounds) }
-            pendingFingerprint = if (idx >= 0) confirmedFingerprints.getOrNull(idx) else null
+            pendingFpKeys = if (idx >= 0) confirmedFpKeys.getOrNull(idx).orEmpty() else emptyList()
             preClickUrl = readUrlBar()
             navPollsLeft = NAV_POLL_COUNT
             handler.removeCallbacks(navPoll)
@@ -956,13 +974,16 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // 어느 것을 눌렀는지 알 수 없으므로 연계하지 않는다 — 틀린 연계는
         // 엉뚱한 광고에 위험 표시를 붙인다.
         val fresh = SystemClock.uptimeMillis() - lastAdFingerprintsAt < FP_FRESH_MS
-        shieldFingerprint = pendingFingerprint
-            ?: lastAdFingerprints.filterNotNull().singleOrNull().takeIf { fresh }
-        pendingFingerprint = null
+        shieldFpKeys = when {
+            pendingFpKeys.isNotEmpty() -> pendingFpKeys
+            fresh -> lastAdFpKeys.filter { it.isNotEmpty() }.singleOrNull().orEmpty()
+            else -> emptyList()
+        }
+        pendingFpKeys = emptyList()
 
         shieldOverlay.show("🔍", "잠깐만요", "안전한 곳인지 확인하고 있어요")
         handler.postDelayed(shieldTimeout, SHIELD_MAX_MS)
-        Log.i(TAG, "가림막 표시 — 사유=$reason 지문=${shieldFingerprint?.take(24) ?: "-"} url=${urlShown ?: "-"}")
+        Log.i(TAG, "가림막 표시 — 사유=$reason 지문=${shieldFpKeys.firstOrNull()?.take(24) ?: "-"} url=${urlShown ?: "-"}")
 
         // 추적 리다이렉트가 끝나 주소창이 안정된 뒤에 판정한다.
         // 초기 URL을 기준값으로 넣지 않는다 — 리다이렉터가 느리면 첫 재확인이
@@ -997,7 +1018,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
             finishShieldUnverified("주소를 확인하지 못했어요")
             return
         }
-        val fp = shieldFingerprint
+        val fpKeys = shieldFpKeys
         scope.launch {
             val now = System.currentTimeMillis()
             val cached = runCatching {
@@ -1005,15 +1026,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
             }.getOrNull()?.toAssessment()
             if (cached != null) {
                 Log.i(TAG, "URL 판정 캐시 히트 — $normalized ${cached.level}")
-                linkFingerprint(fp, normalized)
+                linkFingerprints(fpKeys, normalized)
                 withContext(Dispatchers.Main) { finishShield(normalized, cached) }
                 return@launch
             }
 
             // URL은 처음이지만 같은 광고(지문)를 전에 판정한 적이 있다면 그걸 쓴다 —
             // 소재 로테이션으로 랜딩 주소만 바뀐 경우다 (실측: page_cd 57→67).
-            val linked = fp?.let {
-                runCatching { fingerprintDao.findLinkedVerdict(it, now) }.getOrNull()
+            val linked = fpKeys.firstNotNullOfOrNull { k ->
+                runCatching { fingerprintDao.findLinkedVerdict(k, now) }.getOrNull()
             }
             val linkedAssessment = linked?.toAssessment()
             if (linked != null && linkedAssessment != null) {
@@ -1022,7 +1043,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 runCatching {
                     urlVerdictDao.upsert(linked.copy(normalizedUrl = normalized, analyzedAt = now))
                 }
-                linkFingerprint(fp, normalized)
+                linkFingerprints(fpKeys, normalized)
                 withContext(Dispatchers.Main) { finishShield(normalized, linkedAssessment) }
                 return@launch
             }
@@ -1062,20 +1083,25 @@ class AdGuardAccessibilityService : AccessibilityService() {
                     )
                 )
             }
-            linkFingerprint(fp, normalized)
+            linkFingerprints(fpKeys, normalized)
             Log.i(TAG, "분석 완료 — $normalized ${a.level} : ${a.reason} (최종=${page.finalUrl})")
             withContext(Dispatchers.Main) { finishShield(normalized, a) }
         }
     }
 
-    /** 광고 지문 → URL 판정 연계 저장. 지문을 못 특정했으면 아무것도 하지 않는다. */
-    private suspend fun linkFingerprint(fingerprint: String?, normalizedUrl: String) {
-        if (fingerprint == null) return
+    /**
+     * 광고 지문들 → URL 판정 연계 저장. 카드 전체 지문과 광고주 표기줄 지문을
+     * 모두 저장한다 — 후자가 문구 변형을 하나의 캠페인으로 이어준다.
+     * 지문을 못 특정했으면 아무것도 하지 않는다.
+     */
+    private suspend fun linkFingerprints(keys: List<String>, normalizedUrl: String) {
+        if (keys.isEmpty()) return
+        val now = System.currentTimeMillis()
         runCatching {
-            fingerprintDao.upsert(
-                AdFingerprintLink(fingerprint, normalizedUrl, System.currentTimeMillis())
-            )
-        }.onSuccess { Log.i(TAG, "지문 연계 저장 — ${fingerprint.take(24)}… → $normalizedUrl") }
+            keys.forEach { fingerprintDao.upsert(AdFingerprintLink(it, normalizedUrl, now)) }
+        }.onSuccess {
+            Log.i(TAG, "지문 연계 저장 ${keys.size}건 — ${keys.first().take(24)}… → $normalizedUrl")
+        }
     }
 
     /** 등급이 나왔다. 기획 3.1절의 대응대로 가림막을 끝맺는다. */

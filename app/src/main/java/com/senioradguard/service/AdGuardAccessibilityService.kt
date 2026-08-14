@@ -303,6 +303,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 // 지금 도는 스캔은 이만큼 구르기 *전* 화면을 읽고 있다. 결과가
                 // 돌아왔을 때 그대로 그리면 테두리가 뒤로 튄다 — 보정에 쓴다.
                 scrollSinceScanStart += dy
+                scrollBetweenScans += dy
             }
         }
 
@@ -556,9 +557,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         // 스캔이 도는 동안 굴러간 만큼 결과를 되민다 (안 그러면 테두리가 뒤로 튄다)
         val dy = -scrollSinceScanStart
-        val shifted = confirmed.shiftedBy(dy)
+        // 고정 배너는 스캔이 도는 동안에도 안 움직였으므로 되밀면 안 된다.
+        // 되밀면 좌표가 원본에서 벗어나 오버레이가 "고정"으로 알아보지 못하고,
+        // 결국 스크롤 때마다 함께 밀려 엉뚱한 곳을 가리킨다.
+        val pinned = pinnedAmong(confirmed + guessed)
+        borderOverlay.pinnedRegions = pinned
+        val shifted = confirmed.shiftedBy(dy, pinned)
         borderOverlay.show(AdMarkStyle.CONFIRMED, shifted)
-        borderOverlay.show(AdMarkStyle.AI_GUESS, guessed.shiftedBy(dy))
+        borderOverlay.show(AdMarkStyle.AI_GUESS, guessed.shiftedBy(dy, pinned))
 
         confirmedRegions = shifted
         aiRegions = guessed
@@ -567,8 +573,40 @@ class AdGuardAccessibilityService : AccessibilityService() {
         scheduleLayer2()
     }
 
-    private fun List<Rect>.shiftedBy(dy: Int): List<Rect> =
-        if (dy == 0 || isEmpty()) this else map { Rect(it).apply { offset(0, dy) } }
+    private fun List<Rect>.shiftedBy(dy: Int, pinned: Set<Rect> = emptySet()): List<Rect> =
+        if (dy == 0 || isEmpty()) this
+        else map { if (it in pinned) it else Rect(it).apply { offset(0, dy) } }
+
+    /** 직전 스캔이 낸 원본 영역과, 그 사이 화면이 굴러간 양. */
+    private var prevScanRegions: List<Rect> = emptyList()
+    private var scrollBetweenScans = 0
+
+    /**
+     * 스크롤을 따라 움직이지 않는 광고를 골라낸다. 화면에 고정된 상·하단 배너다.
+     *
+     * 화면이 굴렀는데도 같은 자리에 그대로 있으면 고정된 것이다. "화면 가장자리에
+     * 붙어 있으면 고정"으로 판정하지 않는 이유는, 본문과 함께 구르는 광고도 지나가는
+     * 길에 가장자리에 걸치기 때문이다. 두 스캔을 비교하면 그 착각이 없다.
+     *
+     * 판정이 틀려도 손해는 한쪽뿐이다. 고정인데 못 알아보면 지금까지처럼 테두리가
+     * 잠시 어긋나고, 고정이 아닌데 고정으로 보면 테두리가 잠시 안 따라온다.
+     * 다음 스캔이 어느 쪽이든 바로잡는다.
+     */
+    private fun pinnedAmong(regions: List<Rect>): Set<Rect> {
+        val scrolled = scrollBetweenScans
+        val prev = prevScanRegions
+        prevScanRegions = regions.map { Rect(it) }
+        scrollBetweenScans = 0
+
+        if (kotlin.math.abs(scrolled) < MIN_SCROLL_TO_JUDGE_PIN || prev.isEmpty()) {
+            // 화면이 안 굴렀으면 고정인지 아닌지 구분할 근거가 없다. 직전 판정을 유지한다.
+            return borderOverlay.pinnedRegions
+        }
+
+        return regions.filterTo(mutableSetOf()) { r ->
+            prev.any { kotlin.math.abs(it.top - r.top) <= PIN_TOLERANCE_PX }
+        }
+    }
 
     // ──────────────────────────────────────────────────────────
     // Layer 2 — AI 판별 파이프라인
@@ -683,6 +721,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
          * 사용자가 다시 스크롤할 때까지 영원히 재스캔되지 않는다.
          */
         private val LAZY_RESCAN_MS = longArrayOf(600, 1800, 3500)
+
+        /**
+         * 고정 배너인지 판정하려면 화면이 최소 이만큼은 굴러야 한다.
+         * 몇 px 흔들린 것으로 판정하면 스크롤하지 않은 화면을 전부 고정으로 본다.
+         */
+        private const val MIN_SCROLL_TO_JUDGE_PIN = 80
+
+        /** 두 스캔 사이 위치가 이 이내면 "안 움직였다"로 본다 */
+        private const val PIN_TOLERANCE_PX = 12
 
         /** 스크롤 경로에서 도는 Layer 2 후보 추출의 시간 상한 */
         private const val SCROLL_EXTRACT_BUDGET_MS = 150L

@@ -101,6 +101,18 @@ class AdBorderOverlay(private val context: Context) {
     /** 자식 뷰 하나의 생김새. 이게 같으면 뷰를 그대로 재사용한다. */
     private data class Spec(val style: AdMarkStyle, val withBadge: Boolean)
 
+    /**
+     * 스크롤을 따라 움직이지 않는 광고 영역. 화면에 고정된 상·하단 배너다.
+     *
+     * 이게 없으면 [offsetBy]가 모든 테두리를 똑같이 밀어, 스크롤 도중 고정 배너의
+     * 테두리가 엉뚱한 기사 사진 위로 올라간다 (실기기 확인: 한경 하단 배너).
+     * 서비스가 스캔 사이 좌표 변화를 보고 판정해 넣어준다.
+     */
+    var pinnedRegions: Set<Rect> = emptySet()
+
+    /** 자식 뷰 i가 어느 영역을 그리고 있는가. [offsetBy]가 고정 배너를 건너뛰는 데 쓴다. */
+    private val childRegions = mutableListOf<Rect>()
+
     private fun dp(v: Int) = (v * context.resources.displayMetrics.density).toInt()
 
     /** 해당 스타일의 영역 목록을 교체한다. 다른 스타일의 표시는 그대로 둔다. */
@@ -145,14 +157,23 @@ class AdBorderOverlay(private val context: Context) {
         if (dy == 0) return
         if (shown.values.all { it.isEmpty() }) return
 
+        // 화면에 고정된 배너는 밀지 않는다. 스크롤해도 제자리에 있는 광고라,
+        // 함께 밀면 테두리만 위로 떠올라 광고가 아닌 곳을 가리킨다.
+        val pinned = pinnedRegions
+
         // 저장된 영역도 함께 민다. 안 그러면 다음 스캔 결과와 비교할 때 기준이
         // 어긋나, 실제로 같은 자리인데도 매번 다시 그리게 된다.
         for (style in shown.keys.toList()) {
-            shown[style] = shown[style].orEmpty().map { Rect(it).apply { offset(0, dy) } }
+            shown[style] = shown[style].orEmpty().map { r ->
+                if (r in pinned) r else Rect(r).apply { offset(0, dy) }
+            }
         }
 
         val root = overlay ?: return
         for (i in 0 until root.childCount) {
+            // childRegions는 draw()가 그린 순서 그대로다. 아직 안 그려졌으면
+            // 대조할 수 없으니 미는 쪽으로 둔다 (다음 스캔이 바로잡는다).
+            if (childRegions.getOrNull(i) in pinned) continue
             val view = root.getChildAt(i)
             val lp = view.layoutParams as FrameLayout.LayoutParams
             lp.topMargin += dy
@@ -268,6 +289,7 @@ class AdBorderOverlay(private val context: Context) {
 
         // 맵 순서에 기대지 않는다. 순서가 흔들리면 재사용 판정이 매번 어긋난다.
         var i = 0
+        childRegions.clear()
         for (style in AdMarkStyle.values()) {
             for (r in shown[style].orEmpty()) {
                 val c = Rect(r)
@@ -293,6 +315,9 @@ class AdBorderOverlay(private val context: Context) {
                     lp.setMargins(left, top, 0, 0)
                     view.layoutParams = lp   // requestLayout을 부른다
                 }
+                // 자른 좌표(c)가 아니라 원래 영역(r)을 기억한다. pinnedRegions는
+                // 스캔이 낸 원본 좌표로 들어오므로 그걸로 대조해야 한다.
+                childRegions.add(Rect(r))
                 i++
             }
         }

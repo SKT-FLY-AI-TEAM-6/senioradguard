@@ -20,6 +20,8 @@ import com.senioradguard.agent.StubClassifier
 import com.senioradguard.detector.UrlGuard
 import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.guard.InstallGuard
+import com.senioradguard.guard.InstallSourceGuard
+import com.senioradguard.guard.RedirectRules
 import com.senioradguard.logger.AdEventLogger
 import com.senioradguard.ocr.OcrScanner
 import com.senioradguard.overlay.AdBorderOverlay
@@ -175,6 +177,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     private val urlGuard by lazy { UrlGuard(this) }
 
+    private val installSourceGuard by lazy { InstallSourceGuard(this) }
+
+    /** 이미 안내한 쇼핑몰. 같은 화면에서 반복해 띄우면 쓸 수 없다. */
+    private val redirectShown = SightingLog()
+
     /**
      * 글자 없는 광고 이미지를 화면에서 읽는다. API 30부터만 가능하다 —
      * takeScreenshot이 그때 생겼고, 그 아래에서는 OCR 없이 동작한다.
@@ -278,8 +285,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 시스템 단계에서 걸러 우리 프로세스를 아예 깨우지 않는다.
             // 삼성 인터넷은 광고 감지 대상이 아니지만(웹 콘텐츠를 트리에 안 내놓는다)
             // 주소창은 읽히므로 도메인 대조를 위해 이벤트만 받는다.
-            packageNames = (targetApps + storePackages + UrlGuard.URL_BAR_IDS.keys)
-                .toTypedArray()
+            // 감지 대상(targetApps) 말고도 "화면이 떴다"만 알면 되는 패키지들이 있다.
+            // 쇼핑 앱·설치 화면은 광고를 훑지 않고 전환 사실만 본다.
+            packageNames = (
+                targetApps + storePackages + UrlGuard.URL_BAR_IDS.keys +
+                    RedirectRules.AD_REDIRECT_PACKAGES + InstallSourceGuard.INSTALLER_PACKAGES
+                ).toTypedArray()
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
@@ -324,9 +335,26 @@ class AdGuardAccessibilityService : AccessibilityService() {
             handler.removeCallbacks(lazyRescan)
             for (d in LAZY_RESCAN_MS) handler.postDelayed(lazyRescan, d)
 
-            // 주소가 바뀌었을 때만 대조한다. 같은 페이지 안에서도 이 이벤트는 여러 번 온다.
+            // 기능 3 — APK 설치 화면. 출처가 Play 스토어가 아니면 끼어든다.
+            if (installSourceGuard.isInstallerScreen(pkg)) {
+                warnUnknownInstall()
+                return
+            }
+
+            // 기능 1 — 광고를 눌러 쇼핑 앱으로 튕겨 나갔다.
+            if (RedirectRules.isRedirectPackage(pkg)) {
+                warnRedirect(pkg)
+                return
+            }
+
             rootInActiveWindow?.let { root ->
                 val host = urlGuard.hostOf(root)
+                // 기능 1 — 브라우저 안에서 쇼핑몰로 이동한 경우.
+                if (RedirectRules.isRedirectHost(host)) {
+                    warnRedirect(host!!)
+                    return
+                }
+                // 기능 2 — 악성 도메인 대조. 주소가 바뀌었을 때만 본다.
                 if (host != null) scope.launch { checkHost(host) }
             }
         }
@@ -770,6 +798,57 @@ class AdGuardAccessibilityService : AccessibilityService() {
             getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_AI_CLASSIFY, false)
 
     /**
+     * 기능 1 — 광고를 눌러 쇼핑몰로 넘어왔다고 알린다.
+     *
+     * 쿠팡·알리는 정상 쇼핑몰이다. 막을 대상이 아니라, **어르신이 광고를 누른 줄
+     * 모르고 끌려왔을 수 있다는 사실**을 알리는 것이 목적이다. 계속 보겠다면 둔다.
+     */
+    private fun warnRedirect(key: String) {
+        if (!redirectShown.shouldReport(key, layer = 3)) return
+        val name = RedirectRules.displayName(key)
+        Log.i(TAG, "광고 경유 이동 감지: $key")
+
+        overlayManager.showWarning(
+            message = "광고를 통해 ${name}(으)로 이동했습니다.\n" +
+                "원래 보던 화면으로 돌아갈까요?",
+            packageName = rootInActiveWindow?.packageName?.toString().orEmpty(),
+            onConfirm = { AdEventLogger.logIgnored(key) },
+            onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
+            currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() },
+            onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) },
+            blockLabel = "돌아가기",
+            confirmLabel = "계속 보기"
+        )
+        AdEventLogger.logStoreRedirect(key)
+    }
+
+    /**
+     * 기능 3 — Play 스토어가 아닌 곳에서 온 APK 설치 화면에 끼어든다.
+     *
+     * 시스템 설치 버튼은 누를 수도 가릴 수도 없다. 경고를 덮어 "이게 무슨
+     * 화면인지" 알리고 돌아갈 길을 주는 것까지가 우리 몫이다. 완전 차단은
+     * Play 정책 위반이라 하지 않는다.
+     */
+    private fun warnUnknownInstall() {
+        if (installSourceGuard.isFromPlayStore()) return
+        Log.i(TAG, "알 수 없는 출처의 설치 화면 감지")
+
+        overlayManager.showWarning(
+            message = "앱을 설치하려고 합니다.\n" +
+                "플레이스토어가 아닌 곳에서 받은 앱입니다.\n" +
+                "모르는 앱이면 설치하지 마세요.",
+            packageName = rootInActiveWindow?.packageName?.toString().orEmpty(),
+            onConfirm = { AdEventLogger.logIgnored("unknown_installer") },
+            onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
+            currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() },
+            onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) },
+            blockLabel = "설치 취소하고 돌아가기",
+            confirmLabel = "그래도 설치"
+        )
+        AdEventLogger.logInstallBlocked("unknown_installer")
+    }
+
+    /**
      * 지금 페이지의 도메인이 차단 목록에 있는지 본다. 보호 강도 3단계에서만 돈다.
      *
      * 링크를 누르는 순간이 아니라 **도착한 뒤**에 확인한다 — 접근성 트리에는 href가
@@ -794,7 +873,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 onConfirm = { AdEventLogger.logIgnored(host) },
                 onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
                 currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() },
-                onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) }
+                onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) },
+                blockLabel = "안전하게 돌아가기",
+                confirmLabel = "그냥 보기"
             )
         }
     }

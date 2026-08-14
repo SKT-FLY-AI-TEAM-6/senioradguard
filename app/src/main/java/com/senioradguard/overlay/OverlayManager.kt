@@ -35,10 +35,15 @@ class OverlayManager(private val context: Context) {
     fun showWarning(
         message: String,
         packageName: String,
-        onConfirm: () -> Unit,   // "그냥 보기" — 사용자가 계속 진행
-        onBlock: () -> Unit,     // "뒤로 가기" 1단계 — GLOBAL_ACTION_BACK
+        onConfirm: () -> Unit,   // 보조 버튼 — 사용자가 계속 진행
+        onBlock: () -> Unit,     // 주 버튼 1단계 — GLOBAL_ACTION_BACK
         currentForegroundPackage: () -> String?,
-        onForceHome: () -> Unit  // "뒤로 가기" 2단계 — GLOBAL_ACTION_HOME
+        onForceHome: () -> Unit, // 주 버튼 2단계 — GLOBAL_ACTION_HOME
+        // 상황마다 무엇으로 돌아가는지가 달라 문구를 바꿔 끼운다. "뒤로 가기"는
+        // 앱을 나가는 것처럼 들리지만, 실제로 하는 일은 "쇼핑몰에서 원래 보던
+        // 화면으로", "위험한 사이트에서 안전하게", "설치를 취소하고"로 각각 다르다.
+        blockLabel: String = "뒤로 가기",
+        confirmLabel: String = "그냥 보기"
     ) {
         if (overlayView != null) return // 이미 표시 중이면 중복 방지
 
@@ -47,6 +52,8 @@ class OverlayManager(private val context: Context) {
             packageName = packageName,
             onConfirm = onConfirm,
             onBlock = onBlock,
+            blockLabel = blockLabel,
+            confirmLabel = confirmLabel,
             currentForegroundPackage = currentForegroundPackage,
             onForceHome = onForceHome
         )
@@ -78,6 +85,8 @@ class OverlayManager(private val context: Context) {
         packageName: String,
         onConfirm: () -> Unit,
         onBlock: () -> Unit,
+        blockLabel: String,
+        confirmLabel: String,
         currentForegroundPackage: () -> String?,
         onForceHome: () -> Unit
     ): View {
@@ -113,7 +122,7 @@ class OverlayManager(private val context: Context) {
 
         // "뒤로 가기" 버튼 (기본 선택 — 빨간색)
         val blockBtn = Button(context).apply {
-            text = "뒤로 가기"
+            text = blockLabel
             textSize = 20f
             setTextColor(0xFFFFFFFF.toInt())
             setBackgroundColor(0xFFD32F2F.toInt())
@@ -139,7 +148,7 @@ class OverlayManager(private val context: Context) {
         // "무시하기"는 무엇을 무시하는지가 모호해 노인 사용자가 멈칫한다.
         // 실제로 하는 일("경고를 닫고 그대로 본다")을 그대로 적는다.
         val confirmBtn = Button(context).apply {
-            text = "그냥 보기"
+            text = confirmLabel
             textSize = 18f
             setTextColor(0xFF888888.toInt())
             setBackgroundColor(0xFF333333.toInt())

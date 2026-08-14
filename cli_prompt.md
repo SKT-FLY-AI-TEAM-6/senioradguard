@@ -82,52 +82,45 @@ families/{familyId}/
    - 어르신: 코드 입력 → families/{familyId}/members에 등록
    - SetupActivity에서 모드 선택 시 연동
 
-### Phase 2-B: 브라우저 도메인 대조
+### Phase 2-B: 화면전환 대응 (3개 기능 분리)
 
-#### 목적
-사칭 문자나 광고 링크로 사기 사이트 접속 시 즉시 경고 + 이전 화면 복귀 유도.
-사전 차단 아님. 접속 직후 경고.
+#### 기능 1 — 광고 클릭 → 쇼핑몰 이동 감지 → 돌아가기
+DB 사용 안 함. 하드코딩 목록(`guard/RedirectRules.kt`).
 
-#### 트리거
-TYPE_WINDOW_STATE_CHANGED 이벤트에서 브라우저 패키지 감지 시 주소창 URL 읽기
-
-#### 지원 브라우저
-- Chrome: `com.android.chrome:id/url_bar`
-- Samsung Internet: `com.sec.android.app.sbrowser:id/location_bar_edit_text`
-
-#### 흐름
 ```
-브라우저 주소창 URL 읽기
-        ↓
-Uri.parse()로 도메인 추출
-        ↓
-Room DB blacklist_domains 테이블 대조
-        ↓
-히트 → 고위험 오버레이 + "안전하게 돌아가기" 버튼
-미히트 → 통과
+AD_REDIRECT_TARGETS  = coupang.com, aliexpress.com, temu.com, shein.com
+AD_REDIRECT_PACKAGES = com.coupang.mobile, com.alibaba.aliexpresshd,
+                       com.einnovation.temu, com.zzkko
 ```
 
-#### Room DB
-```kotlin
-@Entity(tableName = "blacklist_domains")
-data class BlacklistDomain(
-    @PrimaryKey val domain: String,
-    val addedAt: Long
-)
-```
-도메인 대조는 서픽스 매칭으로 구현 (sub.example.com → example.com도 히트)
+TYPE_WINDOW_STATE_CHANGED → 패키지 또는 주소창 도메인 대조 → 히트 시 오버레이
+("광고를 통해 {사이트명}으로 이동했습니다") · 주 버튼 "돌아가기" · 보조 "계속 보기".
 
-#### 초기 데이터
-`assets/blacklist.txt`에 초기 도메인 목록 포함. 앱 첫 실행 시 Room DB에 삽입.
+Room 테이블 만들지 않는다.
 
-#### 하지 말 것
-- `extractUrl()` 광고 노드 URL 추출 구현하지 마라 (실효성 없음)
-- `AdDetector.kt` 활성화하지 마라
-- `BlacklistUpdateWorker` 재활성화하지 마라 (배터리 이슈, Phase 3로 미룸)
+#### 기능 2 — 악성 도메인 대조 → 경고 + 돌아가기
+DB 사용. `blacklist_domains` 서픽스 매칭.
 
-#### 범위
-"알려진 피싱·사기 도메인 접속 직후 경고"까지만. 사전 차단, DBE, DBD 자동 설치는
-범위 밖. APK 설치 차단은 기존 Layer 3가 담당.
+TYPE_WINDOW_STATE_CHANGED(브라우저) → 주소창 URL → 도메인 추출 → 대조 →
+히트 시 경고("위험한 사이트입니다") · 주 버튼 "안전하게 돌아가기".
+
+초기 데이터는 `assets/blacklist.txt`를 첫 실행에 삽입.
+`BlacklistUpdateWorker`는 계속 비활성화(Phase 3).
+
+#### 기능 3 — APK 설치 직전 개입
+DB 사용 안 함.
+
+패키지 인스톨러 화면 감지 → 설치 요청자가 `com.android.vending`인지 확인 →
+아니면 전체화면 경고 · 주 버튼 "설치 취소하고 돌아가기" · 보조 "그래도 설치".
+
+시스템 설치 버튼은 직접 조작 불가. 오버레이로만 개입한다.
+완전 차단은 구현하지 않는다(Play 정책 위반).
+
+#### 공통 제약
+- 이 세 기능의 경고는 `FLAG_NOT_TOUCHABLE`을 쓰지 않는다 (버튼을 눌러야 하므로).
+  Layer 1·2 테두리는 종전대로 유지한다.
+- `extractUrl()` 광고 노드 URL 추출 구현하지 않는다.
+- 화이트리스트 테이블 만들지 않는다.
 
 ### Phase 2-C: OCR 추가
 

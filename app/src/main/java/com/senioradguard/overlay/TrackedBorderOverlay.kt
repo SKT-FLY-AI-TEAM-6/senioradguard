@@ -74,8 +74,14 @@ class TrackedBorderOverlay(private val context: Context) {
      */
     data class BorderStyle(val color: String, val badge: String) {
         companion object {
-            /** 저위험·기본: 파란 테두리 + 광고 */
+            /** 판정 전 기본: 파란 테두리 + 광고 */
             val AD = BorderStyle("#2179FD", "광고")
+            /**
+             * 저위험 확인 완료: 초록 테두리 + 광고 ✓ — 판정 전(파랑)과 구분한다.
+             * 체크는 "안전 보증"이 아니라 "확인한 범위에서 신호 없음"이다.
+             * 색만 바꾸지 않고 배지도 달리해 색각과 무관하게 읽히게 한다.
+             */
+            val SAFE = BorderStyle("#2E7D32", "광고 ✓")
             /** 중위험 연계 판정: 노란 테두리 + 주의 */
             val CAUTION = BorderStyle("#F9A825", "주의")
             /** 고위험 연계 판정: 빨간 테두리 + 위험 */

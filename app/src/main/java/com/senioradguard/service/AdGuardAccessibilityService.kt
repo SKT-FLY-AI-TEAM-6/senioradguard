@@ -599,7 +599,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun styleFor(level: RiskLevel?): TrackedBorderOverlay.BorderStyle = when (level) {
         RiskLevel.HIGH -> TrackedBorderOverlay.BorderStyle.DANGER
         RiskLevel.MEDIUM -> TrackedBorderOverlay.BorderStyle.CAUTION
-        else -> TrackedBorderOverlay.BorderStyle.AD
+        RiskLevel.LOW -> TrackedBorderOverlay.BorderStyle.SAFE
+        null -> TrackedBorderOverlay.BorderStyle.AD
     }
 
     /**

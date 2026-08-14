@@ -39,7 +39,13 @@ import com.senioradguard.ui.ServiceStatus
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 import com.senioradguard.detector.BlacklistSeeder
-import com.senioradguard.remote.FirebaseRepo
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.text.input.KeyboardType
+import com.senioradguard.remote.FamilyRepo
+import com.senioradguard.remote.GoogleAuth
+import com.senioradguard.remote.InviteCode
 import com.senioradguard.risk.ProtectionLevel
 import com.senioradguard.remote.Role
 import com.senioradguard.ui.GuardianActivity
@@ -68,7 +74,7 @@ class MainActivity : ComponentActivity() {
 
         // 역할을 아직 안 골랐으면 선택 화면으로, 보호자면 대시보드로 넘긴다.
         // 이 화면(어르신 모드)은 접근성 서비스 상태를 다루므로 보호자에게는 의미가 없다.
-        when (FirebaseRepo.savedRole(this)) {
+        when (FamilyRepo.savedRole(this)) {
             null -> {
                 startActivity(Intent(this, SetupActivity::class.java))
                 finish()
@@ -179,7 +185,7 @@ private fun HomeScreen(
 
         // 어떤 상태든 아래 두 가지는 항상 보여준다. 이게 없으면 UI만으로는
         // 보호자를 연결할 수도, 역할을 바꿔볼 수도 없다.
-        ConnectionCodeCard()
+        FamilyJoinCard()
         ChangeRoleButton()
     }
 }
@@ -247,53 +253,84 @@ private fun ProtectionLevelCard() {
 }
 
 /**
- * 보호자가 입력할 연결 코드. 이 기기의 ID를 그대로 쓴다.
- * 코드를 볼 방법이 없으면 보호자 모드를 실제로 연결해볼 수가 없다.
+ * 보호자가 불러준 6자리 코드를 넣어 가족에 들어간다.
+ *
+ * 이 화면에서 처음으로 로그인을 묻는다. 앱을 켜자마자 계정을 요구하면 무엇을
+ * 하는 앱인지도 모르는 채 로그인부터 하게 된다. 연결을 실제로 원하는 시점에
+ * 묻고, 연결하지 않아도 광고 감지는 그대로 돈다.
  */
 @Composable
-private fun ConnectionCodeCard() {
+private fun FamilyJoinCard() {
     val context = LocalContext.current
-    val code = FirebaseRepo.currentUserId()
+    val scope = rememberCoroutineScope()
+    var familyId by remember { mutableStateOf(FamilyRepo.savedFamilyId(context)) }
+    var input by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
 
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F1F1))
+    ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Text("보호자 연결 코드", fontSize = 19.sp, fontWeight = FontWeight.Bold)
-            Text(
-                text = code.ifBlank { "-" },
-                fontSize = 20.sp,
-                color = Color(0xFF1565C0)
+            if (familyId != null) {
+                Text("보호자와 연결됨", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text("광고를 발견하면 보호자에게 알려드립니다.", fontSize = 16.sp)
+                return@Column
+            }
+
+            Text("보호자 연결", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text("보호자가 불러준 6자리 숫자를 넣어주세요.", fontSize = 16.sp)
+
+            OutlinedTextField(
+                value = input,
+                onValueChange = { input = InviteCode.normalize(it).take(InviteCode.LENGTH) },
+                label = { Text("연결 숫자 6자리") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth()
             )
-            Text(
-                text = "보호자 폰의 '보호자 모드'에 이 코드를 입력하세요.",
-                fontSize = 15.sp,
-                color = Color(0xFF5D4037)
-            )
+            message?.let { Text(it, fontSize = 15.sp, color = Color(0xFFC62828)) }
+
             Button(
                 onClick = {
-                    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                        as android.content.ClipboardManager
-                    clipboard.setPrimaryClip(
-                        android.content.ClipData.newPlainText("연결 코드", code)
-                    )
+                    busy = true
+                    message = null
+                    scope.launch {
+                        val uid = if (GoogleAuth.isSignedIn) FamilyRepo.uid()
+                        else GoogleAuth.signIn(context)
+
+                        when {
+                            uid == null ->
+                                message = "구글 로그인에 실패했습니다."
+                            !FamilyRepo.joinFamily(context, input) ->
+                                message = "그런 숫자를 가진 가족이 없습니다. 다시 확인해주세요."
+                            else ->
+                                familyId = FamilyRepo.savedFamilyId(context)
+                        }
+                        busy = false
+                    }
                 },
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("코드 복사", fontSize = 17.sp) }
+                enabled = !busy && InviteCode.isValid(input),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(60.dp)
+            ) { Text(if (busy) "연결 중…" else "연결하기", fontSize = 20.sp) }
         }
     }
 }
 
-/** 역할 재선택. 한 번 고르면 되돌릴 방법이 없어 테스트가 막혔다. */
 @Composable
 private fun ChangeRoleButton() {
     val context = LocalContext.current
     Button(
         onClick = {
-            FirebaseRepo.clearRole(context)
+            FamilyRepo.clearLocal(context); GoogleAuth.signOut()
             context.startActivity(
                 Intent(context, SetupActivity::class.java)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)

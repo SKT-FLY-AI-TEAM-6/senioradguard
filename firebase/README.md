@@ -1,41 +1,60 @@
-# Firebase 보안 규칙
+# Firebase 설정
 
-`database.rules.json`을 Realtime Database에 적용해야 한다. **적용 전에는 아무나 DB 전체를 읽고 지울 수 있다.**
+## 1. Google 로그인 켜기 (필수)
 
-## 적용
+가족 계정은 사람 단위라 계정이 있어야 기기를 바꿔도 연결이 유지된다.
 
-콘솔 → **빌드 → Realtime Database → 규칙** 탭 → 내용을 통째로 붙여넣고 **게시**.
+1. 콘솔 → **Authentication → Sign-in method → Google** 사용 설정
+2. 콘솔 → 프로젝트 설정 → 내 앱 → **SHA-1 지문 추가**
 
-`Authentication → Sign-in method`에서 **익명(Anonymous)** 제공업체도 켜야 한다. 앱이 익명 로그인을 거치는데 이게 꺼져 있으면 `CONFIGURATION_NOT_FOUND`로 실패하고 원격 기능이 통째로 죽는다 (광고 감지는 그대로 돈다).
+   디버그 키의 SHA-1은 이렇게 얻는다:
+   ```bash
+   ./gradlew signingReport | grep -A1 "Variant: debug" | grep SHA1
+   ```
+3. **`google-services.json`을 다시 받아** `app/`에 덮어쓴다
 
-## 무엇을 막나
+3번을 빼먹으면 파일에 웹 클라이언트 ID(`client_type: 3`)가 없어 로그인이 실패한다.
+빌드 시 `google-services.json에 웹 클라이언트 ID가 없습니다` 경고가 나오면 이 상태다.
 
-| | 적용 전 | 적용 후 |
+## 2. Firestore 만들기
+
+콘솔 → **빌드 → Firestore Database** 생성. (Realtime Database 아님 — 2-A에서 옮겼다)
+
+## 3. 보안 규칙 올리기
+
+`firestore.rules` 내용을 콘솔 → Firestore → **규칙** 탭에 붙여넣고 게시.
+
+**올리기 전에는 아무나 DB 전체를 읽고 지울 수 있다.**
+
+## 데이터 구조
+
+```
+families/{familyId}/
+  members/{uid}    role, fcmToken, deviceName, joinedAt
+  settings/{uid}   protectionLevel, whitelist[]
+  events/{id}      timestamp, riskLevel, type, blocked, packageName, count
+  reports/{YYYY-MM}  adsBlocked, urlsBlocked, appsBlocked
+invites/{code}     familyId          ← 6자리 코드로 가족을 찾는 역인덱스
+```
+
+**화면에 뜬 글자는 올라가지 않는다.** 이벤트에 담기는 것은 위험등급·유형·차단여부·
+시각·출처(도메인 또는 패키지명)뿐이다.
+
+## 규칙이 막는 것
+
+| | 규칙 전 | 규칙 후 |
 |---|---|---|
-| `curl .../.json` 으로 DB 전체 덤프 | **가능** | 차단 (`auth == null`) |
-| 남의 이벤트 삭제·조작 | **가능** | 차단 (owner 불일치) |
-| 남의 코드로 이벤트 위조 | **가능** | 차단 |
-| 스키마에 없는 필드 주입 | **가능** | 차단 (`$other: false`) |
-| 연결 코드를 아는 사람이 기록을 **읽는** 것 | 가능 | **여전히 가능** |
+| 로그인 없이 DB 덤프 | 가능 | 차단 |
+| 남의 가족 기록 읽기 | 가능 | 차단 (구성원만) |
+| 남의 역할·FCM 토큰 변조 | 가능 | 차단 (자기 문서만) |
+| 기록 삭제·조작 | 가능 | 차단 (생성만 허용) |
 
 ## 남아 있는 구멍
 
-**연결 코드는 사실상 비밀번호다.** 코드를 아는 로그인된 사용자면 누구나 그 어르신의 기록을 읽을 수 있다. 보호자가 어르신 기록을 읽어야 하는데, 서버가 "이 사람이 진짜 보호자인가"를 판단할 근거가 코드밖에 없기 때문이다.
+**초대 코드를 아는 사람은 가족에 들어올 수 있다.** 6자리라 무작위로 맞히기는 어렵지만
+(100만분의 1), 코드가 새어나가면 막을 방법이 없다. 코드를 한 번 쓰면 무효화하거나,
+어르신 쪽에서 수락하게 하는 절차가 다음 단계다.
 
-제대로 막으려면 **어르신 쪽 승인**이 필요하다:
-
-1. 보호자가 코드를 넣으면 `requests/{어르신코드}/{보호자uid}` 에 요청만 쌓임
-2. 어르신 폰에 "○○님이 연결을 요청했어요 [수락] [거절]"
-3. 수락하면 어르신이 `users/{어르신코드}/allowed/{보호자uid} = true` 를 씀
-4. 읽기 규칙을 `allowed`에 있는 uid로 제한
-
-지금 단계에서는 코드를 직접 만나서 전달하는 상황을 가정하고 넘어간다. 배포 전에는 반드시 붙여야 한다.
-
-## 규칙 요약
-
-- 루트 읽기·쓰기 전면 차단
-- `users/{code}` — 로그인하면 읽기 가능, 쓰기는 `owner`가 자기 uid인 기기만
-- `owner`는 자기 uid로만 쓸 수 있다 (남의 코드를 가로챌 수 없음)
-- `events/{code}` — 로그인하면 읽기 가능, 쓰기는 그 코드의 owner만
-- 이벤트 필드는 타입·길이·허용값까지 검증 (`action`은 blocked/warned/ignored, `layer`는 1~3)
-- 정의되지 않은 필드는 거부
+`invites/{code}`는 로그인한 사람이면 누구나 **덮어쓸 수 있다.** 남의 코드를 자기
+가족으로 바꿔치기할 수 있다는 뜻이다. 코드 발급을 서버(Cloud Functions)로 옮기면
+막힌다.

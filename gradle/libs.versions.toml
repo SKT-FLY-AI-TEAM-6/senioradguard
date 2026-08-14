@@ -15,6 +15,8 @@ coroutines = "1.11.0"
 googleServices = "4.4.2"
 firebaseBom = "33.7.0"
 mlkitTextKorean = "16.0.1"
+credentials = "1.5.0"
+googleId = "1.1.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -40,6 +42,10 @@ firebase-bom = { group = "com.google.firebase", name = "firebase-bom", version.r
 firebase-auth-ktx = { group = "com.google.firebase", name = "firebase-auth-ktx" }
 mlkit-text-korean = { group = "com.google.mlkit", name = "text-recognition-korean", version.ref = "mlkitTextKorean" }
 firebase-database-ktx = { group = "com.google.firebase", name = "firebase-database-ktx" }
+firebase-firestore-ktx = { group = "com.google.firebase", name = "firebase-firestore-ktx" }
+androidx-credentials = { group = "androidx.credentials", name = "credentials", version.ref = "credentials" }
+androidx-credentials-play-services = { group = "androidx.credentials", name = "credentials-play-services-auth", version.ref = "credentials" }
+google-id = { group = "com.google.android.libraries.identity.googleid", name = "googleid", version.ref = "googleId" }
 firebase-messaging-ktx = { group = "com.google.firebase", name = "firebase-messaging-ktx" }
 kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
 

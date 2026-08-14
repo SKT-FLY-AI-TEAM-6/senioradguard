@@ -33,6 +33,32 @@ if (hasGoogleServices) {
 // 배포 전에는 반드시 우리 서버를 거치는 구현으로 바꿔야 한다 (AdClassifier가 교체점).
 val geminiApiKey: String = localProperties.getProperty("GEMINI_API_KEY", "")
 
+/**
+ * Google 로그인에 필요한 웹 클라이언트 ID (oauth_client의 client_type 3).
+ *
+ * google-services.json에서 뽑는다. 콘솔에서 Google 제공업체를 켜고 SHA-1을
+ * 등록해야 이 항목이 생기므로, 없으면 빈 문자열이 되고 앱은 로그인 없이
+ * (원격 기능만 꺼진 채) 돌아간다.
+ */
+val googleWebClientId: String = run {
+    val json = file("google-services.json")
+    if (!json.exists()) return@run ""
+    val text = json.readText()
+    // client_type 3(웹)인 oauth_client 항목의 client_id를 찾는다.
+    // JSON 파서를 끌어오지 않으려고 문자열로 훑는다 — 이 파일 형식은 고정이다.
+    val marker = "\"client_type\": 3"
+    val at = text.indexOf(marker)
+    if (at < 0) return@run ""
+    val idKey = "\"client_id\": \""
+    val start = text.lastIndexOf(idKey, at)
+    if (start < 0) return@run ""
+    val from = start + idKey.length
+    text.substring(from, text.indexOf('"', from))
+}
+if (googleWebClientId.isEmpty()) {
+    logger.warn("google-services.json에 웹 클라이언트 ID가 없습니다 — Google 로그인이 동작하지 않습니다.")
+}
+
 android {
     namespace = "com.senioradguard"
     compileSdk {
@@ -50,6 +76,7 @@ android {
 
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
         buildConfigField("Boolean", "HAS_FIREBASE", "$hasGoogleServices")
+        buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", "\"$googleWebClientId\"")
     }
 
     buildTypes {
@@ -98,6 +125,11 @@ dependencies {
     // 온디바이스 한국어 OCR. 화면 픽셀이 기기 밖으로 나가지 않는다.
     implementation(libs.mlkit.text.korean)
     implementation(libs.firebase.database.ktx)
+    implementation(libs.firebase.firestore.ktx)
+    // Google 로그인 — GoogleSignInClient는 폐기됐고 Credential Manager가 후속이다
+    implementation(libs.androidx.credentials)
+    implementation(libs.androidx.credentials.play.services)
+    implementation(libs.google.id)
     implementation(libs.firebase.messaging.ktx)
 
     // 코루틴

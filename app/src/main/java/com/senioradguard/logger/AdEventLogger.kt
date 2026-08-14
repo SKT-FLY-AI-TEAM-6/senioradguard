@@ -1,7 +1,7 @@
 package com.senioradguard.logger
 
 import android.content.Context
-import com.senioradguard.remote.FirebaseRepo
+import com.senioradguard.remote.FamilyRepo
 import com.senioradguard.risk.RiskLevel
 
 /**
@@ -14,63 +14,67 @@ import com.senioradguard.risk.RiskLevel
  */
 object AdEventLogger {
 
+    /** 앱 컨텍스트를 들고 있는다. 서비스·액티비티 어디서 기록해도 같은 가족에 쌓인다. */
+    private lateinit var appContext: Context
+
     fun init(context: Context) {
-        FirebaseRepo.init(context)
+        appContext = context.applicationContext
+        FamilyRepo.init(appContext)
     }
 
     /** Layer 1·2가 광고를 표시했을 때. */
     fun logAdMarked(source: String, layer: Int, risk: RiskLevel, count: Int) {
-        FirebaseRepo.logEvent(
-            appPackage = source,
+        FamilyRepo.logEvent(
+            context = appContext,
+            packageName = source,
             type = if (layer == 1) TYPE_AD_LABELED else TYPE_AD_GUESSED,
             risk = risk,
             blocked = false,
-            layer = layer,
             count = count
         )
     }
 
     /** URL 차단 목록에 걸렸을 때. */
     fun logBlockedDomain(host: String, blocked: Boolean) {
-        FirebaseRepo.logEvent(
-            appPackage = host,
+        FamilyRepo.logEvent(
+            context = appContext,
+            packageName = host,
             type = TYPE_BLOCKED_DOMAIN,
             risk = RiskLevel.HIGH,
-            blocked = blocked,
-            layer = 3
+            blocked = blocked
         )
     }
 
     /** Layer 3 — 스토어 강제 이동 감지. */
     fun logStoreRedirect(storePackage: String) {
-        FirebaseRepo.logEvent(
-            appPackage = storePackage,
+        FamilyRepo.logEvent(
+            context = appContext,
+            packageName = storePackage,
             type = TYPE_STORE_REDIRECT,
             risk = RiskLevel.MEDIUM,
-            blocked = false,
-            layer = 3
+            blocked = false
         )
     }
 
     /** Layer 3 — 설치 유도 버튼 클릭에 경고를 띄웠을 때. */
     fun logInstallBlocked(packageName: String) {
-        FirebaseRepo.logEvent(
-            appPackage = packageName,
+        FamilyRepo.logEvent(
+            context = appContext,
+            packageName = packageName,
             type = TYPE_INSTALL_BLOCKED,
             risk = RiskLevel.HIGH,
-            blocked = true,
-            layer = 3
+            blocked = true
         )
     }
 
     /** Layer 3 — 사용자가 경고를 무시하고 "그냥 보기"를 골랐을 때. */
     fun logIgnored(packageName: String) {
-        FirebaseRepo.logEvent(
-            appPackage = packageName,
+        FamilyRepo.logEvent(
+            context = appContext,
+            packageName = packageName,
             type = TYPE_IGNORED,
             risk = RiskLevel.MEDIUM,
-            blocked = false,
-            layer = 3
+            blocked = false
         )
     }
 

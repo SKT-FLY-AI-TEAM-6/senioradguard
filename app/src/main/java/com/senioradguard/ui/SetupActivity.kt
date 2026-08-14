@@ -27,7 +27,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.senioradguard.MainActivity
-import com.senioradguard.remote.FirebaseRepo
 import com.senioradguard.remote.Role
 import com.senioradguard.ui.theme.SeniorAdGuardTheme
 
@@ -57,9 +56,17 @@ class SetupActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * 역할을 고르면 곧바로 다음 화면으로 보낸다. **로그인은 여기서 하지 않는다.**
+     *
+     * 앱을 처음 여는 사람에게 계정 선택 시트부터 들이밀면, 무엇을 하는 앱인지도
+     * 모르는 채 로그인을 요구받는다. 가족 연결이 실제로 필요한 지점(보호자의
+     * "가족 만들기", 어르신의 "코드 입력")에서 그때 묻는다. 로그인을 안 해도
+     * 광고 감지는 그대로 돈다.
+     */
     private fun choose(role: Role) {
-        FirebaseRepo.setRole(this, role)
-        if (role == Role.SENIOR) FirebaseRepo.ensureSettings()
+        getSharedPreferences("adguard_prefs", MODE_PRIVATE)
+            .edit().putString("role", role.wire).apply()
 
         val next = if (role == Role.SENIOR) MainActivity::class.java else GuardianActivity::class.java
         startActivity(Intent(this, next))

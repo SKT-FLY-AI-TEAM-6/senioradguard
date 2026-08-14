@@ -248,6 +248,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private var suppressAdClickUntil = 0L
 
     private var shieldActive = false
+
+    /**
+     * 선택 버튼(안전하게 돌아가기 / 그냥 볼게요)을 띄우고 사용자 결정을
+     * 기다리는 중인가. 이 상태는 시간이 지나도 걷지 않는다 — 위험 안내가
+     * 사용자 결정 없이 사라지면 안내의 의미가 없다. 대신 사용자가 뒤로가기·
+     * 홈으로 스스로 화면을 떠나면 함께 걷는다 (가림막이 폰을 잠그면 안 된다).
+     */
+    private var shieldAwaitingChoice = false
+
     private var navPollsLeft = 0
     private var urlSettleReadsLeft = 0
     private var lastSettleUrl: String? = null
@@ -819,11 +828,19 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // gclid류 클릭 추적 파라미터)이 웹 광고의 주 판별 경로다.
         val host = lastSourceKey
         if (host != null && host !in targetApps) {          // 크롬의 웹 호스트일 때만
-            if (prevChromeHost != null && host != prevChromeHost && !shieldActive) {
-                Log.i(TAG, "페이지 이동: $prevChromeHost → $host")
-                // 직전 호스트도 넘긴다 — 리다이렉터를 스쳐 지나간 것을 봤다면
-                // 최종 랜딩에서 확정적으로 잡는다
-                onNavigationDetected(readUrlBar(), cameFromHost = prevChromeHost)
+            if (prevChromeHost != null && host != prevChromeHost) {
+                // 선택 대기 중에 페이지가 바뀌었다 = 사용자가 뒤로가기 등으로
+                // 스스로 떠났다. 가림막을 걷고 새 이동을 평소대로 다룬다.
+                if (shieldAwaitingChoice) {
+                    Log.i(TAG, "가림막 해제 — 선택 대기 중 페이지 이동")
+                    dismissShieldNow()
+                }
+                if (!shieldActive) {
+                    Log.i(TAG, "페이지 이동: $prevChromeHost → $host")
+                    // 직전 호스트도 넘긴다 — 리다이렉터를 스쳐 지나간 것을 봤다면
+                    // 최종 랜딩에서 확정적으로 잡는다
+                    onNavigationDetected(readUrlBar(), cameFromHost = prevChromeHost)
+                }
             }
             prevChromeHost = host
         } else {
@@ -1147,7 +1164,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 Log.i(TAG, "고위험 차단 — $url")
             }
             RiskLevel.MEDIUM -> {
-                // 이유를 보여주고 사용자가 선택한다 (안내형 동작 — 균형형 투터치 정책은 4e)
+                // 이유를 보여주고 사용자가 선택한다 (안내형 동작 — 균형형 투터치 정책은 4e).
+                // 사용자가 결정할 때까지 걷지 않는다.
                 shieldOverlay.showChoice(
                     "⚠️", "조심하세요", assessment.reason,
                     "안전하게 돌아가기", {
@@ -1156,7 +1174,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
                     },
                     "그냥 볼게요", { dismissShieldNow() }
                 )
-                handler.postDelayed(dismissShieldRunnable, CHOICE_SHOW_MS)
+                startAwaitingChoice()
             }
             RiskLevel.LOW -> {
                 shieldOverlay.update("✅", "확인했어요", assessment.reason)
@@ -1183,7 +1201,31 @@ class AdGuardAccessibilityService : AccessibilityService() {
             },
             "그냥 볼게요", { dismissShieldNow() }
         )
-        handler.postDelayed(dismissShieldRunnable, CHOICE_SHOW_MS)
+        startAwaitingChoice()
+    }
+
+    /** 선택 대기 시작. 사용자가 화면을 떠났는지만 주기적으로 살핀다. */
+    private fun startAwaitingChoice() {
+        shieldAwaitingChoice = true
+        handler.postDelayed(choiceWatch, CHOICE_WATCH_MS)
+    }
+
+    /**
+     * 선택 대기 중 사용자가 뒤로가기·홈 등으로 크롬을 떠났는지 확인한다.
+     * 떠났으면 가림막도 걷는다 — 위험한 페이지를 이미 벗어났고, 런처 위에
+     * 가림막이 남으면 폰을 잠근 꼴이 된다.
+     */
+    private val choiceWatch = object : Runnable {
+        override fun run() {
+            if (!shieldActive || !shieldAwaitingChoice) return
+            val pkg = rootInActiveWindow?.packageName?.toString()
+            if (pkg != CHROME) {
+                Log.i(TAG, "가림막 해제 — 사용자가 화면을 떠남 (현재=$pkg)")
+                dismissShieldNow()
+            } else {
+                handler.postDelayed(this, CHOICE_WATCH_MS)
+            }
+        }
     }
 
     /** 어떤 경로로든 가림막이 이 시간 이상 "확인 중"이면 미확인으로 끝맺는다. */
@@ -1198,8 +1240,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
         handler.removeCallbacks(shieldTimeout)
         handler.removeCallbacks(urlSettle)
         handler.removeCallbacks(dismissShieldRunnable)
+        handler.removeCallbacks(choiceWatch)
         shieldOverlay.dismiss()
         shieldActive = false
+        shieldAwaitingChoice = false
     }
 
     override fun onInterrupt() {
@@ -1292,8 +1336,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
         /** 격리 분석(네트워크 수집 + 규칙 판정)의 시간 상한 */
         private const val ANALYZE_TIMEOUT_MS = 3_000L
 
-        /** 선택 버튼이 있는 결과(중위험·미확인)를 보여주는 최대 시간 — 이후 자동 해제 */
-        private const val CHOICE_SHOW_MS = 6_000L
+        /**
+         * 선택 대기 중 사용자가 화면을 떠났는지 확인하는 주기. 선택 화면은
+         * 시간으로 걷지 않는다 — 사용자 결정 또는 화면 이탈로만 끝난다.
+         */
+        private const val CHOICE_WATCH_MS = 1_500L
 
         /** 저위험 확인 표시를 보여주는 시간 */
         private const val OK_SHOW_MS = 900L

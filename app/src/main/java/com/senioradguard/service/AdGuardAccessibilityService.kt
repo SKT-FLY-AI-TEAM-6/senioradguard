@@ -275,6 +275,18 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private var lastPreWarnedLogged = -1
 
     /**
+     * 이번 가림막의 광고가 사용자를 다른 앱·화면으로 끌고 갔는가.
+     * 참이면 저위험이어도 "이전 화면으로 돌아가기" 선택지를 남긴다 —
+     * 팀원 ad_claude_fable NavigationGuard의 강제 이동 복귀 안내를 이식한 것.
+     * 그쪽은 이동 자체를 별도 추적하지만, 우리는 딥링크 이탈 감지가 이미
+     * 같은 순간을 더 정확히 알므로 안내 UX만 가져온다.
+     */
+    private var shieldDeepLinked = false
+
+    /** 선택 대기의 기준 화면(패키지) — 여기를 떠나면 가림막을 걷는다 */
+    private var choiceScreenPkg: String? = null
+
+    /**
      * 선택 버튼(안전하게 돌아가기 / 그냥 볼게요)을 띄우고 사용자 결정을
      * 기다리는 중인가. 이 상태는 시간이 지나도 걷지 않는다 — 위험 안내가
      * 사용자 결정 없이 사라지면 안내의 의미가 없다. 대신 사용자가 뒤로가기·
@@ -1073,6 +1085,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // 격리 분석기로 직접 따라가는 것이 최종 목적지를 보는 유일한 길이다.
         shieldEntryUrl = urlShown
         shieldCameFrom = cameFromHost
+        shieldDeepLinked = false
 
         // 이번 진입의 광고 지문 — 판정이 나오면 연계 저장한다.
         // 클릭 좌표로 특정된 것이 최우선이고, 없으면(웹 광고는 클릭 이벤트가 없다)
@@ -1149,6 +1162,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         var target = if (urlShown == null || backAtOrigin) shieldEntryUrl ?: urlShown else urlShown
         if (target !== urlShown) {
             Log.i(TAG, "딥링크 이탈 감지 — 진입 URL 체인을 직접 분석: ${target?.take(80)}")
+            shieldDeepLinked = true
         }
         // JS로만 넘어가는 경유지는 서버 체인으로 안 풀린다 — 쿼리에 내장된
         // 목적지(origUrl= 등)를 꺼내 이어간다 (실측: mjbiz → link.coupang.com).
@@ -1428,8 +1442,23 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 startAwaitingChoice()
             }
             RiskLevel.LOW -> {
-                shieldOverlay.update("✅", "확인했어요", assessment.reason)
-                handler.postDelayed(dismissShieldRunnable, OK_SHOW_MS)
+                if (shieldDeepLinked) {
+                    // 광고가 다른 앱·화면을 열었다 — 페이지는 안전해도 갑자기 옮겨진
+                    // 어르신에겐 돌아갈 길이 필요하다 (NavigationGuard 이식).
+                    shieldOverlay.showChoice(
+                        "✅", "확인했어요",
+                        "${assessment.reason}\n광고가 이 화면을 열었어요",
+                        "이전 화면으로 돌아가기", {
+                            performGlobalAction(GLOBAL_ACTION_BACK)
+                            dismissShieldNow()
+                        },
+                        "그냥 볼게요", { dismissShieldNow() }
+                    )
+                    startAwaitingChoice()
+                } else {
+                    shieldOverlay.update("✅", "확인했어요", assessment.reason)
+                    handler.postDelayed(dismissShieldRunnable, OK_SHOW_MS)
+                }
             }
         }
     }
@@ -1459,6 +1488,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
     /** 선택 대기 시작. 사용자가 화면을 떠났는지만 주기적으로 살핀다. */
     private fun startAwaitingChoice() {
         shieldAwaitingChoice = true
+        // 기준 화면을 지금 떠 있는 앱으로 기록한다 — 딥링크로 끌려간 앱 위에서도
+        // 안내가 유지되고, 그 앱을 떠나는 순간(스스로 복귀) 걷힌다.
+        choiceScreenPkg = rootInActiveWindow?.packageName?.toString() ?: CHROME
         handler.postDelayed(choiceWatch, CHOICE_WATCH_MS)
     }
 
@@ -1471,7 +1503,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         override fun run() {
             if (!shieldActive || !shieldAwaitingChoice) return
             val pkg = rootInActiveWindow?.packageName?.toString()
-            if (pkg != CHROME) {
+            if (pkg != null && pkg != choiceScreenPkg) {
                 Log.i(TAG, "가림막 해제 — 사용자가 화면을 떠남 (현재=$pkg)")
                 dismissShieldNow()
             } else {

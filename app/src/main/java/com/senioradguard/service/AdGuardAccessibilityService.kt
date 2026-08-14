@@ -920,9 +920,17 @@ class AdGuardAccessibilityService : AccessibilityService() {
         val viaChain = chainTracker.onHost(host)
 
         handler.post {
-            if (adClickTracker.consumePendingClick() || viaChain) {
+            if (viaChain) {
+                // 중계를 스쳐 지나온 **직후 도착한 주소**가 광고의 목적지다.
+                // 감시 창을 열어 기다릴 것 없이 여기가 답이다.
+                redirectWatchUntil = 0
+                Log.i(TAG, "광고 경유 도착: $host")
+                warnRedirect(host)
+                return@post
+            }
+            if (adClickTracker.consumePendingClick()) {
                 redirectWatchUntil = SystemClock.uptimeMillis() + REDIRECT_WATCH_MS
-                Log.i(TAG, "광고 경유 판단 — 이동 감시 시작 (중계=$viaChain)")
+                Log.i(TAG, "광고 클릭 후 이동 감시 시작")
             }
             checkRedirect(currentPackage())
         }
@@ -936,25 +944,34 @@ class AdGuardAccessibilityService : AccessibilityService() {
      */
     private fun checkRedirect(pkg: String?) {
         if (SystemClock.uptimeMillis() > redirectWatchUntil) return
+        if (pkg == null || pkg == packageName) return
 
-        if (RedirectRules.isRedirectPackage(pkg)) {
-            redirectWatchUntil = 0
-            warnRedirect(pkg!!)
-            return
-        }
-        val host = rootInActiveWindow?.let { urlGuard.hostOf(it) }
-        Log.i(TAG, "이동 감시: pkg=$pkg host=$host")
-        if (RedirectRules.isRedirectHost(host)) {
-            redirectWatchUntil = 0
-            warnRedirect(host!!)
-        }
+        // 브라우저 안에서의 이동은 onHostSeen이 처리한다. 여기서는 광고가 다른
+        // **앱**을 열어버린 경우만 본다 — 쿠팡 앱처럼 딥링크로 튀는 경우다.
+        if (pkg in UrlGuard.URL_BAR_IDS.keys) return
+        if (installGuard.isStorePackage(pkg)) return   // 스토어는 Layer 3이 담당
+
+        redirectWatchUntil = 0
+        Log.i(TAG, "광고 경유 앱 전환: $pkg")
+        warnRedirect(pkg)
     }
 
     /**
-     * 기능 1 — 광고를 눌러 쇼핑몰로 넘어왔다고 알린다.
+     * 기능 1 — 광고를 눌러 어딘가로 넘어왔다고 알린다.
      *
-     * 쿠팡·알리는 정상 쇼핑몰이다. 막을 대상이 아니라, **어르신이 광고를 누른 줄
-     * 모르고 끌려왔을 수 있다는 사실**을 알리는 것이 목적이다. 계속 보겠다면 둔다.
+     * ## 목적지를 목록으로 제한하지 않는다
+     * 처음에는 쿠팡·알리 등 쇼핑몰 네 곳만 대상으로 했다. 실기기에서 광고를 눌러
+     * 보니 목적지가 그 목록 밖이었다:
+     *
+     *   hankyung.com → googleads.g.doubleclick.net → omoney.kbstar.com (은행)
+     *   google.com   → tenbizt.com
+     *
+     * 어르신을 노리는 것은 쇼핑몰보다 대출·보험·경품 쪽이 많다. 목록을 늘리는
+     * 방식으로는 끝이 없고, 우리는 이미 "광고를 거쳐 왔는지"를 정확히 가려낸다.
+     * 그 사실 자체로 알리는 편이 목적에 맞다.
+     *
+     * 막지 않는다. 광고를 누른 줄 모르고 끌려왔을 수 있다는 것만 알리고,
+     * 계속 보겠다면 그대로 둔다.
      */
     private fun warnRedirect(key: String) {
         val name = RedirectRules.displayName(key)

@@ -19,6 +19,7 @@ import com.senioradguard.agent.GeminiClassifier
 import com.senioradguard.agent.StubClassifier
 import com.senioradguard.detector.UrlGuard
 import com.senioradguard.detector.db.AppDatabase
+import com.senioradguard.guard.AdClickTracker
 import com.senioradguard.guard.InstallGuard
 import com.senioradguard.guard.InstallSourceGuard
 import com.senioradguard.guard.RedirectRules
@@ -179,8 +180,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     private val installSourceGuard by lazy { InstallSourceGuard(this) }
 
-    /** 이미 안내한 쇼핑몰. 같은 화면에서 반복해 띄우면 쓸 수 없다. */
-    private val redirectShown = SightingLog()
+    /**
+     * "방금 광고를 눌렀는가"를 기억한다. 기능 1은 이 플래그가 있을 때만 발동한다 —
+     * 어르신이 스스로 쿠팡을 켠 경우까지 경고하면 멀쩡한 행동을 방해하게 된다.
+     */
+    private val adClickTracker = AdClickTracker()
 
     /**
      * 글자 없는 광고 이미지를 화면에서 읽는다. API 30부터만 가능하다 —
@@ -322,6 +326,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
         if (pkg !in targetApps) return
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
+            // 광고 위를 눌렀는지 본다. 접근성 이벤트는 손가락 좌표를 주지 않으므로
+            // 눌린 노드의 화면 영역과 광고 영역이 겹치는지로 판단한다.
+            val clicked = event.source?.let { node ->
+                Rect().also { node.getBoundsInScreen(it) }.toBounds()
+            }
+            if (adClickTracker.onClick(clicked)) {
+                Log.i(TAG, "광고 클릭 감지 — 화면 전환 감시 시작")
+            }
             val clickedText = event.contentDescription?.toString()
                 ?: event.text.joinToString(separator = " ")
             installGuard.onClick(clickedText, pkg)
@@ -668,12 +680,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         confirmedRegions = shifted
         aiRegions = guessed
+        adClickTracker.recordAdRegions((shifted + guessed).map { it.toBounds() })
         reportSighting(lastSourceKey, layer = 1, count = shifted.size, risk = RiskLevel.LOW)
         // 캐시로 되살린 표시는 확신도를 모른다. 중위험으로 둔다 —
         // 모르는 것을 고위험으로 올리면 사용자를 근거 없이 막게 된다.
         reportSighting(lastSourceKey, layer = 2, count = guessed.size, risk = RiskLevel.MEDIUM)
         scheduleLayer2()
     }
+
+    private fun Rect.toBounds() = AdClickTracker.Bounds(left, top, right, bottom)
 
     private fun List<Rect>.shiftedBy(dy: Int, pinned: Set<Rect> = emptySet()): List<Rect> =
         if (dy == 0 || isEmpty()) this
@@ -804,7 +819,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
      * 모르고 끌려왔을 수 있다는 사실**을 알리는 것이 목적이다. 계속 보겠다면 둔다.
      */
     private fun warnRedirect(key: String) {
-        if (!redirectShown.shouldReport(key, layer = 3)) return
+        // 광고를 눌러서 온 게 아니면 아무 말도 하지 않는다. 플래그는 한 번 쓰면
+        // 사라지므로 같은 클릭으로 두 번 뜨지 않는다.
+        if (!adClickTracker.consumePendingClick()) return
         val name = RedirectRules.displayName(key)
         Log.i(TAG, "광고 경유 이동 감지: $key")
 
@@ -817,7 +834,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
             currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() },
             onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) },
             blockLabel = "돌아가기",
-            confirmLabel = "계속 보기"
+            confirmLabel = "그냥 보기"
         )
         AdEventLogger.logStoreRedirect(key)
     }
@@ -842,8 +859,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
             onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
             currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() },
             onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) },
+            // "그래도 설치"를 넣지 않는다. 알 수 없는 출처의 APK에 그 버튼을 두면
+            // 경고가 형식이 되고, 어르신은 대개 오른쪽 버튼을 누른다.
             blockLabel = "설치 취소하고 돌아가기",
-            confirmLabel = "그래도 설치"
+            confirmLabel = null
         )
         AdEventLogger.logInstallBlocked("unknown_installer")
     }
@@ -874,8 +893,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
                 currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() },
                 onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) },
+                // 버튼은 하나뿐이다. 알려진 사기 사이트에 "그냥 보기"를 주면
+                // 그 선택지가 있다는 사실만으로 사용자가 눌러도 된다고 읽는다.
                 blockLabel = "안전하게 돌아가기",
-                confirmLabel = "그냥 보기"
+                confirmLabel = null
             )
         }
     }

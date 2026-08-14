@@ -93,8 +93,19 @@ AD_REDIRECT_PACKAGES = com.coupang.mobile, com.alibaba.aliexpresshd,
                        com.einnovation.temu, com.zzkko
 ```
 
-TYPE_WINDOW_STATE_CHANGED → 패키지 또는 주소창 도메인 대조 → 히트 시 오버레이
-("광고를 통해 {사이트명}으로 이동했습니다") · 주 버튼 "돌아가기" · 보조 "계속 보기".
+**반드시 "탐지된 광고 노드를 클릭한 직후"에만 발동한다.** 사용자가 직접 앱이나
+사이트를 켠 경우는 제외.
+
+```
+Layer 1/2가 광고 탐지 → bounds와 시각을 메모리에 기록
+TYPE_VIEW_CLICKED → 눌린 노드가 광고 bounds와 겹치는지 확인
+겹치면 → pendingAdClick 플래그 3초 TTL (메모리, DB 아님)
+TYPE_WINDOW_STATE_CHANGED → 플래그 유효 + 목록 매칭일 때만 오버레이, 플래그 즉시 소모
+플래그 없으면 → 오버레이 표시하지 않음
+```
+
+오버레이: "광고를 통해 {사이트명}으로 이동했습니다" ·
+주 버튼 "돌아가기" · 보조 "그냥 보기" · **두 버튼 크기 동일**.
 
 Room 테이블 만들지 않는다.
 
@@ -102,7 +113,8 @@ Room 테이블 만들지 않는다.
 DB 사용. `blacklist_domains` 서픽스 매칭.
 
 TYPE_WINDOW_STATE_CHANGED(브라우저) → 주소창 URL → 도메인 추출 → 대조 →
-히트 시 경고("위험한 사이트입니다") · 주 버튼 "안전하게 돌아가기".
+히트 시 경고("위험한 사이트입니다") · **버튼 하나만** "안전하게 돌아가기".
+무시/계속 보기 옵션을 넣지 않는다.
 
 초기 데이터는 `assets/blacklist.txt`를 첫 실행에 삽입.
 `BlacklistUpdateWorker`는 계속 비활성화(Phase 3).
@@ -111,7 +123,8 @@ TYPE_WINDOW_STATE_CHANGED(브라우저) → 주소창 URL → 도메인 추출 �
 DB 사용 안 함.
 
 패키지 인스톨러 화면 감지 → 설치 요청자가 `com.android.vending`인지 확인 →
-아니면 전체화면 경고 · 주 버튼 "설치 취소하고 돌아가기" · 보조 "그래도 설치".
+아니면 전체화면 경고 · **버튼 하나만** "설치 취소하고 돌아가기".
+"그래도 설치" 버튼을 넣지 않는다.
 
 시스템 설치 버튼은 직접 조작 불가. 오버레이로만 개입한다.
 완전 차단은 구현하지 않는다(Play 정책 위반).

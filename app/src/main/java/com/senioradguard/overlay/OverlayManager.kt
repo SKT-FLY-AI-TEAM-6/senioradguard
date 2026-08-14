@@ -43,7 +43,9 @@ class OverlayManager(private val context: Context) {
         // 앱을 나가는 것처럼 들리지만, 실제로 하는 일은 "쇼핑몰에서 원래 보던
         // 화면으로", "위험한 사이트에서 안전하게", "설치를 취소하고"로 각각 다르다.
         blockLabel: String = "뒤로 가기",
-        confirmLabel: String = "그냥 보기"
+        // null이면 보조 버튼을 만들지 않는다. 위험한 사이트나 알 수 없는 설치처럼
+        // "그대로 진행"이라는 선택지를 주면 안 되는 화면이 있다.
+        confirmLabel: String? = "그냥 보기"
     ) {
         if (overlayView != null) return // 이미 표시 중이면 중복 방지
 
@@ -86,7 +88,7 @@ class OverlayManager(private val context: Context) {
         onConfirm: () -> Unit,
         onBlock: () -> Unit,
         blockLabel: String,
-        confirmLabel: String,
+        confirmLabel: String?,
         currentForegroundPackage: () -> String?,
         onForceHome: () -> Unit
     ): View {
@@ -144,30 +146,38 @@ class OverlayManager(private val context: Context) {
             }
         }
 
-        // "그냥 보기" 버튼 (회색 — 덜 강조).
-        // "무시하기"는 무엇을 무시하는지가 모호해 노인 사용자가 멈칫한다.
-        // 실제로 하는 일("경고를 닫고 그대로 본다")을 그대로 적는다.
-        val confirmBtn = Button(context).apply {
-            text = confirmLabel
-            textSize = 18f
-            setTextColor(0xFF888888.toInt())
-            setBackgroundColor(0xFF333333.toInt())
-            setPadding(36, 24, 36, 24)
-            setOnClickListener {
-                cancelHomeFallback() // 무시하기를 누르면 예약된 2단계 홈 이동도 취소
-                dismiss()
-                onConfirm()
+        // 보조 버튼 (회색 — 덜 강조). "무시하기"는 무엇을 무시하는지가 모호해
+        // 노인 사용자가 멈칫한다. 실제로 하는 일을 그대로 적는다.
+        val confirmBtn = confirmLabel?.let { label ->
+            Button(context).apply {
+                text = label
+                textSize = 20f
+                setTextColor(0xFF888888.toInt())
+                setBackgroundColor(0xFF333333.toInt())
+                setPadding(36, 24, 36, 24)
+                setOnClickListener {
+                    cancelHomeFallback() // 계속 보기를 누르면 예약된 홈 이동도 취소
+                    dismiss()
+                    onConfirm()
+                }
             }
         }
 
-        // 마진 설정
-        val lp = LinearLayout.LayoutParams(
+        // 두 버튼을 같은 크기로 둔다. 한쪽이 크면 그쪽이 정답처럼 보이는데,
+        // 어느 쪽을 고를지는 사용자가 판단할 문제다.
+        val equal = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            .apply { setMargins(16, 0, 16, 0) }
+        val single = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { setMargins(16, 0, 16, 0) }
 
-        btnRow.addView(blockBtn, lp)
-        btnRow.addView(confirmBtn, lp)
+        if (confirmBtn == null) {
+            btnRow.addView(blockBtn, single)
+        } else {
+            btnRow.addView(blockBtn, equal)
+            btnRow.addView(confirmBtn, equal)
+        }
 
         root.addView(icon)
         root.addView(msgView)

@@ -24,8 +24,12 @@ object ClaudeApiJudge {
 
     private const val TAG = "AdGuard"
 
-    /** 비교 대상 모델. 최속·최저가 비교가 필요하면 claude-haiku-4-5로 바꿔 측정. */
-    private const val MODEL = "claude-opus-5"
+    /**
+     * 비교 대상 모델. 실측 이력:
+     * - claude-opus-5 (effort low): 5.4초, 프루지오 관심고객등록 폼을 잡아 중위험 상향
+     * - claude-haiku-4-5: 최속·최저가 측정용 (effort 미지원이라 조건 분기)
+     */
+    private const val MODEL = "claude-haiku-4-5"
 
     fun isAvailable(): Boolean = BuildConfig.CLAUDE_API_KEY.isNotBlank()
 
@@ -53,9 +57,14 @@ object ClaudeApiJudge {
                 MessageCreateParams.builder()
                     .model(MODEL)
                     .maxTokens(300L)
-                    // 두 줄짜리 분류라 저심도면 충분 — 지연 최소화가 목적
-                    .outputConfig(OutputConfig.builder().effort(OutputConfig.Effort.LOW).build())
                     .addUserMessage(LlmRiskJudge.buildPrompt(finalUrl, pageText))
+                    .apply {
+                        // 두 줄짜리 분류라 저심도면 충분 — 지연 최소화가 목적.
+                        // 단 effort는 Opus/Sonnet 5·4.6+ 전용이고 Haiku 4.5는 400을 낸다.
+                        if (MODEL.startsWith("claude-opus") || MODEL.startsWith("claude-sonnet")) {
+                            outputConfig(OutputConfig.builder().effort(OutputConfig.Effort.LOW).build())
+                        }
+                    }
                     .build()
             )
             val text = response.content()

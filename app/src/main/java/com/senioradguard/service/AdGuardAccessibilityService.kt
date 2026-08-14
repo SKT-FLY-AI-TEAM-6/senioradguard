@@ -1069,6 +1069,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun resolveShield(urlShown: String?) {
         val normalized = urlShown?.let { UrlNormalizer.normalize(it) }
         if (normalized == null) {
+            // 주소창 읽기가 끝까지 실패한 드문 케이스 (실측: 프루지오 진입 1회).
+            // 로그 없이 죽으면 디버깅이 불가능해 흔적을 남긴다.
+            Log.i(TAG, "주소 확보 실패 — 가림막 미확인 종료")
             finishShieldUnverified("주소를 확인하지 못했어요")
             return
         }

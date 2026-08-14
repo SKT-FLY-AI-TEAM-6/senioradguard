@@ -350,7 +350,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             installGuard.isStorePackage(pkg)
         ) {
-            installGuard.onStoreRedirect(pkg)
+            // 스토어를 열었다는 것만으로는 개입하지 않는다. 어르신이 스스로 Play
+            // 스토어를 켠 경우까지 "뒤로 갈까요?"가 뜨면, 앱이 정상적인 사용을
+            // 방해하는 물건이 된다. 광고를 거쳐 왔다는 증거가 있을 때만 끼어든다.
+            if (consumeAdEvidence()) installGuard.onStoreRedirect(pkg)
             return
         }
 
@@ -844,6 +847,24 @@ class AdGuardAccessibilityService : AccessibilityService() {
             getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_AI_CLASSIFY, false)
 
     private fun currentPackage(): String? = rootInActiveWindow?.packageName?.toString()
+
+    /**
+     * 광고를 거쳐 여기까지 왔는가. **증거가 없으면 어떤 개입도 하지 않는다.**
+     *
+     * 뒤로 가기는 사용자가 하던 일을 되돌리는 동작이라, 근거 없이 권하면 정상적인
+     * 사용을 방해한다. 실제로 어르신이 직접 Play 스토어를 켰을 때도 경고가 떴다.
+     *
+     * 증거는 둘 중 하나다 — 광고 노드를 눌렀거나(네이티브 앱), 중계 도메인을
+     * 스쳐 지나왔거나(웹). 한 번 쓰면 사라진다.
+     */
+    private fun consumeAdEvidence(): Boolean {
+        if (adClickTracker.consumePendingClick()) return true
+        if (SystemClock.uptimeMillis() <= redirectWatchUntil) {
+            redirectWatchUntil = 0
+            return true
+        }
+        return false
+    }
 
     /**
      * 스캔이 읽은 주소가 직전과 다르면 화면이 바뀐 것으로 본다.

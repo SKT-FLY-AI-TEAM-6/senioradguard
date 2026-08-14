@@ -37,13 +37,16 @@ class Anchor private constructor(
      * 노드가 죽었거나 텍스트가 하나도 없으면 null.
      * IPC가 노드 수만큼 발생하므로 영역이 새로 나타난 스캔에서만 부른다.
      */
-    fun gatherText(maxNodes: Int = 40): List<String>? {
+    fun gatherText(maxNodes: Int = 120): List<String>? {
         if (!node.refresh()) return null
         val texts = mutableListOf<String>()
         val descs = mutableListOf<String>()
         var visited = 0
         fun walk(n: AccessibilityNodeInfo, depth: Int) {
-            if (depth > 15 || visited >= maxNodes) return
+            // iframe 광고(쿠팡 파트너스·구글 디스플레이)는 래퍼→iframe→html→body로
+            // 중첩이 깊어 depth 15·노드 40으로는 텍스트에 닿기 전에 끝났다
+            // (실측: 연합뉴스TV에서 지문 수집 미완 2/2 반복 → 초록 표시 불가)
+            if (depth > 25 || visited >= maxNodes) return
             visited++
             n.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { texts.add(it) }
             n.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { descs.add(it) }

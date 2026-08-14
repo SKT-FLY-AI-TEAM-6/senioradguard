@@ -1,296 +1,397 @@
-# GuArDian — 광고 감지 코어 (2-Layer 재구축)
+# 검색창 사이트 위험도 분석 (Search Site Risk AI)
 
-> **이 브랜치는 `integration/2layer`다.** 발표 아키텍처(2-Layer + 상시 액션바)로
-> 감지 코어를 재구축한 버전이고, **`main`은 건드리지 않는다.**
-> `main`은 senioradguard에서 카카오 연동만 걷어낸 3-Layer 린 버전이 계속 돈다.
-
-노인 사용자가 광고를 광고로 인식하지 못해 불필요한 앱을 설치하거나 개인정보를
-입력하는 피해를 막기 위한 Android 앱.
+> **이 브랜치는 `feat/search-site-analysis-ai`다.**
+> 역할 분담 중 **"구글·크롬 검색 결과에서 사이트마다 위험도 상·중·하를 붙이는 기능"** 하나만 담는다.
+> 광고 감지·광고 닫기·전환 탈출은 다른 팀원의 브랜치에서 따로 온다.
 
 ---
 
-## main과 무엇이 다른가
+## 1. 무엇을 푸는가
 
-| | `main` (린 버전) | `integration/2layer` (이 브랜치) |
+어르신이 **"드라마 다시보기"** 를 검색하면 이런 화면이 나온다.
+
+```
+티비핫        https://tvhot2.com        ← 불법 다시보기
+누누티비      https://nooo16.tv         ← 불법 다시보기
+KBS 다시보기  https://vod.kbs.co.kr     ← 공식 서비스
+주소월드      http://homepy.korean.net  ← 불법 사이트 링크 모음
+```
+
+**전부 똑같이 생겼다.** 광고가 아니므로 광고 감지는 아무것도 표시하지 않고, 어르신 입장에서는
+맨 위에 있는 것을 누른다. 실제로 이 검색어의 1·2위가 불법 사이트다(2026-08-14 실측).
+
+이 기능은 결과 하나하나에 **상(위험) · 중(주의) · 하(안전)** 를 붙인다.
+누르기 **전에** 보여야 의미가 있으므로 자동으로 돈다.
+
+---
+
+## 2. 핵심 결정: 그림이 아니라 글자를 본다
+
+원래 구현(senioradguard V3)은 검색 결과도 **스크린샷을 찍어 비전 모델**에 보냈다.
+광고 배너와 같은 경로를 썼기 때문이다.
+
+배너에는 그럴 이유가 있다 — 그림 한 장이라 무엇을 파는지 알려면 픽셀을 봐야 한다.
+**검색 결과는 다르다. 도메인·제목·설명이 전부 접근성 트리에 글자로 들어 있다.**
+
+| 비전 경로에서 필요했던 것 | 이 구현 |
+|---|---|
+| 스크린샷 권한 · 호출 간격 제한 | 없음 |
+| 비트맵 복사 → 크롭 → 그레이스케일 → JPEG 인코딩 | 없음 |
+| dHash 지문 · 이웃 지문 비교 | 호스트 문자열이 곧 캐시 키 |
+| 이미지 토큰(장당 수백~수천) | 텍스트 1.2k 토큰 / 화면 |
+| "화면 그림이 통째로 나간다"는 프라이버시 부담 | 검색 결과에 **이미 공개된** 제목·도메인만 |
+
+---
+
+## 3. 아키텍처
+
+```mermaid
+flowchart TB
+    subgraph AND["안드로이드"]
+        EV["접근성 이벤트<br/>크롬 · 구글 앱"]
+        TREE["접근성 트리<br/>(도메인·제목·설명이 글자로)"]
+    end
+
+    subgraph SERP["com.guradian.serp — 이 브랜치가 담는 전부"]
+        FEAT["SerpFeature<br/><i>서비스와 닿는 유일한 지점</i>"]
+        TRACK["SerpTracker<br/><b>좌표</b> — 매 스캔마다 새로 읽음"]
+        SCAN["SerpScanner<br/>결과 카드 추출"]
+        ENGINE["SerpRiskEngine<br/><b>판정</b> — 호스트에 붙음"]
+        RULES["SerpRules + UrlSignals<br/>규칙 신호 · 네트워크 0"]
+        SITES["KnownSites<br/><i>목록 교체 지점</i>"]
+        CLS["GeminiSerpClassifier<br/>텍스트 배치 판별"]
+        OVL["SerpBadgeOverlay<br/>상·중·하 배지"]
+    end
+
+    GEM["Gemini API<br/>화면당 1회"]
+
+    EV --> FEAT --> TRACK
+    TRACK -->|"트리 순회"| SCAN
+    SCAN -->|"host·title·snippet"| TRACK
+    TRACK -->|"판정 요청 (유휴 시)"| ENGINE
+    ENGINE --> RULES
+    RULES -.-> SITES
+    ENGINE -->|"규칙·캐시로 결론 안 난 것만"| CLS
+    CLS <-->|"배치 1회"| GEM
+    TRACK -->|"host로 판정 조회"| ENGINE
+    TRACK -->|"좌표 + 판정"| OVL
+    TREE -.-> SCAN
+
+    style ENGINE fill:#e8f5e9,stroke:#43a047,stroke-width:2px
+    style TRACK fill:#fff3e0,stroke:#fb8c00,stroke-width:2px
+    style FEAT fill:#e3f2fd,stroke:#1e88e5,stroke-width:2px
+    style GEM fill:#f3e5f5,stroke:#8e24aa
+```
+
+### 설계의 심장 — 판정과 좌표를 분리한다
+
+처음 구현은 `evaluate()`가 **"이 사각형에 이 판정"** 을 함께 돌려줬다. 판정과 좌표가 한 덩어리라
+**화면이 움직이면 판정까지 같이 못 쓰게 됐고**, 실기기에서 두 가지로 터졌다.
+
+- 스크롤하면 배지가 통째로 사라짐 (좌표가 낡았다는 이유로 판정까지 버림)
+- 판별기 응답이 **100% 버려짐** (돌아왔을 때 좌표가 이미 달라져 있음)
+
+그래서 둘을 갈랐다.
+
+| | 무엇에 붙는가 | 누가 들고 있는가 | 언제 갱신되는가 |
+|---|---|---|---|
+| **판정** | 호스트 (`tvhot2.com → 위험`) | `SerpRiskEngine` | 유휴 700ms 뒤 1회 |
+| **좌표** | 화면 (`Rect`) | `SerpTracker` | 이벤트마다 (150ms 스로틀) |
+
+그리기는 항상 `anchors`(좌표)를 돌며 `engine.known(host)`(판정)를 조회한다.
+이렇게 하면 두 결함이 **고쳐지는 게 아니라 존재할 수 없게 된다** —
+스크롤하면 좌표만 새로 읽어 다시 그리고, 응답이 5초 뒤에 와도 호스트에 얹으면 그 시점 좌표에
+저절로 붙는다. 화면 세대(generation) 비교 코드는 통째로 삭제됐다.
+
+---
+
+## 4. AI가 분석하는 트리거 — 네 개의 관문
+
+판별기(Gemini)는 아래를 **모두** 통과했을 때만 호출된다.
+
+```mermaid
+flowchart TD
+    E["접근성 이벤트"] --> G1
+
+    G1{"① 화면 관문<br/>지금 검색 결과 화면인가?"}
+    G1 -->|"아니오"| X1["끝. 트리를 훑지도 않는다<br/>(뉴스 볼 땐 완전히 잠듦)"]
+    G1 -->|"크롬: 주소가 검색 URL<br/>구글 앱: 검색창에 글자"| G2
+
+    G2{"② 유휴 관문<br/>700ms 조용해졌나?"}
+    G2 -->|"아니오 (스크롤 중)"| P["위치만 따라간다<br/>판별기 호출 없음"]
+    G2 -->|"예"| G3
+
+    G3{"③ 변경 관문<br/>호스트 구성이 직전과 다른가?"}
+    G3 -->|"같음"| C1["캐시된 판정 그대로"]
+    G3 -->|"다름"| G4
+
+    G4{"④ 미지 관문<br/>결론이 안 난 결과가 있나?"}
+    G4 -->|"규칙이 '위험' 확정"| R1["즉시 빨강<br/>누누티비·도박·성인<br/><b>네트워크 0</b>"]
+    G4 -->|"알려진 곳 + 위험신호 0"| R2["초록<br/>티빙·넷플릭스·KBS"]
+    G4 -->|"캐시에 있음 (7일)"| R3["캐시 판정"]
+    G4 -->|"처음 보는 도메인"| AI["<b>배치 1회 호출</b><br/>화면당 1번"]
+
+    style AI fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px
+    style X1 fill:#eceff1
+    style R1 fill:#ffebee
+    style R2 fill:#e8f5e9
+```
+
+**호출은 항목당이 아니라 화면당 1회다.** 남은 항목이 2개든 8개든 한 배치로 묶어 보낸다.
+결과당 부르면 검색 한 번에 8건이 나가고, 배치로 묶으면 모델이 결과들을 **서로 비교해서**
+볼 수 있다 — "이 목록에서 tving.com이 정상이고 tvhot2.com이 그 흉내"라는 판단은
+따로 볼 때보다 함께 볼 때 잘 나온다.
+
+추가 안전장치: 화면당 최대 8건, 시간당 30회 토큰버킷, 429 응답 시 5분 쿨다운.
+
+### 왜 버튼을 누를 때가 아닌가
+
+광고 판별은 `[광고 찾기]`를 눌러야 돈다. 검색 결과는 그럴 수 없다 — 위험도는 **누르기 전에**
+보여야 하고, 검색할 때마다 버튼을 한 번 더 누르게 하면 어르신은 그냥 안 누른다.
+대신 나가는 정보를 줄였다: 화면 그림도 페이지 본문도 아닌, **검색 결과에 이미 공개돼 있는
+제목·설명·도메인**만 나간다.
+
+---
+
+## 5. 위험도 상·중·하를 만드는 법
+
+```
+점수 = 가장 강한 신호 + (나머지 신호 합 ÷ 3) + 신뢰 가산(음수)
+등급 = 확인 안 됨(표시 없음) / 0~39 하(초록) / 40~69 중(주황) / 70~100 상(빨강)
+```
+
+신호를 전부 더하지 않는다. 더하면 사소한 신호 다섯 개가 확정 신호 하나를 이겨버리고,
+규칙을 하나 추가할 때마다 기존 판정이 통째로 흔들린다.
+
+**확정 신호(hard)는 하한이 된다.** 판별기가 "안전하다"고 답해도 그 아래로는 안 내려간다.
+신뢰 가산은 하한에 반영하지 않는다 — 네이버 카페라는 사실이 그 글이 도박을 권한다는 사실을
+지워주지 않기 때문이다.
+
+### 네 번째 등급 — '확인 안 됨'
+
+**"걸린 규칙이 없다"는 '안전'이 아니다.** 우리 목록은 작고 앞으로도 완결되지 않는다
+(불법 사이트는 차단되면 숫자만 바꿔 되살아난다: `tvhot2` → `tvhot3`, `noonoo` → `nooo16`).
+그 상태에서 0점을 초록으로 옮기면 **모르는 사이트 전부에 안전 도장을 찍게 된다.**
+
+그래서 초록은 근거가 있을 때만 붙는다 — 알려진 곳 목록에 있거나, 판별기가 실제로 보고
+안전하다고 했을 때. 그 외에는 아무것도 그리지 않는다.
+다만 침묵과 무시는 다르다. 위험 신호가 잡혔으면 판별기가 없어도 경고는 남는다.
+
+### 규칙이 단독으로 끝내는 경계를 70에 둔 이유
+
+표본 27건으로 두 경계를 다 돌려봤다.
+
+| 규칙 확정 경계 | 규칙이 끝내는 비율 | 규칙의 오답 |
 |---|---|---|
-| 레이어 | 3-Layer (감지 / AI / 설치차단) | **2-Layer + 액션바** |
-| Layer 2 실행 | 스크롤 멈춘 뒤 600ms 자동 | **[광고 찾기]를 누를 때만** |
-| 대응 UI | 전체 화면 경고 팝업 (터치 가로챔) | **상시 액션바, 화면을 막지 않음** |
-| 광고 닫기 | 없음 | 어포던스 탐지 → 대리 클릭 |
-| 저장소 | Room | `VerdictStore` 인메모리 (task 4에서 교체) |
-| 로그 | `AdEventLogger` | `DetectionLog` (원문이 못 들어가는 시그니처) |
-| 악성 URL | 블랙리스트 dead code | `MaliciousUrlSource` (항상 false, 크롬 한정) |
-| 의존성 | Room · WorkManager 포함 | **Kotlin + Compose + Coroutines만** |
+| 40 ('주의' 이상) | 25/27 | **2건** — APK 배포·IP 직결 사이트를 '중'으로 확정 (판별기는 90점대 '상') |
+| **70 ('위험' 이상)** | 20/27 | **0건** |
 
-**가장 큰 변화는 Layer 2의 트리거다.** 화면 텍스트가 외부로 나가는 유일한 지점이
-사용자의 명시적 동작과 1:1로 대응하게 만들었다. 자동 실행 경로(`scheduleLayer2` /
-`LAYER2_IDLE_MS`)는 아예 만들지 않았다.
+규칙이 확정하면 판별기는 그 항목을 보지 못하므로 **틀려도 고칠 기회가 없다.**
+'주의'는 정의상 확신이 없다는 뜻이고, 확신이 없으면 넘기는 것이 문지기의 계약이다.
+비용은 거의 그대로다 — 호출이 화면당 1회라 판별기로 내려가는 항목이 2개든 12개든 같다.
 
 ---
 
-## task 매핑 — Layer 3은 다섯 갈래로 흩어진다
+## 6. 목록이 작아도 무너지지 않는 구조
 
-이 재구축의 핵심이다. 원본 `guard/InstallGuard.kt` 하나가 하던 일이 이렇게 나뉜다.
+규칙 목록(`KnownSites`)은 완결될 수 없다. 그래서 **목록에 기대지 않도록** 설계했다.
 
-| 원본 InstallGuard의 책임 | 새 위치 | task |
+```mermaid
+flowchart LR
+    S["검색 결과<br/>한 칸"] --> R{"규칙"}
+    R -->|"목록에 있음"| F["공짜로 즉시 판정<br/>네트워크 0"]
+    R -->|"목록에 없음"| A{"판별기"}
+    A -->|"응답"| J["AI 판정<br/>(하한은 규칙이 받침)"]
+    A -->|"키 없음·상한·오프라인"| U{"위험 신호가<br/>하나라도?"}
+    U -->|"있음"| W["경고는 남긴다"]
+    U -->|"없음"| N["<b>확인 안 됨</b><br/>아무것도 안 그림"]
+
+    style F fill:#e8f5e9
+    style J fill:#f3e5f5
+    style N fill:#eceff1
+    style W fill:#fff3e0
+```
+
+- 목록이 커질수록 **호출이 줄어들 뿐**, 목록이 작다고 기능이 망가지지 않는다
+- 목록은 `KnownSites` 인터페이스 뒤에 있다. 방송통신심의위원회·KISA 피드가 생기면
+  **구현 하나만 갈아끼우면 된다** — 판정 코드는 손대지 않는다
+- `BuiltInKnownSites + FeedSites` 처럼 더하면 씨앗을 지우지 않고 얹힌다.
+  피드를 못 받아도 최소한 씨앗만큼은 계속 동작한다
+
+실기기에서 이 구조가 실제로 값을 했다. 우리 목록에 있던 `tvhot2.com` 옆에,
+목록에 **없던** `nooo16.tv`·`m.dcinside.com`(누누티비 접속 주소 공유 글)·
+`dunakavicsv8.hu`(제목은 뉴스처럼 보이는 헝가리 랜덤 도메인)가 나란히 떴고,
+**뒤의 셋은 전부 AI가 잡았다.**
+
+---
+
+## 7. 스크롤을 어떻게 따라가는가
+
+```mermaid
+sequenceDiagram
+    participant U as 사용자
+    participant T as SerpTracker
+    participant S as SerpScanner
+    participant E as SerpRiskEngine
+    participant O as 배지 오버레이
+
+    U->>T: 스크롤 (100ms마다 이벤트)
+    T->>O: offsetBy(-dy) — 즉시 임시 보정
+    Note over T: 150ms 스로틀 · 요청은 버리지 않고 미룸
+    T->>S: 좌표만 다시 읽기 (노드 예산 900)
+    S-->>T: anchors 갱신
+    T->>E: known(host) — 이미 아는 판정
+    T->>O: 정확한 자리에 다시 그림
+
+    U->>T: 손을 뗌
+    Note over T: 700ms 조용
+    T->>E: evaluate(query, results)
+    E-->>T: 판정 (필요하면 Gemini 배치 1회)
+    T->>O: 다시 그림 — <b>늦게 와도 버리지 않는다</b>
+```
+
+곁들인 장치 셋(전부 팀의 `BorderTracker`가 광고 테두리에서 쓰던 것과 같다):
+
+- **요청을 버리지 않는다** — 스로틀·스캔 중에 온 요청은 트레일링으로 미룬다.
+  버리면 드래그의 마지막 위치를 잃어 손 뗀 자리에서 배지가 어긋난 채 멈춘다
+- **되밀기 보정** — 스캔이 도는 동안 더 구른 만큼(`scrollSinceScanStart`) 결과를 되민다.
+  안 하면 배지가 뒤로 튄다
+- **빈 화면 히스테리시스** — 결과를 못 찾은 스캔이 3번 연속돼야 지운다.
+  한 번에 지우면 지연 로딩·예산 절단마다 배지가 깜빡이고, 정작 위험한 결과 위에서 경고가 사라진다
+
+### 화면을 벗어날 때
+
+검색 화면을 떠나 가는 곳(런처·잠금화면·다른 앱)은 우리 `packageNames`에 없다.
+**"이제 지워라"고 알려줄 이벤트가 아예 오지 않는다** — 실기기에서 잠금화면 위에 빨간 테두리가
+그대로 남았다. 이벤트에만 기대는 구조의 구멍이라 두 가지로 메웠다.
+
+- **재확인 타이머(1초)** — 배지가 떠 있는 동안만 스스로 화면을 확인하고, 검색 결과가 아니면 지운다
+- **`ACTION_SCREEN_OFF` 브로드캐스트** — 화면이 꺼지는 순간은 확실한 신호라 기다리지 않고 즉시 지운다
+
+---
+
+## 8. 크롬과 구글 앱, 둘 다 본다
+
+어르신이 구글 검색을 쓰는 경로는 크롬만이 아니다. 홈 위젯·구글 앱이 오히려 흔하다.
+
+| | 화면 판정 근거 | 검색어 |
 |---|---|---|
-| `storePackages` 매칭 | `rule/EscapeRules` | **1** (룰 판정) |
-| `InstallTriggerRules.isInstallTrigger()` | `rule/EscapeRules` | **1** (룰 판정) |
-| `GLOBAL_ACTION_BACK` + HOME 폴백 | `action/EscapeAction` | **3** |
-| `OverlayManager.showWarning()` (경고 UI) | `action/ActionBar` | **2** (액션바 공유) |
-| `AdEventLogger` 기록 | `store/DetectionLog` | **4** (이 저장소 범위 밖) |
-| `KakaoNotifier` 전송 | 없음 | **5** (이 저장소 범위 밖) |
+| **크롬** | 주소창이 `google.com/search`·`search.naver.com`·`search.daum.net`… | 주소의 `q=` |
+| **구글 앱** | 주소창이 **없다.** `googleapp_srp_search_box_text`에 글자가 있는지 | 그 노드의 텍스트 |
 
-**"Layer 3 = task 3"이 아니다.** 판정은 task 1로 내려가고, UI는 task 2가 만드는
-액션바에 얹히고, 기록·알림은 이 저장소를 떠난다. task 3에 남는 것은 **탈출 동작
-그 자체**뿐이다.
+구글 앱에서 이 값이 중요한 이유가 둘이다.
 
-그래서 **task 3은 task 2 없이 완성될 수 없다.** 실제 순서는 task 2 → task 3이다.
-
-### 저장소 범위
-
-```
-GuArDian = task 1 + task 2 + task 3
-           (감지 · 닫기 · 탈출 — 전부 기기 안에서 끝나는 것)
-
-범위 밖  = task 4 (DB · 서버 · 로그 집계)
-           task 5 (가족 그룹 · Insight Report · 카카오)
-```
-
-범위 밖이라도 **붙일 자리는 남겼다.** `store/`의 인터페이스 셋이 그 이음매고,
-**구현체는 전부 no-op이지만 호출부는 전부 배선돼 있다.** 호출부가 없으면 나중에
-붙일 때 서비스를 다시 뜯어야 한다.
+1. 검색 완료 화면에는 **편집 가능한 노드가 하나도 없다.** 입력창(EditText)을 찾으면
+   검색어를 영영 못 읽는다 — 실기기 트리 덤프로 확인했다
+2. id의 `srp`는 search results page다. **이 노드의 존재 자체가 검색 결과 화면이라는 뜻**이라,
+   검색어를 읽는 일과 화면을 판정하는 일이 한 번에 끝난다.
+   패키지명만으로 통과시키면 홈 피드(큰 카드가 잔뜩 있고 검색창은 비어 있다)까지 계속 훑게 된다
 
 ---
 
-## 흐름
+## 9. 다른 task와의 독립성 — 병합을 위한 설계
 
-```
-onAccessibilityEvent(event)
-│
-├─ Layer 1 (룰 판정) — 항상, 자동
-│  ├─ RuleEngine.scan(root)        → List<Rect> → BorderTracker → 실선 테두리
-│  ├─ RuleEngine.checkPackage(pkg) → Escape(STORE_REDIRECT)
-│  ├─ RuleEngine.checkClick(text)  → Escape(INSTALL_TRIGGER)
-│  └─ RuleEngine.checkUrl(root)    → Escape(MALICIOUS_URL)   ※ 크롬 한정, 지금은 항상 null
-│
-├─ Layer 2 (Agent) — [광고 찾기]를 누를 때만
-│  └─ findAdsNow() → AgentPipeline → List<Rect> → 점선 테두리
-│     (캐시만 보는 스크롤 경로는 유지 — 판별한 카드는 스크롤해도 점선이 따라온다)
-│
-└─ ActionBar (대응) — 주 버튼 하나
-   우선순위: BUSY > [돌아가기] > [광고 닫기] > [광고 찾기] > 없음
-```
+안드로이드 접근성 서비스는 앱에 **하나뿐**이라, 모든 task가 같은 파일 한 곳으로 이벤트를 받는다.
+각 task가 그 파일에 필드와 분기를 흩뿌리면 병합할 때마다 같은 자리에서 충돌한다.
 
-## 파일 구조
-
-```
-app/src/main/java/com/guradian/
-├── service/
-│   └── GuardianAccessibilityService.kt   단일 진입점. 레이어 배분만
-│
-├── rule/                                 ← Layer 1 · task 1
-│   ├── AdLabelRules.kt                   광고 라벨/컨테이너 id 판정 (순수 함수)
-│   ├── AdRegionScanner.kt                노드 트리 순회 → 광고 영역
-│   ├── EscapeRules.kt                    스토어 패키지 + 위험 문구 판정 (순수 함수)
-│   ├── BrowserHost.kt                    크롬 주소창 → host
-│   └── RuleEngine.kt                     위 넷의 단일 진입점
-│
-├── agent/                                ← Layer 2 · task 1
-│   ├── AdCandidate.kt
-│   ├── CandidateExtractor.kt             Agent1
-│   ├── AdClassifier.kt                   인터페이스 (교체점)
-│   ├── GeminiClassifier.kt               HttpURLConnection 직접 호출
-│   ├── StubClassifier.kt                 키 없을 때 규칙 기반 대역
-│   ├── CrossValidator.kt                 Agent4
-│   ├── AgentPipeline.kt                  캐시 → 판별 → 표시
-│   ├── CardText.kt                       마스킹 · 정규화 · 캐시 키
-│   └── RateLimiter.kt                    토큰버킷
-│
-├── action/                               ← task 2 · task 3
-│   ├── ActionBar.kt                      상시 액션바 (순수 View)
-│   ├── ActionBarState.kt                 주 버튼 상태 머신 (순수 함수)
-│   ├── CloseAffordanceFinder.kt          task 2 — 닫기·건너뛰기 탐지
-│   └── EscapeAction.kt                   task 3 — BACK + HOME 폴백
-│
-├── overlay/
-│   ├── AdBorderOverlay.kt                비차단 테두리 (실선/점선)
-│   └── BorderTracker.kt                  스캔 주기 · 스크롤 추종 · 히스테리시스
-│
-├── store/                                ← 이음매 (task 4가 여기에 붙는다)
-│   ├── VerdictStore.kt                   interface + InMemoryVerdictStore
-│   ├── DetectionLog.kt                   interface + NoopDetectionLog
-│   └── MaliciousUrlSource.kt             interface + EmptyMaliciousUrlSource
-│
-├── ui/
-│   ├── ServiceStatus.kt
-│   └── BatteryOptimizationGuide.kt
-├── MainActivity.kt                       상태 화면 + AI 판별 토글
-└── GuardianApp.kt                        Application
-```
-
----
-
-## 이음매 세 개
+그래서 이 기능이 서비스에 요구하는 것을 **여섯 줄로 줄였다.**
 
 ```kotlin
-// store/VerdictStore.kt
-interface VerdictStore {
-    suspend fun get(key: String): Verdict?
-    suspend fun put(key: String, verdict: Verdict)
-}
-// 지금: InMemoryVerdictStore(maxEntries = 500, ttlMillis = 30일)
-// task 4: RoomVerdictStore
+// 1) 필드 하나
+private val serp by lazy { SerpFeature(this, scope, BuildConfig.GEMINI_API_KEY) }
 
-// store/DetectionLog.kt
-interface DetectionLog {
-    fun onAdDetected(source: String, count: Int, aiGuessed: Boolean)
-    fun onAdClosed(source: String, succeeded: Boolean)
-    fun onEscape(reason: EscapeReason, hostHash: String?)
-}
-// 지금: NoopDetectionLog (Log.i 한 줄만)
-// task 4: RoomDetectionLog + 서버 전송 큐
+// 2) 이벤트 필터에 우리 앱을 더한다 (구글 앱이 targetApps에 없기 때문)
+packageNames = (targetApps + storePackages + SerpFeature.PACKAGES).toTypedArray()
 
-// store/MaliciousUrlSource.kt
-interface MaliciousUrlSource {
-    suspend fun isMalicious(host: String): Boolean
-}
-// 지금: EmptyMaliciousUrlSource — 항상 false
-// task 4: KISA 공공데이터포털 기반 구현
+// 3) dispatch에서 한 줄 — targetApps 필터보다 앞에
+serp.onEvent(event, pkg)
+
+// 4) 정리 — onInterrupt()와 onDestroy()에 각각
+serp.stop()
 ```
 
-**`DetectionLog`에는 화면 텍스트 원문이 들어가지 않는다.** "보내지 않는다 — 화면
-텍스트 원문 · URL 전문"을 문서가 아니라 **인터페이스 시그니처 단계에서 강제**한다.
-`hostHash`는 `DetectionLog.hashHost()`가 만드는 SHA-256이다. 나중에 구현체를
-잘못 만들어도 원문이 새어나갈 통로 자체가 없다.
+**`com.guradian.serp` 패키지는 자기 밖의 어떤 클래스도 import하지 않는다**
+(안드로이드 SDK와 코루틴 제외). 패키지를 통째로 복사해 다른 저장소·다른 패키지명으로 옮겨도
+그대로 컴파일된다.
 
-**이 규칙을 깨는 파라미터를 추가하지 말 것.** 원문이 필요해 보이면 그건 집계
-방식을 다시 생각해야 한다는 신호다.
-
----
-
-## 액션바 — "큰 버튼 하나"
-
-| 상황 | 주 버튼 | 색 | 동작 |
-|---|---|---|---|
-| 진행 중 | **찾는 중…** | 회색 | (비활성) |
-| Escape 상태 | **돌아가기** | 빨강 | BACK → 안 바뀌면 HOME |
-| 광고 테두리 있음 | **광고 닫기** | 주황 | 어포던스 탐지 → `ACTION_CLICK` |
-| AI 판별 ON | **광고 찾기** | 파랑 | Layer 2 1회 실행 |
-| 그 외 | 없음 | | |
-
-어르신에게 버튼 세 개를 동시에 주면 고르는 일 자체가 부담이다. 지금 상황에서 가장
-필요한 하나만 크게 보여준다. `busy`가 전부를 이기는 이유는, 손 밑에서 버튼이 다른
-기능으로 바뀌면 두 번째 누름이 엉뚱한 동작을 실행하기 때문이다.
-
-### 구현 제약 (반드시 지킬 것)
-
-- `TYPE_ACCESSIBILITY_OVERLAY` + **서비스 컨텍스트**(`this`). `applicationContext`를
-  쓰면 창 토큰이 없어 `BadTokenException`으로 죽는다
-- **Compose 아님, 순수 View.** 오버레이 창에는 `ViewTreeLifecycleOwner`·
-  `SavedStateRegistryOwner`가 없다
-- 테두리 창(`FLAG_NOT_TOUCHABLE`)과 **별도 창**이어야 한다. 합치면 둘 다 터치를
-  받거나 둘 다 통과시킨다
-- 터치 타깃 72dp, 글자 24sp 이상
-- **광고 위에 겹치지 않는다** — 하단 바가 광고 `Rect`와 겹치면 상단으로 옮긴다.
-  광고를 가리면 구글 정책 위반
-
-### `ACTION_CLICK` 정책
-
-**대리 클릭은 사용자가 `[광고 닫기]`를 누른 경우에만 한다.** 자동으로 닫으면 그건
-광고 차단이고 정책 위반이다. 우리가 하는 일은 "닫기 버튼이 저기 있는데 너무 작아서
-못 누르는 사람 대신 눌러주는 것"이지 "광고를 없애는 것"이 아니다.
-**호출부는 액션바 클릭 핸들러 하나뿐이어야 한다.**
+| 공유하지 않는 것 | 왜 |
+|---|---|
+| 오버레이 창 | 배지는 **자기 창**에 그린다. 광고 테두리와 서로를 지우지 않는다 (실기기에서 공존 확인) |
+| 룰 엔진 · 판정 캐시 | 캐시 단위가 다르다 — 광고는 카드 문구, 위험도는 호스트 |
+| `RateLimiter` | 같은 일을 하지만 `SerpCallBudget`으로 따로 뒀다. 30줄 중복으로 "이 패키지는 자기 밖의 무엇도 필요로 하지 않는다"를 산다 |
+| 로그 태그 | 값은 같게(`GurADian`) 두어 한 줄로 다 보이되, 상수는 패키지 안에서 정의한다 |
 
 ---
 
-## 스크롤 추종 — 두 개의 속도
+## 10. 검증
 
-트리 순회는 아무리 조여도 150~250ms가 걸린다. 60fps는 16.7ms다. **스캔 주기를
-손보는 방식으로는 원리적으로 스무스해질 수 없다.** 그래서 두 갈래로 나눈다.
+### 실제 Gemini API 표본 (2026-08-14, gemini-3.1-flash-lite)
 
-- **빠른 쪽 (매 스크롤 이벤트)** — 노드를 하나도 읽지 않고 이미 그려둔 테두리를
-  `scrollDeltaY`만큼 즉시 민다. `layoutParams`만 고치므로 프레임 단위로 붙는다.
-- **느린 쪽 (스로틀된 스캔)** — 진짜 좌표를 찾아 보정한다. 결과는 몇백 ms 전의
-  화면이므로 `scrollSinceScanStart`만큼 되밀어 그린다. 이 보정이 없으면 스캔이
-  끝날 때마다 테두리가 뒤로 튄다.
+| 표본 | 건수 | 결과 |
+|---|---|---|
+| 정상 OTT·방송·포털 + 불법 다시보기 | 12 | 12/12 |
+| 덜 알려진 정상 서비스 · 사칭 · 도박 · 성인 · APK · IP직결 · 단축주소 | 15 | 14/15 · **오탐 0 · 미탐 0** |
+| 실제 운영 형태(규칙 신호 동봉, 판별기가 실제로 보는 것만) | 10 | 9/10 · **오탐 0 · 미탐 0** |
 
-느린 쪽을 제 시간에 끝나게 하는 장치 다섯 개. **하나라도 빠지면 얼어붙거나 깜빡인다.**
+비용: 화면당 배치 1회 · 입력 1.2~1.4k 토큰 · 응답 5~9초.
 
-1. `TYPE_VIEW_SCROLLED` 구독 — 순수 스크롤에서는 `CONTENT_CHANGED`가 오지 않는다
-2. 트레일링 스로틀 — 겹친 요청을 버리지 않고 미룬다
-3. 스캔 예산 — 순회 시간 상한
-4. 잘린 결과 홀드 — 최대 3회
-5. 히스테리시스 — 나타날 때 즉시, 사라질 때 700ms 대기
+### 실기기 (SM-S937N, 크롬 + 구글 앱)
 
-원본에서는 이게 전부 서비스 안에 흩어져 있었다. `overlay/BorderTracker.kt` 한
-클래스로 뽑았고 **로직과 상수는 한 글자도 바꾸지 않았다.**
-
-**주사율 통일은 최종본 이후로 미뤘다.** 실험 기기 3종의 주사율이 달라 지금
-맞춰봐야 한 대 기준으로만 맞는다. `SCAN_INTERVAL_MS` 200 / `RECHECK_MS` 1000 /
-`CLEAR_DELAY_MS` 700 / `MAX_TRUNCATED_HOLDS` 3 / `LAZY_RESCAN_MS` 600·1800·3500은
-그때까지 손대지 않는다.
-
----
-
-## 감지 한계
-
-- **유튜브 인스트림 광고**(영상 내부): 비디오 플레이어 안이라 접근성 트리에 없다.
-  **이 설계로 해결되지 않는 구조적 한계다.**
-- **네이버식 광고**: 라벨이 `clickable=false` 노드에 있어 `adLinkOf`가 영역을 못 잡는다
-- **삼성 인터넷**: 렌더링된 웹 페이지를 접근성 트리에 노출하지 않는다 — 같은 URL에서
-  크롬은 노드 421개에 본문 텍스트가 나오는 반면 삼성 인터넷은 노드 20개에 텍스트가
-  0개다. 볼 정보가 없어 코드로는 해결 불가라 `targetApps`에서 뺐다
-- **악성 URL은 크롬 한정**: 인스타·유튜브·당근에는 URL이라는 개념이 접근성 트리에
-  없다. 구현체를 아무리 좋게 만들어도 이 한계는 사라지지 않는다
-- **카카오톡·네이버 앱**: 대상 목록에 없음 (프라이버시 범위를 좁히려는 의도적 선택)
-
----
-
-## 빌드와 검증
-
-```properties
-# local.properties (버전 관리 제외)
-sdk.dir=/path/to/Android/Sdk
-GEMINI_API_KEY=...     # 없어도 빌드된다 — StubClassifier로 물러난다
 ```
+serp 검색어='드라마 다시보기' 결과=3 판별=1 생략=false {상=2, 하=1}   ← 3건 중 AI 1회
+serp 검색어='드라마 다시보기' 결과=5 판별=2 생략=false {하=3, 상=2}   ← 스크롤 후
+serp 검색어='드라마 다시보기' 결과=3 판별=0 생략=false {상=2, 하=1}   ← 재방문: 캐시, AI 0회
+serp 검색어='nunutv'        결과=3 판별=3 생략=false {상=3}          ← 구글 앱
+```
+
+확인된 것: 결과 추출 · 규칙/AI 분담 · 배지 렌더링 · **스크롤 추종** · 검색 화면 이탈 시 제거 ·
+**잠금화면에 남지 않음** · 캐시 적중 · 광고 감지 오버레이와 공존.
+
+### 단위 테스트
 
 ```bash
-./gradlew testDebugUnitTest    # 단위 테스트 97건
-./scripts/redeploy.sh          # 실기기 배포 (접근성 재활성화 순서 포함)
-adb logcat -s GurADian
+./gradlew :app:testDebugUnitTest      # 163개 통과
 ```
 
-실기기 검증 항목은 [`docs/실기기-검증-체크리스트.md`](docs/실기기-검증-체크리스트.md).
+판정 전체가 안드로이드 타입을 쓰지 않아 JVM에서 그대로 돈다
+(`SerpResult`에 좌표를 넣지 않은 이유 — 좌표는 `SerpScanner.Hit`가 따로 든다).
 
-**`GEMINI_API_KEY`가 없으면 `StubClassifier`로 떨어진다.** 스텁은 문맥을 못 읽어
-지마켓 "슈퍼딜"(그 쇼핑몰 자체 상품 영역)을 광고로 오탐한 전례가 있고, 버튼을 눌러
-부르는 구조에서는 사용자가 결과를 기다리므로 오탐이 그대로 평가받는다.
-`layer2 판별기=` 로그로 어느 쪽이 도는지 먼저 확인할 것.
+- `SerpRiskEngineTest` — **AI 호출 트리거의 명세.** 통과하는 동안 "언제 판별기가 불리는가"는 안 바뀐다
+- `SerpSampleTest` — 27개 표본에 규칙만 돌려 "규칙이 확정한 것 중 오답 0"을 못 박는다
+- `UnknownAndSitesTest` — "모르는 것을 안전이라 하지 않는다" + 목록 교체 가능성
+- `UrlSignalsTest` · `RiskAggregatorTest` · `SerpScannerTest` · `GeminiSerpClassifierTest`
 
 ---
 
-## 브랜치
+## 11. 파일
 
 ```
-main (린 버전 — 3-Layer, 카카오만 제거)   ← 건드리지 않는다
- │
- └── feat/2layer-scaffold                  재구축 뼈대 (region 주석)
-      └── feat/layer1-rule                 rule/ · overlay/ · MaliciousUrlSource
-           └── feat/layer2-agent           agent/ · VerdictStore · findAdsNow()
-                └── feat/action-bar        action/ · DetectionLog
-                                  ↓
-                        integration/2layer  (A → B → C 순서로 병합)
+app/src/main/java/com/guradian/serp/
+  SerpFeature.kt          ★ 서비스와 닿는 유일한 지점 (6줄 계약)
+  SerpTracker.kt          ★ 스크롤 추종 — 좌표를 매번 새로 읽어 판정을 얹는다
+  SerpRiskEngine.kt       ★ 호스트별 판정 저장소 · 트리거 · 캐시 · 상한
+  SerpRules.kt            ★ AI를 부를지 정하는 문지기
+  SerpScanner.kt          접근성 노드 → 결과 카드 (스크린샷 없음)
+  KnownSites.kt           사이트 이름 목록 — 원격 피드 교체 지점
+  UrlSignals.kt           세 축(도메인 신뢰도·저작권·피싱) 규칙 신호
+  RiskAggregator.kt       점수 합성 · 확정 신호 하한 · '확인 안 됨' 판단
+  SerpRisk.kt             등급(확인안됨·하·중·상) · 분류 · 판정
+  SerpResult.kt           결과 한 칸(좌표 없음) · 호스트 분해
+  SerpClassifier.kt       판별기 인터페이스(배치) + 규칙 전용 대역
+  GeminiSerpClassifier.kt 텍스트 배치 판별 — 화면당 1회
+  SerpBadgeOverlay.kt     배지 (별도 창 · FLAG_NOT_TOUCHABLE)
+  SerpInternals.kt        로그 태그 · 호출 상한 (외부 의존을 끊기 위한 것)
+
+docs/검색결과-위험도-설계.md   설계 근거와 검증 기록 전문
 ```
 
-계획서 §5는 세 브랜치를 main에서 나란히 띄우는 그림이었지만, 실제로는 B가 A의
-`BrowserHost`를, C가 A의 `confirmedRegions`와 B의 `findAdsNow()`를 소비하므로
-그 순서대로 쌓았다. 계획서 §5.1이 지정한 병합 순서(A → B → C)와 같다.
+---
 
-## 남은 항목
+## 12. 배포 전에 반드시 할 것
 
-- 어포던스 탐지 휴리스틱 — 앱별 실기기 튜닝 (지금은 인터페이스·배선까지)
-- 주사율 통일 — 실험 기기 3종, 최종본 이후
-- KISA 악성 URL 소스 — 공공데이터포털 API 신청·포맷
-- task 4·5 백엔드 (FastAPI + PostgreSQL) 착수 시점
-- Agent3 (Vision) — 이미지만 있는 광고 판별. 미착수
+- `GeminiSerpClassifier`는 앱에서 Gemini를 직접 부른다. **APK를 뜯으면 키가 그대로 나온다.**
+  `SerpClassifier` 인터페이스가 교체점이고, 서버 경유 구현으로 갈아끼우면
+  파이프라인·캐시·배지는 손대지 않는다
+- 삼성 기기는 **Freecess가 프로세스를 얼린다**(`FZ: reason: Bg`). 배터리 최적화 예외를
+  잡지 않으면 코드와 무관하게 조용히 멈춘다 — 실기기 검증 중 실제로 겪었다
+- 네이버 앱·다음 앱은 미지원. 각 앱마다 "검색 결과 화면"을 알아보는 근거를 따로 찾아야 한다

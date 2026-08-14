@@ -22,6 +22,7 @@ import com.guradian.overlay.AdMarkStyle
 import com.guradian.overlay.BorderTracker
 import com.guradian.rule.RuleEngine
 import com.guradian.rule.RuleVerdict
+import com.guradian.serp.SerpFeature
 import com.guradian.store.DetectionLog
 import com.guradian.store.InMemoryVerdictStore
 import com.guradian.store.NoopDetectionLog
@@ -235,6 +236,18 @@ class GuardianAccessibilityService : AccessibilityService() {
     )
     // ── endregion ──
 
+    // ── region: serp ──  (feat/serp-risk 가 채운다 — 검색 결과 위험도)
+
+    /**
+     * 구글·크롬 검색 결과의 사이트별 위험도. 기능 전체가 `com.guradian.serp`에 있고
+     * 이 파일에는 **입구 하나만** 둔다 ([SerpFeature] 참고).
+     *
+     * 광고 감지와 공유하는 것이 하나도 없다 — 오버레이 창도, 룰 엔진도, 판정 캐시도
+     * 따로다. 병합할 때 이 region과 dispatch 한 줄, 정리 두 줄만 보면 된다.
+     */
+    private val serp by lazy { SerpFeature(this, scope, BuildConfig.GEMINI_API_KEY) }
+    // ── endregion ──
+
     // ── region: action ──  (feat/action-bar 가 채운다)
 
     /**
@@ -372,7 +385,11 @@ class GuardianAccessibilityService : AccessibilityService() {
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                 AccessibilityEvent.TYPE_VIEW_SCROLLED or
                 AccessibilityEvent.TYPE_VIEW_CLICKED
-            packageNames = (targetApps + storePackages).toTypedArray()
+            // serpApps가 더해져 있다. 시스템이 여기 적힌 패키지의 이벤트만 넘겨주므로,
+            // 구글 앱(검색)이 빠지면 검색 결과 위험도가 그 앱에서 통째로 잠자코 있는다.
+            // 다른 레이어의 동작 범위는 그대로다 — 아래 dispatch가 여전히
+            // `pkg !in targetApps`로 자기 몫을 걸러낸다.
+            packageNames = (targetApps + storePackages + SerpFeature.PACKAGES).toTypedArray()
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
@@ -396,6 +413,9 @@ class GuardianAccessibilityService : AccessibilityService() {
             }
             return
         }
+
+        // serp — 검색 결과 위험도. targetApps에 없는 구글 앱도 봐야 해서 필터보다 앞이다.
+        serp.onEvent(event, pkg)
 
         if (pkg !in targetApps) return
 
@@ -467,11 +487,15 @@ class GuardianAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
+        // serp — 여기서 안 지우면 시스템이 서비스를 멈춘 뒤에도 배지가 화면에 남는다.
+        serp.stop()
         borderTracker.clear()
     }
 
     override fun onDestroy() {
         isConnected = false
+        // serp — 창을 떼지 않으면 서비스가 죽어도 배지가 화면에 남는다.
+        serp.stop()
         borderTracker.clear()
         escapeAction.cancel()
         actionBar.dismiss()
@@ -485,6 +509,7 @@ class GuardianAccessibilityService : AccessibilityService() {
 
         /** "settings" prefs — AI 광고 판별 옵트인 키. MainActivity 토글과 공유한다. */
         const val PREF_AI_CLASSIFY = "ai_classify"
+
 
         /**
          * 서비스가 지금 시스템에 연결돼 있는지. 접근성 설정의 "켜짐" 표시와 별개다 —

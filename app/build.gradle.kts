@@ -68,4 +68,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+    // 단위 테스트 전용. android.jar의 org.json은 전부 예외를 던지는 껍데기라
+    // 응답 파싱을 JVM에서 검증하려면 진짜 구현이 클래스패스에 있어야 한다.
+    // APK에는 들어가지 않는다 — 기기에는 플랫폼 org.json이 이미 있다.
+    testImplementation("org.json:json:20250107")
 }

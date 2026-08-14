@@ -179,7 +179,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     private val urlGuard by lazy { UrlGuard(this) }
 
-    private val installSourceGuard by lazy { InstallSourceGuard(this) }
+    private val installSourceGuard = InstallSourceGuard()
 
     /**
      * "방금 광고를 눌렀는가"를 기억한다. 기능 1은 이 플래그가 있을 때만 발동한다 —
@@ -231,6 +231,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
      */
     @Volatile
     private var foregroundPackage: String? = null
+
+    /** 스토어 화면을 마지막으로 본 시각. 설치 출처를 가르는 근거다. */
+    @Volatile
+    private var lastStoreSeenAt = 0L
 
     /**
      * 글자 없는 광고 이미지를 화면에서 읽는다. API 30부터만 가능하다 —
@@ -361,7 +365,21 @@ class AdGuardAccessibilityService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: return
 
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            if (pkg in InstallSourceGuard.TRUSTED_INSTALLERS) {
+                lastStoreSeenAt = SystemClock.uptimeMillis()
+            }
             foregroundPackage = pkg
+        }
+
+        // ── 설치 화면 개입 (기능 3) ──
+        // 설치 화면은 targetApps가 아니므로 아래 필터보다 먼저 처리해야 한다.
+        // 실제로 이 검사가 필터 뒤에 있어 영영 실행되지 않았다 — 이벤트는 정상적으로
+        // 왔는데(로그로 확인) targetApps에 없어 그 자리에서 return되고 있었다.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            installSourceGuard.isInstallerScreen(pkg)
+        ) {
+            warnUnknownInstall()
+            return
         }
 
         // ── Layer 3: 설치 유도 감지 ──
@@ -399,12 +417,6 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 페이지가 새로 떴다. 광고를 나중에 끼워 넣는 사이트를 위해 재스캔을 예약해 둔다.
             handler.removeCallbacks(lazyRescan)
             for (d in LAZY_RESCAN_MS) handler.postDelayed(lazyRescan, d)
-
-            // 기능 3 — APK 설치 화면. 출처가 Play 스토어가 아니면 끼어든다.
-            if (installSourceGuard.isInstallerScreen(pkg)) {
-                warnUnknownInstall()
-                return
-            }
 
             // 기능 1 — 광고를 눌렀다면 잠시 목적지를 지켜본다.
             if (adClickTracker.consumePendingClick()) {
@@ -970,7 +982,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
      * Play 정책 위반이라 하지 않는다.
      */
     private fun warnUnknownInstall() {
-        if (installSourceGuard.isFromPlayStore()) return
+        val sinceStore =
+            if (lastStoreSeenAt == 0L) null else SystemClock.uptimeMillis() - lastStoreSeenAt
+        if (installSourceGuard.isTrustedSource(sinceStore)) return
         Log.i(TAG, "알 수 없는 출처의 설치 화면 감지")
 
         overlayManager.showWarning(

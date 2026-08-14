@@ -1,6 +1,5 @@
 package com.senioradguard.guard
 
-import android.content.Context
 import android.util.Log
 
 /**
@@ -17,29 +16,32 @@ import android.util.Log
  * 덮어 "이게 무슨 화면인지" 알려주고 돌아갈 길을 주는 것까지가 우리 몫이다.
  * "그래도 설치"를 고르면 경고만 걷고 사용자의 선택에 맡긴다.
  */
-class InstallSourceGuard(private val context: Context) {
+class InstallSourceGuard {
 
     /**
-     * 지금 뜬 설치 화면이 Play 스토어에서 온 것인가.
+     * 지금 뜬 설치 화면이 믿을 만한 출처에서 온 것인가.
      *
-     * `PackageInstaller`의 진행 중 세션을 훑어 요청자를 본다. 세션이 없으면
-     * 판단할 근거가 없는데, 그때는 **경고하지 않는다** — 정상 설치를 막는 오탐이
-     * 사용자에게 더 해롭다.
+     * ## 두 번 갈아엎은 판단 근거
+     * 1. `PackageInstaller` 세션의 요청자 → **세션은 사용자가 "설치"를 누른 뒤에
+     *    생긴다.** 확인 화면에서는 목록이 비어 있어 늘 "판단 불가"였다.
+     * 2. 설치 화면 직전에 떠 있던 앱 → **파일 관리자는 우리 이벤트 필터에 없어서
+     *    볼 수 없다.** 실기기에서 직전 앱이 계속 null로 나왔다.
      *
-     * @return true면 안전한 출처(또는 판단 불가), false면 알 수 없는 출처
+     * ## 지금 쓰는 근거 — "최근에 스토어를 봤는가"
+     * 스토어(Play·갤럭시)는 필터에 있으므로 사용자가 거기서 앱을 받으면 우리가
+     * 그 화면 전환을 **반드시 본다.** 반대로 문자·브라우저에서 받은 APK를 파일
+     * 관리자로 열면 스토어를 거치지 않는다.
+     *
+     * 그래서 "설치 화면이 떴는데 최근에 스토어를 본 적이 없다"를 알 수 없는 출처로
+     * 본다. 스토어에서 설치하다 서비스가 재시작되면 잘못 경고할 수 있는데, 그
+     * 경고는 버튼 하나짜리 안내이고 설치를 막지도 않는다.
+     *
+     * @param msSinceStoreSeen 스토어 화면을 마지막으로 본 뒤 지난 시간. 본 적이
+     *        없으면 null.
      */
-    fun isFromPlayStore(): Boolean {
-        val sessions = runCatching { context.packageManager.packageInstaller.allSessions }
-            .getOrElse {
-                Log.w(TAG, "설치 세션을 읽지 못함: ${it.message}")
-                return true
-            }
-        if (sessions.isEmpty()) return true
-
-        // 가장 최근 세션의 요청자를 본다. 동시에 여러 개가 도는 경우는 드물다.
-        val installer = sessions.lastOrNull()?.installerPackageName
-        Log.i(TAG, "설치 세션 요청자=$installer")
-        return installer == null || installer in TRUSTED_INSTALLERS
+    fun isTrustedSource(msSinceStoreSeen: Long?): Boolean {
+        Log.i(TAG, "설치 화면 — 스토어를 본 지 ${msSinceStoreSeen ?: "-"}ms")
+        return msSinceStoreSeen != null && msSinceStoreSeen <= STORE_RECENCY_MS
     }
 
     fun isInstallerScreen(packageName: String?): Boolean =
@@ -56,7 +58,13 @@ class InstallSourceGuard(private val context: Context) {
             "com.samsung.android.packageinstaller"
         )
 
-        private val TRUSTED_INSTALLERS = setOf(
+        /**
+         * 스토어를 본 뒤 이 시간 안에 설치 화면이 뜨면 스토어에서 온 것으로 본다.
+         * 스토어에서 "설치"를 누르고 확인 화면이 뜨기까지는 몇 초면 충분하다.
+         */
+        const val STORE_RECENCY_MS = 30_000L
+
+        val TRUSTED_INSTALLERS = setOf(
             "com.android.vending",              // Play 스토어
             "com.sec.android.app.samsungapps"   // 갤럭시 스토어
         )

@@ -17,7 +17,24 @@ object AdvertiserMark {
         "등록번호", "심의필", "심의번호", "사업자등록", "준법감시", "광고심의"
     )
 
-    /** 광고주 표기줄만 골라낸다. 없으면 빈 목록 — 거친 지문을 만들지 않는다. */
-    fun advertiserLines(texts: List<String>): List<String> =
-        texts.filter { line -> complianceMarks.any { it in line } }
+    /**
+     * 도메인 꼴의 한 줄 (구글 디스플레이 광고가 광고주 표시로 쓰는
+     * "bo-gung.co.kr" 형태). 줄 전체가 도메인일 때만 인정한다 — 문장 속에
+     * 낀 주소를 잡으면 기사 문장이 광고주 줄로 오인된다.
+     */
+    private val domainLine = Regex("""[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+""")
+
+    /**
+     * 광고주 표기줄만 골라낸다. 없으면 빈 목록 — 거친 지문을 만들지 않는다.
+     *
+     * 여기 걸리는 줄만 쓰는 이유: 거친 지문이 서로 다른 광고끼리 충돌하면
+     * 엉뚱한 광고에 위험 표시가 붙는다(오탐이 미탐보다 치명적). 심의 표기와
+     * 도메인 줄은 광고주 고유라 충돌하지 않지만, "지금 확인하세요" 같은
+     * 흔한 문구를 재료로 쓰면 곧바로 충돌한다.
+     */
+    fun advertiserLines(texts: List<String>): List<String> {
+        val compliance = texts.filter { line -> complianceMarks.any { it in line } }
+        if (compliance.isNotEmpty()) return compliance
+        return texts.filter { domainLine.matches(it.trim()) }
+    }
 }

@@ -104,7 +104,11 @@ class AdEntryDetector(private val clock: () -> Long) {
             "adservice.google.com", "criteo.com", "adfit.kakao.com",
             "taboola.com", "dable.io", "outbrain.com", "ad.daum.net",
             // 국내 광고망
-            "popin.cc", "mobon.net", "realclick.co.kr", "cauly.net", "adop.cc"
+            "popin.cc", "mobon.net", "realclick.co.kr", "cauly.net", "adop.cc",
+            // 실측(2026-08-14, 연합뉴스TV 쿠팡 배너): 클릭 → 아래 경유지 → 쿠팡 앱
+            // 딥링크. 경유지를 못 잡으면 앱으로 빠져나가는 광고를 통째로 놓친다.
+            "clickads.co.kr", "mjbiz.co.kr",
+            "link.coupang.com"   // 쿠팡 파트너스 (coupang.com 본체는 리다이렉터가 아님)
         )
 
         fun isAdRedirector(host: String): Boolean {

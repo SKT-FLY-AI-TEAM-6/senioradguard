@@ -121,6 +121,19 @@ class AdEntryDetectorTest {
         // 실기기에서 실제로 관측된 popIn 경유 (네이트 뉴스 추천위젯 광고)
         assertTrue(AdEntryDetector.isAdRedirector("trace.popin.cc"))
         assertTrue(AdEntryDetector.isAdRedirector("mobon.net"))
+        // 실기기 관측(연합뉴스TV 쿠팡 배너): 클릭 → 경유지 → 쿠팡 앱 딥링크
+        assertTrue(AdEntryDetector.isAdRedirector("clickads.co.kr"))
+        assertTrue(AdEntryDetector.isAdRedirector("api.mjbiz.co.kr"))
+        assertTrue(AdEntryDetector.isAdRedirector("link.coupang.com"))
+    }
+
+    @Test
+    fun 쿠팡_본체는_리다이렉터가_아니다() {
+        // link.coupang.com(파트너스 경유지)만 리다이렉터다 — 본체를 리다이렉터로
+        // 보면 쿠팡 안에서 정상 쇼핑하는 내내 가림막이 뜬다
+        assertFalse(AdEntryDetector.isAdRedirector("coupang.com"))
+        assertFalse(AdEntryDetector.isAdRedirector("www.coupang.com"))
+        assertFalse(AdEntryDetector.isAdRedirector("m.coupang.com"))
     }
 
     @Test

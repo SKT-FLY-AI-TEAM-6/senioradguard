@@ -265,6 +265,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
      */
     private var shieldResolved = false
 
+    /** 가림막을 띄운 진입 URL — 앱 딥링크로 주소창을 잃었을 때의 분석 대상 */
+    private var shieldEntryUrl: String? = null
+
+    /** 가림막을 띄운 이동의 출발 호스트 — 주소창이 여기로 돌아오면 딥링크 이탈이다 */
+    private var shieldCameFrom: String? = null
+
     /**
      * 선택 버튼(안전하게 돌아가기 / 그냥 볼게요)을 띄우고 사용자 결정을
      * 기다리는 중인가. 이 상태는 시간이 지나도 걷지 않는다 — 위험 안내가
@@ -1042,6 +1048,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
         handler.removeCallbacks(navPoll)
         shieldActive = true
         shieldResolved = false
+        // 진입 URL과 출발 호스트를 기억한다 — 광고가 앱 딥링크로 빠져나가면
+        // 주소창이 출발지로 돌아가 버려, 이 진입 URL의 리다이렉트 체인을
+        // 격리 분석기로 직접 따라가는 것이 최종 목적지를 보는 유일한 길이다.
+        shieldEntryUrl = urlShown
+        shieldCameFrom = cameFromHost
 
         // 이번 진입의 광고 지문 — 판정이 나오면 연계 저장한다.
         // 클릭 좌표로 특정된 것이 최우선이고, 없으면(웹 광고는 클릭 이벤트가 없다)
@@ -1109,7 +1120,17 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     /** 확보한 URL로 캐시를 조회하고, 미스면 격리 분석을 돌려 가림막의 결말을 정한다. */
     private fun resolveShield(urlShown: String?) {
-        val normalized = urlShown?.let { UrlNormalizer.normalize(it) }
+        // 광고가 앱 딥링크로 빠져나가면 주소창은 못 읽히거나(앱 화면) 출발지로
+        // 되돌아간다. 그때는 진입 URL(경유지)의 리다이렉트 체인을 격리 분석기로
+        // 직접 따라가 최종 목적지를 판정한다 — 실측: 연합뉴스TV의 쿠팡 배너
+        // (기사 → clickads.co.kr → 쿠팡 앱 딥링크, 크롬은 기사로 복귀).
+        val backAtOrigin = urlShown != null && shieldCameFrom != null &&
+            UrlNormalizer.hostOf(urlShown) == shieldCameFrom
+        val target = if (urlShown == null || backAtOrigin) shieldEntryUrl ?: urlShown else urlShown
+        if (target !== urlShown) {
+            Log.i(TAG, "딥링크 이탈 감지 — 진입 URL 체인을 직접 분석: ${target?.take(80)}")
+        }
+        val normalized = target?.let { UrlNormalizer.normalize(it) }
         if (normalized == null) {
             // 주소창 읽기가 끝까지 실패한 드문 케이스 (실측: 프루지오 진입 1회).
             // 로그 없이 죽으면 디버깅이 불가능해 흔적을 남긴다.
@@ -1127,7 +1148,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
             // 격리 분석 — 사용자 브라우저와 분리된 수집(JS·쿠키·다운로드 없음) + 규칙 판정
             val page = runCatching {
-                withTimeoutOrNull(ANALYZE_TIMEOUT_MS) { analyzer.analyze(urlShown) }
+                withTimeoutOrNull(ANALYZE_TIMEOUT_MS) { analyzer.analyze(target) }
             }.getOrNull()
             if (page == null) {
                 Log.i(TAG, "분석 실패 — $normalized (추가 확인 필요)")

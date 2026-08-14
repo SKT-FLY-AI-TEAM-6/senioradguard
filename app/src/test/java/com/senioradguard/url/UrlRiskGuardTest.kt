@@ -1,5 +1,9 @@
 package com.senioradguard.url
 
+import com.senioradguard.risk.RiskCategory
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+
 import com.senioradguard.agent.RateLimiter
 import com.senioradguard.detector.db.IllegalDomain
 import com.senioradguard.detector.db.IllegalDomainDao
@@ -42,7 +46,7 @@ class UrlRiskGuardTest {
     private val classifier = object : UrlRiskClassifier {
         override val source = "FAKE"
         var calls = 0
-        override suspend fun classify(link: AdLink, signals: List<Signal>): UrlRiskVerdict {
+        override suspend fun classify(link: AdLink, signals: List<Signal>): RiskVerdict {
             calls++
             return RiskAggregator.heuristic(signals).copy(source = source)
         }

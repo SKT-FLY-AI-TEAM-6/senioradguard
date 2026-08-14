@@ -1,5 +1,9 @@
 package com.senioradguard.url
 
+import com.senioradguard.risk.RiskCategory
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -48,10 +52,10 @@ class UrlRiskInstrumentedTest {
         limiter = RateLimiter(30, 3_600_000L) { clock }
     ) { clock }
 
-    private class Fake(private val verdict: UrlRiskVerdict?) : UrlRiskClassifier {
+    private class Fake(private val verdict: RiskVerdict?) : UrlRiskClassifier {
         override val source = "FAKE"
         var calls = 0
-        override suspend fun classify(link: AdLink, signals: List<Signal>): UrlRiskVerdict? {
+        override suspend fun classify(link: AdLink, signals: List<Signal>): RiskVerdict? {
             calls++
             return verdict
         }
@@ -59,7 +63,7 @@ class UrlRiskInstrumentedTest {
 
     private fun link(url: String) = UrlParser.parse(url, "yna.co.kr", "광고", isAdElement = true)!!
 
-    private fun verdict(score: Int) = UrlRiskVerdict(
+    private fun verdict(score: Int) = RiskVerdict(
         RiskCategory.UNVERIFIED_THIRD_PARTY, RiskLevel.of(score), score, listOf("근거"), "FAKE"
     )
 
@@ -165,7 +169,7 @@ class UrlRiskInstrumentedTest {
     // 순서가 뒤바뀌면 경고창 문구가 그대로 망가진다.
     @Test
     fun 근거_여러_줄이_캐시를_왕복해도_보존된다() = runTest {
-        val many = UrlRiskVerdict(
+        val many = RiskVerdict(
             RiskCategory.PHISHING_OR_SCAM, RiskLevel.HIGH, 90,
             listOf("첫 번째 근거", "두 번째 근거"), "FAKE"
         )

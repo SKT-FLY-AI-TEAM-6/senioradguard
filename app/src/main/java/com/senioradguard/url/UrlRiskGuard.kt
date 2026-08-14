@@ -1,5 +1,9 @@
 package com.senioradguard.url
 
+import com.senioradguard.risk.RiskCategory
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+
 /**
  * Layer 4의 흐름 제어. "언제 판별할지"와 "같은 것을 두 번 알리지 않기"만 맡는다.
  *
@@ -32,7 +36,7 @@ package com.senioradguard.url
 class UrlRiskGuard(
     private val pipeline: UrlRiskPipeline,
     /** 판정이 나왔을 때 부른다. 화면 표시는 호출부(서비스)의 몫이다. */
-    private val onVerdict: suspend (AdLink, UrlRiskVerdict) -> Unit,
+    private val onVerdict: suspend (AdLink, RiskVerdict) -> Unit,
     /**
      * 판별기(LLM)를 불러도 되는가. AI 판별 토글이 꺼져 있으면 false를 준다.
      *

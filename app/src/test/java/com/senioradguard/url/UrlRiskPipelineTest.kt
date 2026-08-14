@@ -1,5 +1,9 @@
 package com.senioradguard.url
 
+import com.senioradguard.risk.RiskCategory
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+
 import com.senioradguard.agent.RateLimiter
 import com.senioradguard.detector.db.IllegalDomain
 import com.senioradguard.detector.db.IllegalDomainDao
@@ -55,12 +59,12 @@ private class FakeRiskDao : UrlRiskDao {
     }
 }
 
-private class CountingClassifier(private val verdict: UrlRiskVerdict?) : UrlRiskClassifier {
+private class CountingClassifier(private val verdict: RiskVerdict?) : UrlRiskClassifier {
     override val source = "FAKE"
     var calls = 0
     var lastSignals: List<Signal> = emptyList()
 
-    override suspend fun classify(link: AdLink, signals: List<Signal>): UrlRiskVerdict? {
+    override suspend fun classify(link: AdLink, signals: List<Signal>): RiskVerdict? {
         calls++
         lastSignals = signals
         return verdict
@@ -75,7 +79,7 @@ class UrlRiskPipelineTest {
         UrlParser.parse(url, "yna.co.kr", anchor, isAdElement = true)!!
 
     private fun verdict(score: Int, source: String = "FAKE") =
-        UrlRiskVerdict(
+        RiskVerdict(
             RiskCategory.UNVERIFIED_THIRD_PARTY, RiskLevel.of(score), score,
             listOf("판별기 근거"), source
         )
@@ -106,7 +110,7 @@ class UrlRiskPipelineTest {
         assertTrue(result.blacklisted)
         assertEquals(RiskLevel.HIGH, result.verdict.level)
         assertEquals(95, result.verdict.score)
-        assertEquals(UrlRiskVerdict.SOURCE_BLACKLIST, result.verdict.source)
+        assertEquals(RiskVerdict.SOURCE_BLACKLIST, result.verdict.source)
         assertEquals(0, classifier.calls)
     }
 
@@ -181,7 +185,7 @@ class UrlRiskPipelineTest {
             UrlRisk(
                 host = "stale.com", category = RiskCategory.PHISHING_OR_SCAM.name,
                 level = RiskLevel.LOW.name, score = 90, reasons = "옛 근거",
-                source = UrlRiskVerdict.SOURCE_LLM, updatedAt = clock
+                source = RiskVerdict.SOURCE_LLM, updatedAt = clock
             )
         )
         val result = pipeline(risk = risk).evaluate(link("https://stale.com/x"))
@@ -207,7 +211,7 @@ class UrlRiskPipelineTest {
 
         assertEquals(0, classifier.calls)
         assertFalse(result.classified)
-        assertEquals(UrlRiskVerdict.SOURCE_HEURISTIC, result.verdict.source)
+        assertEquals(RiskVerdict.SOURCE_HEURISTIC, result.verdict.source)
     }
 
     @Test
@@ -242,13 +246,13 @@ class UrlRiskPipelineTest {
     fun `판별기가 죽어도 규칙 판정으로 이어간다`() = runTest {
         val exploding = object : UrlRiskClassifier {
             override val source = "BOOM"
-            override suspend fun classify(link: AdLink, signals: List<Signal>): UrlRiskVerdict =
+            override suspend fun classify(link: AdLink, signals: List<Signal>): RiskVerdict =
                 throw IllegalStateException("네트워크 끊김")
         }
         val result = pipeline(classifier = exploding).evaluate(link("https://tvhot2.com/player/1"))
 
         assertEquals(RiskLevel.HIGH, result.verdict.level)
-        assertEquals(UrlRiskVerdict.SOURCE_HEURISTIC, result.verdict.source)
+        assertEquals(RiskVerdict.SOURCE_HEURISTIC, result.verdict.source)
     }
 
     // ── 순서 ───────────────────────────────────────────────────
@@ -262,7 +266,7 @@ class UrlRiskPipelineTest {
             UrlRisk(
                 host = "tvhot2.com", category = RiskCategory.UNKNOWN.name,
                 level = RiskLevel.LOW.name, score = 0, reasons = "옛 판정",
-                source = UrlRiskVerdict.SOURCE_LLM, updatedAt = clock
+                source = RiskVerdict.SOURCE_LLM, updatedAt = clock
             )
         )
         val result = pipeline(FakeIllegalDao(listOf(illegalRow("tvhot2.com"))), risk)

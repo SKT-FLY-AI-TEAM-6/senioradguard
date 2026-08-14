@@ -1,5 +1,9 @@
 package com.senioradguard.url
 
+import com.senioradguard.risk.RiskCategory
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+
 /**
  * Agent5 — 링크 하나의 위험도를 추론한다.
  *
@@ -22,7 +26,7 @@ interface UrlRiskClassifier {
      *        던지면 판별기가 "잘 모르겠다"로 수렴한다
      * @return 실패·타임아웃이면 null. 호출부는 캐시에 저장하지 않고 신호만으로 판정한다
      */
-    suspend fun classify(link: AdLink, signals: List<Signal>): UrlRiskVerdict?
+    suspend fun classify(link: AdLink, signals: List<Signal>): RiskVerdict?
 }
 
 /**
@@ -38,8 +42,8 @@ interface UrlRiskClassifier {
  */
 class HeuristicUrlRiskClassifier : UrlRiskClassifier {
 
-    override val source = UrlRiskVerdict.SOURCE_HEURISTIC
+    override val source = RiskVerdict.SOURCE_HEURISTIC
 
-    override suspend fun classify(link: AdLink, signals: List<Signal>): UrlRiskVerdict =
+    override suspend fun classify(link: AdLink, signals: List<Signal>): RiskVerdict =
         RiskAggregator.heuristic(signals)
 }

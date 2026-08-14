@@ -1,5 +1,9 @@
 package com.senioradguard.url
 
+import com.senioradguard.risk.RiskCategory
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+
 import android.util.Log
 import com.senioradguard.agent.GeminiClient
 import org.json.JSONArray
@@ -69,21 +73,21 @@ class GeminiUrlRiskClassifier(
         )
     }
 
-    override val source = UrlRiskVerdict.SOURCE_LLM
+    override val source = RiskVerdict.SOURCE_LLM
 
-    override suspend fun classify(link: AdLink, signals: List<Signal>): UrlRiskVerdict? {
+    override suspend fun classify(link: AdLink, signals: List<Signal>): RiskVerdict? {
         val payload = client.generateJson(SYSTEM_PROMPT, prompt(link, signals), SCHEMA)
             ?: return null
 
         return runCatching {
             val json = JSONObject(payload)
             val score = json.getDouble("score").toInt().coerceIn(0, 100)
-            UrlRiskVerdict(
+            RiskVerdict(
                 category = RiskCategory.parse(json.optString("category")),
                 level = RiskLevel.of(score),
                 score = score,
                 reasons = json.optJSONArray("reasons").toStringList()
-                    .take(UrlRiskVerdict.MAX_REASONS),
+                    .take(RiskVerdict.MAX_REASONS),
                 source = source
             )
         }.getOrElse {

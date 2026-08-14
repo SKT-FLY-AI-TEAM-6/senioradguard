@@ -1,5 +1,9 @@
 package com.senioradguard.url
 
+import com.senioradguard.risk.RiskCategory
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+
 import com.senioradguard.agent.RateLimiter
 import com.senioradguard.detector.db.IllegalDomainDao
 import com.senioradguard.detector.db.UrlRisk
@@ -38,7 +42,7 @@ class UrlRiskPipeline(
      */
     data class Result(
         val link: AdLink,
-        val verdict: UrlRiskVerdict,
+        val verdict: RiskVerdict,
         val fromCache: Boolean = false,
         val blacklisted: Boolean = false,
         val classified: Boolean = false
@@ -57,7 +61,7 @@ class UrlRiskPipeline(
             illegalDao.findBySuffixes(UrlParser.hostSuffixes(host))
         }.getOrNull()
         if (illegal != null) {
-            val verdict = UrlRiskVerdict(
+            val verdict = RiskVerdict(
                 category = RiskCategory.parse(illegal.category),
                 level = RiskLevel.of(illegal.score),
                 score = illegal.score,
@@ -65,8 +69,8 @@ class UrlRiskPipeline(
                 reasons = (listOf(illegal.note) + RiskAggregator.heuristic(signals).reasons)
                     .filter { it.isNotBlank() }
                     .distinct()
-                    .take(UrlRiskVerdict.MAX_REASONS),
-                source = UrlRiskVerdict.SOURCE_BLACKLIST
+                    .take(RiskVerdict.MAX_REASONS),
+                source = RiskVerdict.SOURCE_BLACKLIST
             )
             store(host, verdict)
             return Result(link, verdict, blacklisted = true)
@@ -93,7 +97,7 @@ class UrlRiskPipeline(
         return Result(link, verdict, classified = classified != null)
     }
 
-    private suspend fun store(host: String, verdict: UrlRiskVerdict) {
+    private suspend fun store(host: String, verdict: RiskVerdict) {
         runCatching {
             riskDao.upsert(
                 UrlRisk(
@@ -109,7 +113,7 @@ class UrlRiskPipeline(
         }
     }
 
-    private fun UrlRisk.toVerdict() = UrlRiskVerdict(
+    private fun UrlRisk.toVerdict() = RiskVerdict(
         category = RiskCategory.parse(category),
         // 등급을 저장된 문자열이 아니라 점수에서 다시 계산한다. 경계값을 조정했을 때
         // 옛 행이 옛 등급을 그대로 들고 살아남는 일을 막는다.

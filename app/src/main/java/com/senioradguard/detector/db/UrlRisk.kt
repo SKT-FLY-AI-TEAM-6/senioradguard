@@ -15,9 +15,9 @@ import androidx.room.PrimaryKey
 @Entity(tableName = "url_risk")
 data class UrlRisk(
     @PrimaryKey val host: String,
-    /** com.senioradguard.url.RiskCategory 이름 */
+    /** com.senioradguard.risk.RiskCategory 이름 */
     val category: String,
-    /** com.senioradguard.url.RiskLevel 이름 */
+    /** com.senioradguard.risk.RiskLevel 이름 */
     val level: String,
     val score: Int,
     /** 근거들을 개행으로 이어 붙인 것. 목록 컬럼을 따로 두려고 컨버터를 쓰진 않는다 */

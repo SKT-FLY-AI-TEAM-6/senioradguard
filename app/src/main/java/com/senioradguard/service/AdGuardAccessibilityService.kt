@@ -25,16 +25,20 @@ import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.AdMarkStyle
 import com.senioradguard.overlay.OverlayManager
 import com.senioradguard.region.AdRegionScanner
-import com.senioradguard.url.AdLink
-import com.senioradguard.url.GeminiUrlRiskClassifier
-import com.senioradguard.url.HeuristicUrlRiskClassifier
 import com.senioradguard.url.LinkHarvester
-import com.senioradguard.url.RiskLevel
-import com.senioradguard.url.UrlParser
-import com.senioradguard.url.UrlRiskClassifier
-import com.senioradguard.url.UrlRiskGuard
-import com.senioradguard.url.UrlRiskPipeline
-import com.senioradguard.url.UrlRiskVerdict
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+import com.senioradguard.vision.GeminiVisionClassifier
+import com.senioradguard.vision.RegionMatcher
+import com.senioradguard.vision.Roi
+import com.senioradguard.vision.RoiHasher
+import com.senioradguard.vision.RoiKind
+import com.senioradguard.vision.ScreenCapture
+import com.senioradguard.vision.SearchResultScanner
+import com.senioradguard.vision.TextOnlyVisionClassifier
+import com.senioradguard.vision.VisionRequest
+import com.senioradguard.vision.VisionRiskClassifier
+import com.senioradguard.vision.VisionRiskPipeline
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -76,14 +80,22 @@ internal class SightingLog(private val capacity: Int = 128) {
 /**
  * 단일 진입점. 이벤트를 받아 루트 노드를 한 번만 가져오고 각 레이어에 배분한다.
  *
- *   Layer 1  공식 광고 라벨 감지  → 비차단 테두리 (AdBorderOverlay)
+ *   Layer 1  공식 광고 라벨 감지  → 파란 테두리 (AdBorderOverlay)
  *   Layer 2  LLM 판별            → 캐시 표시는 즉시, 새 판별은 유휴 때만
  *   Layer 3  설치 유도 감지       → 차단 경고 (InstallGuard)
- *   Layer 4  광고 링크 위험도      → 불법 목록·LLM 추론 (UrlRiskGuard)
+ *   Layer 5  ROI 이미지 판별      → 테두리를 위험도 색으로 교체 (VisionRiskPipeline)
  *
- * Layer 1·2가 "이게 광고인가"를 보고, Layer 4는 "그 광고가 데려가는 곳이 위험한가"를
- * 본다. 어르신에게 실제로 피해를 입히는 것은 광고 그 자체가 아니라 광고가 데려가는
- * 곳이라, 광고를 정확히 찾는 것만으로는 절반밖에 못 지킨다.
+ * Layer 1·2가 "이게 광고인가"를 찾고, Layer 5는 그 **영역을 그대로 잘라** "얼마나
+ * 위험한가"를 본다. 앞의 둘이 만든 사각형이 뒤의 입력이 되는 구조라, 광고를 찾는
+ * 정확도가 곧 판별 대상의 정확도가 된다.
+ *
+ * ## Layer 4(URL 위험도)의 화면 표시는 이 버전에서 걷어냈다
+ * 링크 주소로 위험도를 매기는 경로는 `com.senioradguard.url`에 그대로 있고, Layer 5가
+ * 불법 도메인 조회(VisionRiskPipeline.byShownUrl)로 여전히 쓴다. 다만 **화면에 뜨던
+ * 전체 화면 경고는 없앴다.** 실기기에서 검색 결과 화면을 보다가 그 경고가 떠서 Layer 5가
+ * 그린 위험도 테두리를 통째로 덮어버렸다. 판정 결과를 알리는 언어는 하나여야 한다.
+ * 게다가 네이티브 앱에서는 URL이 아예 없어(유튜브 실측 0건) 그 경로만으로는 절반의
+ * 화면에서 아무 말도 못 한다.
  *
  * ## 테두리는 스캔을 기다리지 않는다 — 두 개의 속도
  * 트리 순회는 아무리 조여도 150~250ms가 걸린다. 여기에 스로틀이 얹히면 광고가
@@ -123,7 +135,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
         "com.google.android.youtube",   // 유튜브
         "com.instagram.android",        // 인스타그램
         "com.towneers.www",             // 당근
-        "com.android.chrome"            // 크롬 (모바일 웹)
+        "com.android.chrome",           // 크롬 (모바일 웹)
+        // 구글 앱. 검색 결과에서 공식 서비스와 불법 사이트가 나란히 나오는 화면을
+        // Layer 5가 다루기 위해 넣는다. 크롬 검색은 위 항목으로 이미 들어온다.
+        "com.google.android.googlequicksearchbox"
         // 삼성 인터넷(com.sec.android.app.sbrowser)은 제외한다.
         // 실기기 A/B 검증 결과 렌더링된 웹 페이지를 접근성 트리에 전혀 노출하지
         // 않는다 — 같은 URL에서 크롬은 노드 421개에 본문 텍스트가 나오는 반면
@@ -198,32 +213,22 @@ class AdGuardAccessibilityService : AccessibilityService() {
         )
     }
 
-    // ── Layer 4 — 광고 링크 위험도 ──────────────────────────────
+    // ── Layer 5 — 화면 조각(ROI) 이미지 판별 ────────────────────
 
-    private val urlPipeline by lazy {
-        // Layer 2와 같은 규칙이다. 키가 없으면 규칙 기반 대역으로 물러나므로 키를
-        // 아직 안 받은 팀원도 Layer 4 전 구간을 실기기에서 돌려볼 수 있다.
+    private val screenCapture by lazy { ScreenCapture(this) }
+    private val searchScanner = SearchResultScanner()
+
+    private val visionPipeline by lazy {
         val key = BuildConfig.GEMINI_API_KEY
-        val classifier: UrlRiskClassifier =
-            if (key.isNotBlank()) GeminiUrlRiskClassifier(key) else HeuristicUrlRiskClassifier()
-        Log.i(TAG, "layer4 판별기=${classifier.source}")
+        val classifier: VisionRiskClassifier =
+            if (key.isNotBlank()) GeminiVisionClassifier(key) else TextOnlyVisionClassifier()
+        Log.i(TAG, "layer5 판별기=${classifier.source}")
 
         val db = AppDatabase.getInstance(this)
-        UrlRiskPipeline(
+        VisionRiskPipeline(
             illegalDao = db.illegalDomainDao(),
-            riskDao = db.urlRiskDao(),
+            riskDao = db.roiRiskDao(),
             classifier = classifier
-        )
-    }
-
-    private val urlGuard by lazy {
-        UrlRiskGuard(
-            pipeline = urlPipeline,
-            onVerdict = ::onUrlVerdict,
-            // AI 토글이 꺼져 있어도 불법 목록 조회와 규칙 판정은 그대로 돈다.
-            // 화면 텍스트가 나가는 Layer 2와 달리 여기서 외부로 나가는 것은 URL뿐이지만,
-            // 그것도 사용자가 켜야만 나가도록 같은 토글에 묶는다.
-            allowClassify = ::isAiEnabled
         )
     }
 
@@ -338,7 +343,6 @@ class AdGuardAccessibilityService : AccessibilityService() {
             val clickedText = event.contentDescription?.toString()
                 ?: event.text.joinToString(separator = " ")
             installGuard.onClick(clickedText, pkg)
-            onPossibleAdClick(event, clickedText)
             // 클릭만으로는 화면이 바뀌지 않아 Layer 1이 다시 스캔할 게 없다.
             // (화면이 바뀌면 CONTENT_CHANGED가 따로 온다)
             return
@@ -356,6 +360,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 // 스캔을 기다리지 않고 지금 있는 테두리를 바로 민다. 화면이 위로
                 // 굴렀으면(dy > 0) 광고도 위로 가므로 테두리는 -dy만큼 움직인다.
                 borderOverlay.offsetBy(-dy)
+                // 위험도가 붙은 자리도 함께 민다. 이걸 빠뜨리면 스크롤한 뒤 좌표가
+                // 어긋나 "이 자리는 이미 판정됐다"는 판단이 실패하고, 위험도 색 위에
+                // 광고 테두리가 한 겹 더 그려진다(실기기에서 실제로 그랬다).
+                offsetRiskRegions(-dy)
                 // 지금 도는 스캔은 이만큼 구르기 *전* 화면을 읽고 있다. 결과가
                 // 돌아왔을 때 그대로 그리면 테두리가 뒤로 튄다 — 보정에 쓴다.
                 scrollSinceScanStart += dy
@@ -444,21 +452,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 다른 앱 화면에 이전 앱의 테두리가 남아 있으면 그게 오탐이다.
             truncatedHolds = 0
             emptySince = 0L
-            // 남은 클릭 기억이 다음 앱 화면으로 새면, 사용자가 직접 연 주소가
-            // 광고 착지로 오인된다.
-            urlGuard.reset()
             withContext(Dispatchers.Main) { apply(emptyList(), emptyList()) }
             return
         }
 
         // 트리 접근은 이 백그라운드 경로에서 끝낸다 (apply는 메인 스레드).
         lastSourceKey = runCatching { extractor.sourceKeyOf(root) }.getOrNull()
-
-        // Layer 4 — 착지 주소를 볼 일이 있을 때만 주소창을 읽는다. 노드 조회가 한 번
-        // 더 늘어나므로, 광고를 누른 적도 화면에 광고가 뜬 적도 없으면 건너뛴다.
-        if (urlGuard.wantsPageUrl()) {
-            runCatching { urlGuard.onPageChanged(LinkHarvester.currentPageUrl(root)) }
-        }
 
         val result = scanner.scan(root)
         if (result.truncated) {
@@ -512,12 +511,6 @@ class AdGuardAccessibilityService : AccessibilityService() {
             emptyList()
         }
 
-        // 광고가 화면에 떠 있었다는 사실을 Layer 4에 알린다. 크롬이 웹 배너 터치에
-        // 클릭 이벤트를 주지 않아(실기기 확인), 이동 자체를 두 번째 신호로 쓴다.
-        if (stable.isNotEmpty() || guessed.isNotEmpty()) {
-            urlGuard.onAdsShown(lastSourceKey.orEmpty())
-        }
-
         withContext(Dispatchers.Main) { apply(stable, guessed) }
     }
 
@@ -538,7 +531,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun closeAllAds() {
         val root = rootInActiveWindow ?: return
         val screen = Rect().also { root.getBoundsInScreen(it) }
-        val targets = confirmedRegions + aiRegions
+        // 위험도 색으로 바뀐 자리도 대상이다. 바뀌었다고 광고가 아니게 된 것은 아니다.
+        val targets = (confirmedRegions + aiRegions + riskRegions.values.flatten()).distinct()
 
         var closed = 0
         var fullScreenAd = false
@@ -628,18 +622,36 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // 스캔이 도는 동안 굴러간 만큼 결과를 되민다 (안 그러면 테두리가 뒤로 튄다)
         val dy = -scrollSinceScanStart
         val shifted = confirmed.shiftedBy(dy)
-        borderOverlay.show(AdMarkStyle.CONFIRMED, shifted)
-        borderOverlay.show(AdMarkStyle.AI_GUESS, guessed.shiftedBy(dy))
+        val shiftedGuess = guessed.shiftedBy(dy)
+
+        // 광고가 통째로 사라졌으면 위험도 테두리도 함께 걷는다. 안 걷으면 이미 없는
+        // 광고 자리에 빨간 테두리가 남아 사용자가 무엇을 보고 있는지 알 수 없게 된다.
+        if (shifted.isEmpty() && shiftedGuess.isEmpty() && riskRegions.isNotEmpty()) clearRisk()
+
+        // 위험도가 정해진 자리에는 '광고' 테두리를 그리지 않는다 — 한 광고에 두 겹이
+        // 겹치면 색이 섞여 어느 쪽이 판정인지 알 수 없다.
+        borderOverlay.show(AdMarkStyle.CONFIRMED, shifted.withoutRisky())
+        borderOverlay.show(AdMarkStyle.AI_GUESS, shiftedGuess.withoutRisky())
 
         confirmedRegions = shifted
-        aiRegions = guessed
+        aiRegions = shiftedGuess
         reportSighting(lastSourceKey, layer = 1, count = shifted.size)
-        reportSighting(lastSourceKey, layer = 2, count = guessed.size)
+        reportSighting(lastSourceKey, layer = 2, count = shiftedGuess.size)
         scheduleLayer2()
     }
 
     private fun List<Rect>.shiftedBy(dy: Int): List<Rect> =
         if (dy == 0 || isEmpty()) this else map { Rect(it).apply { offset(0, dy) } }
+
+    /** 이미 위험도 색이 칠해진 자리를 뺀 목록. */
+    private fun List<Rect>.withoutRisky(): List<Rect> {
+        val risky = riskRegions.values.flatten()
+        if (risky.isEmpty() || isEmpty()) return this
+        return filter { r -> risky.none { it.sameRegionAs(r) } }
+    }
+
+    private fun Rect.sameRegionAs(other: Rect): Boolean =
+        RegionMatcher.same(left, top, right, bottom, other.left, other.top, other.right, other.bottom)
 
     // ──────────────────────────────────────────────────────────
     // Layer 2 — AI 판별 파이프라인
@@ -663,8 +675,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
     @Volatile
     private var lastSourceKey: String? = null
 
+    /**
+     * 유휴 1회에 도는 무거운 작업들 — Layer 2 판별, Layer 4 링크 훑기, Layer 5 이미지 판별.
+     *
+     * 한 곳에 모아 둔 이유가 있다. 셋 다 트리를 다시 순회하거나 네트워크를 쓰므로
+     * 스크롤 중에 돌리면 테두리 추종이 무너진다. 또 Layer 5는 Layer 2가 찾아낸 영역을
+     * 입력으로 받으므로 순서가 정해져 있다.
+     */
     private val runLayer2 = Runnable {
-        if (!isAiEnabled()) return@Runnable
+        if (!isAiEnabled() && !isVisionEnabled()) return@Runnable
         if (!classifying.compareAndSet(false, true)) return@Runnable
 
         val generation = screenGeneration
@@ -673,35 +692,37 @@ class AdGuardAccessibilityService : AccessibilityService() {
             try {
                 val root = rootInActiveWindow
                 if (root == null || root.packageName?.toString() !in targetApps) return@launch
-                // 유휴 경로라 상한을 걸지 않는다. 후보를 빠짐없이 봐야 판별이 의미가 있다.
-                val candidates = extractor.extract(root, excluded)
-                val result = pipeline.run(candidates)
-                // 유휴 1회에 한 줄. 이벤트마다가 아니라 스크롤이 멈췄을 때만 찍히므로
-                // 부담이 없고, 캐시가 실제로 듣는지 눈으로 볼 수 있는 유일한 창이다.
-                Log.i(
-                    TAG,
-                    "layer2 출처=${candidates.firstOrNull()?.sourceKey ?: "-"} " +
-                        "후보=${candidates.size} 캐시=${result.cacheHits} " +
-                        "판별=${result.classified} 보류=${result.skippedByLimit} " +
-                        "표시=${result.regions.size}"
-                )
-                withContext(Dispatchers.Main) {
-                    // 결과가 늦게 왔고 그 사이 화면이 바뀌었으면 버린다
-                    if (generation == screenGeneration) {
-                        borderOverlay.show(AdMarkStyle.AI_GUESS, result.regions)
-                        aiRegions = result.regions
-                        reportSighting(
-                            candidates.firstOrNull()?.sourceKey,
-                            layer = 2,
-                            count = result.regions.size
-                        )
+
+                var adRegions = excluded
+                if (isAiEnabled()) {
+                    // 유휴 경로라 상한을 걸지 않는다. 후보를 빠짐없이 봐야 판별이 의미가 있다.
+                    val candidates = extractor.extract(root, excluded)
+                    val result = pipeline.run(candidates)
+                    // 유휴 1회에 한 줄. 이벤트마다가 아니라 스크롤이 멈췄을 때만 찍히므로
+                    // 부담이 없고, 캐시가 실제로 듣는지 눈으로 볼 수 있는 유일한 창이다.
+                    Log.i(
+                        TAG,
+                        "layer2 출처=${candidates.firstOrNull()?.sourceKey ?: "-"} " +
+                            "후보=${candidates.size} 캐시=${result.cacheHits} " +
+                            "판별=${result.classified} 보류=${result.skippedByLimit} " +
+                            "표시=${result.regions.size}"
+                    )
+                    withContext(Dispatchers.Main) {
+                        // 결과가 늦게 왔고 그 사이 화면이 바뀌었으면 버린다
+                        if (generation == screenGeneration) {
+                            borderOverlay.show(AdMarkStyle.AI_GUESS, result.regions.withoutRisky())
+                            aiRegions = result.regions
+                            reportSighting(
+                                candidates.firstOrNull()?.sourceKey,
+                                layer = 2,
+                                count = result.regions.size
+                            )
+                        }
                     }
+                    adRegions = excluded + result.regions
                 }
 
-                // Layer 4 — 표시된 광고 영역 안의 링크를 미리 훑는다. 여기서 캐시를
-                // 채워두면 사용자가 실제로 눌렀을 때 판별기를 부르지 않고 즉시 답이
-                // 나온다. 유휴 경로라 이 추가 순회의 비용이 감당된다.
-                harvestAdLinks(root, excluded + result.regions)
+                runVisionPass(root, adRegions, generation)
             } finally {
                 classifying.set(false)
             }
@@ -715,96 +736,190 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun scheduleLayer2() {
         screenGeneration++
         handler.removeCallbacks(runLayer2)
-        if (isAiEnabled()) handler.postDelayed(runLayer2, LAYER2_IDLE_MS)
+        if (isAiEnabled() || isVisionEnabled()) handler.postDelayed(runLayer2, LAYER2_IDLE_MS)
     }
 
     /** 기본 OFF 옵트인. 화면 텍스트가 외부로 나가므로 사용자가 켜야만 동작한다. */
     private fun isAiEnabled(): Boolean =
         getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_AI_CLASSIFY, false)
 
+    /**
+     * Layer 5 옵트인. 기본 OFF이고 AI 토글과 **별개**다.
+     *
+     * 텍스트가 나가는 것과 화면 그림이 나가는 것은 무게가 다르다. 글자는 마스킹할
+     * 수 있지만 픽셀은 못 한다. 하나의 토글로 묶으면 사용자가 텍스트만 허락한 줄
+     * 알고 그림까지 내보내게 된다.
+     */
+    private fun isVisionEnabled(): Boolean =
+        getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_VISION_CLASSIFY, false)
+
     // ──────────────────────────────────────────────────────────
-    // Layer 4 — 광고 링크 위험도
+    // Layer 5 — 광고 영역을 잘라 이미지로 판별하고 테두리를 위험도 색으로 바꾼다
     // ──────────────────────────────────────────────────────────
+
+    /** 지금 위험도 색이 칠해진 영역. 메인 스레드가 쓰고 스캔 코루틴이 읽는다. */
+    @Volatile
+    private var riskRegions: Map<RiskLevel, List<Rect>> = emptyMap()
 
     /**
-     * 광고로 표시한 영역 안이 눌렸는지 확인하고, 맞으면 Layer 4에 알린다.
+     * 유휴 1회의 이미지 판별.
      *
-     * 광고 영역 밖의 클릭은 사용자가 보려던 것이므로 건드리지 않는다. 이 조건이
-     * 없으면 기사 링크를 누를 때마다 위험도 판별이 돌아 호출만 늘어난다.
-     *
-     * 클릭 노드에서 주소를 바로 읽을 수 있으면(크롬 extras) 이동을 기다리지 않고
-     * 그 자리에서 판별한다 — 경고가 이동보다 앞설 수 있는 유일한 경로다. 못 읽으면
-     * 기억만 남기고, 뒤이어 바뀌는 주소창을 [scanWork]가 넘겨준다.
+     * 순서가 곧 비용 순서다.
+     *  1. 화면에 주소가 보이면 불법 목록만 조회하고 끝 — 스크린샷도 판별기도 안 쓴다
+     *  2. 남은 것만 화면을 **한 장** 찍어 영역별로 자른다
+     *  3. 잘라낸 그림의 지문으로 캐시를 본다 — 같은 배너는 두 번 판별하지 않는다
+     *  4. 그래도 처음 보는 그림만 판별기로 간다
      */
-    private fun onPossibleAdClick(event: AccessibilityEvent, clickedText: String) {
-        val marked = confirmedRegions + aiRegions
-        if (marked.isEmpty()) return
+    private suspend fun runVisionPass(
+        root: AccessibilityNodeInfo,
+        adRegions: List<Rect>,
+        generation: Int
+    ) {
+        if (!isVisionEnabled()) return
 
-        val source = event.source ?: return
-        val bounds = Rect().also { source.getBoundsInScreen(it) }
-        if (bounds.isEmpty || marked.none { Rect.intersects(it, bounds) }) return
+        val sourceKey = lastSourceKey.orEmpty()
+        val pkg = root.packageName?.toString().orEmpty()
+        val pageUrl = runCatching { LinkHarvester.currentPageUrl(root) }.getOrNull()
 
-        val page = lastSourceKey.orEmpty()
-        urlGuard.onAdClicked(clickedText, page)
+        val rois = mutableListOf<Roi>()
+        for (rect in adRegions.take(MAX_VISION_ROIS)) {
+            rois += Roi(rect, RoiKind.AD, shownText = "", shownUrl = "", sourceKey = sourceKey)
+        }
+        // 검색 결과는 광고가 아니라 Layer 1·2가 아무것도 표시하지 않는다. 공식 서비스와
+        // 불법 사이트가 같은 목록에 나란히 뜨는 화면이 정확히 이 자리다.
+        if (rois.size < MAX_VISION_ROIS && searchScanner.isSearchScreen(pageUrl, pkg)) {
+            rois += runCatching { searchScanner.extract(root, adRegions, sourceKey) }
+                .getOrDefault(emptyList())
+                .take(MAX_VISION_ROIS - rois.size)
+        }
+        if (rois.isEmpty()) return
 
-        val direct = LinkHarvester.urlOf(source) ?: return
-        val link = UrlParser.parse(direct, page, clickedText, isAdElement = true) ?: return
-        scope.launch { urlGuard.onAdLinksSeen(listOf(link)) }
-    }
+        val assigned = linkedMapOf<RiskLevel, MutableList<Rect>>()
+        var classified = 0
 
-    /** 표시 중인 광고 영역 안의 링크를 모아 Layer 4로 넘긴다. 유휴 경로에서만 부른다. */
-    private suspend fun harvestAdLinks(root: AccessibilityNodeInfo, regions: List<Rect>) {
-        if (regions.isEmpty()) return
-        val page = runCatching { LinkHarvester.currentPageUrl(root) }.getOrNull()
-            ?: lastSourceKey.orEmpty()
-        val links = runCatching { LinkHarvester.harvest(root, regions, page) }
-            .getOrDefault(emptyList())
-        if (links.isNotEmpty()) urlGuard.onAdLinksSeen(links)
-    }
+        // 1단계 — 주소만으로 결론이 나는 것 (검색 결과에서 특히 잘 듣는다)
+        val remaining = mutableListOf<Roi>()
+        for (roi in rois) {
+            val byUrl = if (roi.shownUrl.isNotBlank()) {
+                runCatching { visionPipeline.byShownUrl(roi.shownUrl) }.getOrNull()
+            } else null
 
-    /**
-     * Layer 4 판정 결과를 사용자에게 전한다. 백그라운드에서 불린다.
-     *
-     * 등급마다 방식이 다르다. '위험'만 전체 화면 경고로 막아서고, '주의'는 짧은
-     * 안내로 그친다. 모든 등급에 경고를 띄우면 정상 광고 서버에까지 경고가 떠서
-     * 사용자가 경고 자체를 무시하게 된다 — 그러면 진짜 위험할 때도 안 읽는다.
-     */
-    private suspend fun onUrlVerdict(link: AdLink, verdict: UrlRiskVerdict) {
+            if (byUrl != null) assign(assigned, roi.rect, byUrl) else remaining += roi
+        }
+
+        // 2단계 — 남은 것만 그림을 본다. 화면은 한 번만 찍는다.
+        if (remaining.isNotEmpty() && screenCapture.canCapture()) {
+            val screen = screenCapture.captureScreen()
+            if (screen != null) {
+                try {
+                    for (roi in remaining) {
+                        val verdict = verdictFor(roi, screen, sourceKey) { classified++ }
+                        if (verdict != null) assign(assigned, roi.rect, verdict)
+                    }
+                } finally {
+                    screen.recycle()
+                }
+            }
+        }
+
+        if (assigned.isEmpty()) return
+
         Log.i(
             TAG,
-            "layer4 ${link.components.domain} ${verdict.level.name}(${verdict.score}) " +
-                "${verdict.category.name} 출처=${verdict.source}"
-        )
-        if (verdict.level == RiskLevel.LOW) return
-
-        AdEventLogger.logUrlRisk(
-            host = link.components.domain,
-            levelLabel = verdict.level.label,
-            categoryLabel = verdict.category.label
+            "layer5 출처=$sourceKey ROI=${rois.size} 주소판정=${rois.size - remaining.size} " +
+                "판별=$classified " +
+                assigned.entries.joinToString(" ") { "${it.key.name}=${it.value.size}" }
         )
 
         withContext(Dispatchers.Main) {
-            if (verdict.level == RiskLevel.HIGH) showRiskWarning(link, verdict)
-            else toast("주의: ${link.components.rootDomain} — ${verdict.category.label}")
+            // 결과가 늦게 왔고 그 사이 화면이 바뀌었으면 버린다
+            if (generation == screenGeneration) applyRisk(assigned, sourceKey)
         }
     }
 
-    private fun showRiskWarning(link: AdLink, verdict: UrlRiskVerdict) {
-        val pkg = rootInActiveWindow?.packageName?.toString() ?: return
-        val reasons = verdict.reasons.take(MAX_WARNING_REASONS).joinToString("\n") { "· $it" }
+    /**
+     * 영역 하나의 판정. 잘라낸 비트맵은 반드시 돌려준다 — 유휴마다 몇 장씩 새는
+     * 것만으로 몇 분 안에 메모리가 마른다.
+     */
+    private suspend fun verdictFor(
+        roi: Roi,
+        screen: android.graphics.Bitmap,
+        sourceKey: String,
+        onClassified: () -> Unit
+    ): RiskVerdict? {
+        val crop = screenCapture.crop(screen, roi.rect) ?: return null
+        return try {
+            val hash = RoiHasher.dHash(screenCapture.grayscale(crop))
+            if (hash == 0L) return null
 
-        overlayManager.showWarning(
-            message = "위험할 수 있는 광고예요\n\n" +
-                "${link.components.rootDomain}\n${verdict.category.label}\n\n$reasons",
-            packageName = pkg,
-            onConfirm = {
-                AdEventLogger.logIgnored(pkg, "위험 링크 경고 무시 · ${link.components.domain}")
-            },
-            onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
-            currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() },
-            onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) }
-        )
+            visionPipeline.cached(sourceKey, hash)?.let { return it }
+
+            val request = VisionRequest(
+                kind = roi.kind,
+                sourceKey = sourceKey,
+                shownText = roi.shownText,
+                shownUrl = roi.shownUrl,
+                jpegBase64 = screenCapture.toJpegBase64(crop)
+            )
+            visionPipeline.classify(request, hash)?.also { onClassified() }?.verdict
+        } finally {
+            crop.recycle()
+        }
     }
+
+    private fun assign(
+        into: MutableMap<RiskLevel, MutableList<Rect>>,
+        rect: Rect,
+        verdict: RiskVerdict
+    ) {
+        into.getOrPut(verdict.level) { mutableListOf() }.add(Rect(rect))
+    }
+
+    /** 메인 스레드. 위험도 색 테두리를 그리고 그 자리의 '광고' 테두리를 걷어낸다. */
+    private fun applyRisk(assigned: Map<RiskLevel, List<Rect>>, sourceKey: String) {
+        riskRegions = assigned
+
+        for (level in RiskLevel.entries) {
+            borderOverlay.show(level.markStyle(), assigned[level].orEmpty())
+        }
+        borderOverlay.show(AdMarkStyle.CONFIRMED, confirmedRegions.withoutRisky())
+        borderOverlay.show(AdMarkStyle.AI_GUESS, aiRegions.withoutRisky())
+
+        // '안전'은 알리지 않는다. 보호자가 알아야 할 것은 위험한 것을 봤다는 사실이다.
+        val risky = assigned.filterKeys { it != RiskLevel.LOW }.values.sumOf { it.size }
+        if (risky > 0 && sourceKey.isNotBlank() && sightings.shouldReport(sourceKey, 5)) {
+            AdEventLogger.logAdMarked(sourceKey, "위험 광고 ${risky}건 표시", layer = 5)
+        }
+    }
+
+    private fun clearRisk() {
+        riskRegions = emptyMap()
+        for (level in RiskLevel.entries) borderOverlay.clear(level.markStyle())
+    }
+
+    /**
+     * 스크롤한 만큼 위험도 영역도 밀어 둔다.
+     *
+     * 그려진 테두리는 [AdBorderOverlay.offsetBy]가 옮기지만, 여기 기억해 둔 좌표는
+     * 그 호출로 바뀌지 않는다. 둘이 어긋나면 [withoutRisky]가 매칭에 실패해 위험도
+     * 색 위에 광고 테두리가 겹쳐 그려진다.
+     */
+    private fun offsetRiskRegions(dy: Int) {
+        if (dy == 0 || riskRegions.isEmpty()) return
+        riskRegions = riskRegions.mapValues { (_, rects) ->
+            rects.map { Rect(it).apply { offset(0, dy) } }
+        }
+    }
+
+    private fun RiskLevel.markStyle() = when (this) {
+        RiskLevel.LOW -> AdMarkStyle.RISK_LOW
+        RiskLevel.MEDIUM -> AdMarkStyle.RISK_MEDIUM
+        RiskLevel.HIGH -> AdMarkStyle.RISK_HIGH
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Layer 4 — 광고 링크 위험도
+    // ──────────────────────────────────────────────────────────
 
     override fun onInterrupt() {
         apply(emptyList(), emptyList())
@@ -850,12 +965,6 @@ class AdGuardAccessibilityService : AccessibilityService() {
         /** 스크롤이 이만큼 멈춰 있어야 Layer 2 판별을 돌린다. */
         private const val LAYER2_IDLE_MS = 600L
 
-        /**
-         * Layer 4 경고창에 적을 근거 수. 두 줄이면 왜 위험한지는 전해지고,
-         * 그 이상은 어르신이 읽지 않는다.
-         */
-        private const val MAX_WARNING_REASONS = 2
-
         // ── "광고 모두 닫기"가 X 버튼을 찾을 때 쓰는 값들 ──
 
         /** 광고 영역 안에서 닫기 버튼을 찾아 내려가는 최대 깊이 */
@@ -878,8 +987,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
             "close", "dismiss", "btnclose", "closebutton", "adclose", "cancel", "skip"
         )
 
+        /** 유휴 1회에 이미지로 판별할 영역 수 상한. 한 화면의 광고는 많아야 대여섯이다. */
+        private const val MAX_VISION_ROIS = 5
+
         /** "settings" prefs — AI 광고 판별 옵트인 키. MainActivity 토글과 공유한다. */
         const val PREF_AI_CLASSIFY = "ai_classify"
+
+        /** "settings" prefs — Layer 5(이미지 판별) 옵트인 키. AI 토글과 별개다. */
+        const val PREF_VISION_CLASSIFY = "vision_classify"
 
         /**
          * 서비스가 지금 시스템에 연결돼 있는지. 설정 화면의 "켜짐" 표시와 별개다 —

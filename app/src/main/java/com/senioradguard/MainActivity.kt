@@ -169,6 +169,7 @@ private fun HomeScreen(
                     )
                 }
                 AiClassifyToggle()
+                VisionClassifyToggle()
             }
         }
 
@@ -280,6 +281,59 @@ private fun AiClassifyToggle() {
                     enabled = it
                     prefs.edit()
                         .putBoolean(AdGuardAccessibilityService.PREF_AI_CLASSIFY, it)
+                        .apply()
+                }
+            )
+        }
+    }
+}
+
+/**
+ * Layer 5(이미지 판별) 옵트인 토글. 기본 OFF이고 AI 토글과 **별개다.**
+ *
+ * 글자가 나가는 것과 화면 그림이 나가는 것은 무게가 다르다. 글자는 전화·카드번호를
+ * 지우고 보낼 수 있지만 픽셀은 지울 수 없다. 하나의 토글로 묶으면 사용자가 글자만
+ * 허락한 줄 알고 그림까지 내보내게 되므로, 따로 묻는다.
+ *
+ * 문구에 "광고 부분만"을 명시한다 — 실제로 잘라낸 영역만 보내는 것이 이 기능의
+ * 전제이고, 사용자가 그 범위를 알고 켜야 한다.
+ */
+@Composable
+private fun VisionClassifyToggle() {
+    val context = LocalContext.current
+    val prefs = remember {
+        context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+    }
+    var enabled by remember {
+        mutableStateOf(prefs.getBoolean(AdGuardAccessibilityService.PREF_VISION_CLASSIFY, false))
+    }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "광고 위험도 색으로 알리기",
+                    fontSize = 21.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "안전하면 초록, 조심하면 주황, 위험하면 빨강 테두리로 알려줍니다.\n" +
+                        "켜면 화면 중 광고 부분만 잘라 판별 서버로 전송됩니다.",
+                    fontSize = 16.sp,
+                    color = Color(0xFF5D4037)
+                )
+            }
+            Switch(
+                checked = enabled,
+                onCheckedChange = {
+                    enabled = it
+                    prefs.edit()
+                        .putBoolean(AdGuardAccessibilityService.PREF_VISION_CLASSIFY, it)
                         .apply()
                 }
             )

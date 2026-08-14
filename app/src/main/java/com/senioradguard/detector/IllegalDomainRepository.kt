@@ -4,7 +4,7 @@ import android.content.Context
 import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.detector.db.IllegalDomain
 import com.senioradguard.detector.db.IllegalDomainDao
-import com.senioradguard.url.RiskCategory
+import com.senioradguard.risk.RiskCategory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 

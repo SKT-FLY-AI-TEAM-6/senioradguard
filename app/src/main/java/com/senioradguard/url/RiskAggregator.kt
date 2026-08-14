@@ -1,5 +1,9 @@
 package com.senioradguard.url
 
+import com.senioradguard.risk.RiskCategory
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+
 /**
  * 네 축의 신호와 판별기 결과를 하나의 등급으로 합친다. 순수 함수 모음이다.
  *
@@ -69,14 +73,14 @@ object RiskAggregator {
     }
 
     /** 판별기 없이 신호만으로 내리는 판정. */
-    fun heuristic(signals: List<Signal>): UrlRiskVerdict {
+    fun heuristic(signals: List<Signal>): RiskVerdict {
         val value = score(signals)
-        return UrlRiskVerdict(
+        return RiskVerdict(
             category = category(signals),
             level = RiskLevel.of(value),
             score = value,
             reasons = reasonsOf(signals),
-            source = UrlRiskVerdict.SOURCE_HEURISTIC
+            source = RiskVerdict.SOURCE_HEURISTIC
         )
     }
 
@@ -87,7 +91,7 @@ object RiskAggregator {
      * 하면(신호가 판단, LLM이 보정) 목록에 없는 새 사이트를 영영 못 잡는다 —
      * 목록에 없는 것을 잡으려고 판별기를 붙인 것이다.
      */
-    fun combine(signals: List<Signal>, classified: UrlRiskVerdict?): UrlRiskVerdict {
+    fun combine(signals: List<Signal>, classified: RiskVerdict?): RiskVerdict {
         if (classified == null) return heuristic(signals)
 
         val value = maxOf(classified.score, hardFloor(signals)).coerceIn(0, 100)
@@ -95,7 +99,7 @@ object RiskAggregator {
             if (classified.category == RiskCategory.UNKNOWN) category(signals)
             else classified.category
 
-        return UrlRiskVerdict(
+        return RiskVerdict(
             category = category,
             level = RiskLevel.of(value),
             score = value,
@@ -104,7 +108,7 @@ object RiskAggregator {
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
                 .distinct()
-                .take(UrlRiskVerdict.MAX_REASONS),
+                .take(RiskVerdict.MAX_REASONS),
             source = classified.source
         )
     }
@@ -112,7 +116,7 @@ object RiskAggregator {
     private fun reasonsOf(signals: List<Signal>): List<String> {
         val positives = signals.filter { it.weight > 0 }.sortedByDescending { it.weight }
         if (positives.isNotEmpty()) {
-            return positives.take(UrlRiskVerdict.MAX_REASONS).map { it.reason }
+            return positives.take(RiskVerdict.MAX_REASONS).map { it.reason }
         }
         return signals.filter { it.weight < 0 }.map { it.reason }.take(1)
     }

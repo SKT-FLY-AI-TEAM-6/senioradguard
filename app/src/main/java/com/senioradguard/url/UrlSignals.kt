@@ -1,5 +1,9 @@
 package com.senioradguard.url
 
+import com.senioradguard.risk.RiskCategory
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+
 /**
  * 위험도를 보는 네 방향. 하나의 링크를 서로 다른 눈으로 각각 훑는다.
  *

@@ -12,7 +12,7 @@ import androidx.room.PrimaryKey
  *
  * @param domain   등록 도메인 또는 정확한 호스트. 하위 호스트도 함께 걸린다
  *                 (com.senioradguard.url.UrlParser.hostSuffixes로 조회)
- * @param category [com.senioradguard.url.RiskCategory] 이름
+ * @param category [com.senioradguard.risk.RiskCategory] 이름
  * @param score    0~100. 목록에 있다는 것은 이미 확인됐다는 뜻이라 대개 90 이상이다
  * @param note     사람이 읽는 근거 한 줄. 경고창에 그대로 나간다
  */

@@ -1,5 +1,9 @@
 package com.senioradguard.url
 
+import com.senioradguard.risk.RiskCategory
+import com.senioradguard.risk.RiskLevel
+import com.senioradguard.risk.RiskVerdict
+
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -15,7 +19,7 @@ class RiskAggregatorTest {
     ) = Signal(axis, weight, reason, hard, category)
 
     private fun llm(score: Int, category: RiskCategory = RiskCategory.UNVERIFIED_THIRD_PARTY) =
-        UrlRiskVerdict(category, RiskLevel.of(score), score, listOf("판별기 근거"), UrlRiskVerdict.SOURCE_LLM)
+        RiskVerdict(category, RiskLevel.of(score), score, listOf("판별기 근거"), RiskVerdict.SOURCE_LLM)
 
     // 신호를 전부 더하면 사소한 신호 여럿이 확정 신호 하나를 이겨버린다
     @Test
@@ -67,7 +71,7 @@ class RiskAggregatorTest {
     @Test
     fun `판별기 결과가 없으면 규칙 판정을 쓴다`() {
         val result = RiskAggregator.combine(listOf(signal(60)), null)
-        assertEquals(UrlRiskVerdict.SOURCE_HEURISTIC, result.source)
+        assertEquals(RiskVerdict.SOURCE_HEURISTIC, result.source)
         assertEquals(60, result.score)
     }
 
@@ -79,7 +83,7 @@ class RiskAggregatorTest {
 
         assertEquals(85, result.score)
         assertEquals(RiskLevel.HIGH, result.level)
-        assertEquals(UrlRiskVerdict.SOURCE_LLM, result.source)
+        assertEquals(RiskVerdict.SOURCE_LLM, result.source)
     }
 
     // .apk 직접 배포처럼 URL에 드러난 사실은 판별기가 넘겨도 남아야 한다
@@ -120,7 +124,7 @@ class RiskAggregatorTest {
         val result = RiskAggregator.combine(signals, llm(80))
 
         assertEquals("판별기 근거", result.reasons.first())
-        assertTrue(result.reasons.size <= UrlRiskVerdict.MAX_REASONS)
+        assertTrue(result.reasons.size <= RiskVerdict.MAX_REASONS)
         assertEquals(result.reasons.distinct(), result.reasons)
     }
 

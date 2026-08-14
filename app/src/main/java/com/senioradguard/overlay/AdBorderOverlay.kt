@@ -19,9 +19,21 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.senioradguard.risk.RiskLevel
 
-/** 확정(공식 라벨) / AI 추정 — 테두리 모양과 배지 문구가 다르다. */
-enum class AdMarkStyle { CONFIRMED, AI_GUESS }
+/**
+ * 테두리 종류. 앞의 둘은 **무엇인지**(광고인가), 뒤의 셋은 **얼마나 위험한지**를 말한다.
+ *
+ * 광고를 찾는 즉시 CONFIRMED/AI_GUESS로 테두리가 뜨고, 이미지 판별(Layer 5)이
+ * 끝나면 그 영역만 RISK_* 로 **바뀐다.** 판별은 왕복이 있어 즉시 나오지 않는데,
+ * 그동안 아무 표시도 없으면 어르신은 이미 광고를 누른 뒤다.
+ *
+ * 위험도 색은 신호등을 그대로 따른다. 배우지 않아도 아는 유일한 색 규약이라,
+ * 글자를 못 읽어도 전달된다.
+ *
+ * 열거 순서가 곧 그리는 순서다([AdBorderOverlay.draw]).
+ */
+enum class AdMarkStyle { CONFIRMED, AI_GUESS, RISK_LOW, RISK_MEDIUM, RISK_HIGH }
 
 /**
  * 광고 영역에 테두리와 배지를 그리는 비차단 오버레이.
@@ -185,7 +197,8 @@ class AdBorderOverlay(private val context: Context) {
             background = GradientDrawable().apply {
                 setColor(Color.argb(235, 33, 33, 33))
                 cornerRadius = dp(26).toFloat()
-                setStroke(dp(2), Color.parseColor("#FF5722"))
+                // 위험도 색(초록·주황·빨강)을 쓰지 않는다. 이건 버튼이지 판정이 아니다.
+                setStroke(dp(2), Color.parseColor("#1E88E5"))
             }
             setOnClickListener { action() }
         }
@@ -301,27 +314,46 @@ class AdBorderOverlay(private val context: Context) {
     }
 
     private fun buildBorderView(spec: Spec): FrameLayout {
+        // 두 벌의 색을 섞지 않는다.
+        //   파랑 계열 = "광고다" (아직 위험도를 모른다)
+        //   신호등    = "위험도가 이만큼이다"
+        // 예전에는 확정 광고가 주황이었는데, 위험도 '중'도 주황이라 실기기에서 둘을
+        // 구분할 수 없었다. 색이 곧 뜻인 화면에서 같은 색이 두 뜻을 가지면 안 된다.
         val accent = when (spec.style) {
-            AdMarkStyle.CONFIRMED -> Color.parseColor("#FF5722")   // 주황
-            AdMarkStyle.AI_GUESS -> Color.parseColor("#FFC107")    // 노랑
+            AdMarkStyle.CONFIRMED -> Color.parseColor("#1E88E5")     // 파랑
+            AdMarkStyle.AI_GUESS -> Color.parseColor("#64B5F6")      // 옅은 파랑
+            AdMarkStyle.RISK_LOW -> RiskLevel.LOW.color              // 초록
+            AdMarkStyle.RISK_MEDIUM -> RiskLevel.MEDIUM.color        // 주황
+            AdMarkStyle.RISK_HIGH -> RiskLevel.HIGH.color            // 빨강
         }
         val badgeLabel = when (spec.style) {
             AdMarkStyle.CONFIRMED -> "AD"
             AdMarkStyle.AI_GUESS -> "AI"
+            AdMarkStyle.RISK_LOW -> "✓"
+            AdMarkStyle.RISK_MEDIUM -> "!"
+            AdMarkStyle.RISK_HIGH -> "!!"
         }
+        // 위험도 배지에는 '광고'라는 말을 넣지 않는다. Layer 5는 광고뿐 아니라
+        // 검색 결과에도 붙는데, 검색 결과를 "안전한 광고"라고 부르면 틀린 말이 된다.
         val badgeText = when (spec.style) {
             AdMarkStyle.CONFIRMED -> "광고"
             AdMarkStyle.AI_GUESS -> "광고 같아요"
+            AdMarkStyle.RISK_LOW -> "안전해요"
+            AdMarkStyle.RISK_MEDIUM -> "주의하세요"
+            AdMarkStyle.RISK_HIGH -> "위험해요"
         }
 
         return FrameLayout(context).apply {
             background = GradientDrawable().apply {
                 setColor(Color.TRANSPARENT)
                 when (spec.style) {
-                    AdMarkStyle.CONFIRMED -> setStroke(dp(6), accent)
                     // AI 추정은 점선 — 확정과 시각적으로 구분해 오탐 시 오해를 줄인다
                     AdMarkStyle.AI_GUESS ->
                         setStroke(dp(6), accent, dp(12).toFloat(), dp(8).toFloat())
+                    // 위험은 굵게. 색만으로는 색약인 사용자에게 전달되지 않으므로
+                    // 두께로도 한 번 더 구분한다.
+                    AdMarkStyle.RISK_HIGH -> setStroke(dp(10), accent)
+                    else -> setStroke(dp(6), accent)
                 }
             }
             // 영역이 배지를 담기에 너무 좁으면 테두리만 표시

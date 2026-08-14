@@ -6,8 +6,12 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [BlacklistDomain::class, AdVerdict::class, IllegalDomain::class, UrlRisk::class],
-    version = 3,
+    entities = [
+        BlacklistDomain::class, AdVerdict::class,
+        IllegalDomain::class, UrlRisk::class,
+        RoiRisk::class
+    ],
+    version = 4,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -21,6 +25,9 @@ abstract class AppDatabase : RoomDatabase() {
 
     /** Layer 4 — 링크 위험도 판정 캐시 */
     abstract fun urlRiskDao(): UrlRiskDao
+
+    /** Layer 5 — 화면 조각(ROI) 위험도 판정 캐시 */
+    abstract fun roiRiskDao(): RoiRiskDao
 
     companion object {
         @Volatile

@@ -99,13 +99,16 @@ class GeminiClient(
      * @param schema responseSchema. 주면 응답이 스키마를 만족하도록 강제되어 JSON
      *        파싱 실패가 사라진다 — 모델이 설명 문장을 덧붙이거나 코드 펜스를
      *        두르는 일이 없어진다
+     * @param imageJpegBase64 함께 보낼 이미지. 화면 전체가 아니라 **잘라낸 영역만**
+     *        넣어야 한다(ScreenCapture 참고). null이면 텍스트만 보낸다
      * @return 모델이 돌려준 JSON 문자열. 실패·타임아웃·상한이면 null
      */
     suspend fun generateJson(
         systemPrompt: String,
         userPrompt: String,
         schema: JSONObject,
-        maxOutputTokens: Int = 1024
+        maxOutputTokens: Int = 1024,
+        imageJpegBase64: String? = null
     ): String? = withContext(Dispatchers.IO) {
         if (apiKey.isBlank() || userPrompt.isBlank()) return@withContext null
         if (System.currentTimeMillis() < cooldownUntil) return@withContext null
@@ -124,7 +127,7 @@ class GeminiClient(
 
             connection.outputStream.use {
                 it.write(
-                    body(systemPrompt, userPrompt, schema, maxOutputTokens)
+                    body(systemPrompt, userPrompt, schema, maxOutputTokens, imageJpegBase64)
                         .toByteArray(Charsets.UTF_8)
                 )
             }
@@ -155,14 +158,28 @@ class GeminiClient(
         systemPrompt: String,
         userPrompt: String,
         schema: JSONObject,
-        maxOutputTokens: Int
+        maxOutputTokens: Int,
+        imageJpegBase64: String?
     ): String = JSONObject().apply {
         put("systemInstruction", JSONObject().put(
             "parts", JSONArray().put(JSONObject().put("text", systemPrompt))
         ))
         put("contents", JSONArray().put(JSONObject().apply {
             put("role", "user")
-            put("parts", JSONArray().put(JSONObject().put("text", userPrompt)))
+            // 이미지를 먼저, 지시를 뒤에 둔다. 이 순서가 "이 그림을 보고 답하라"는
+            // 지시가 그림에 걸리게 만든다 — 반대로 두면 모델이 그림을 참고 자료로만
+            // 취급하고 텍스트만으로 답하는 경우가 있다.
+            put("parts", JSONArray().apply {
+                if (!imageJpegBase64.isNullOrBlank()) {
+                    put(JSONObject().put(
+                        "inline_data",
+                        JSONObject()
+                            .put("mime_type", "image/jpeg")
+                            .put("data", imageJpegBase64)
+                    ))
+                }
+                put(JSONObject().put("text", userPrompt))
+            })
         }))
         put("generationConfig", JSONObject().apply {
             put("temperature", 0)

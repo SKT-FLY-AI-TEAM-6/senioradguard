@@ -6,8 +6,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [BlacklistDomain::class, AdVerdict::class],
-    version = 2,
+    entities = [BlacklistDomain::class, AdVerdict::class, IllegalDomain::class, UrlRisk::class],
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -15,6 +15,12 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun blacklistDao(): BlacklistDao
 
     abstract fun adVerdictDao(): AdVerdictDao
+
+    /** Layer 4 — 확인된 불법 도메인 목록 (판별기보다 먼저 본다) */
+    abstract fun illegalDomainDao(): IllegalDomainDao
+
+    /** Layer 4 — 링크 위험도 판정 캐시 */
+    abstract fun urlRiskDao(): UrlRiskDao
 
     companion object {
         @Volatile

@@ -17,6 +17,7 @@ import com.senioradguard.agent.AgentPipeline
 import com.senioradguard.agent.CandidateExtractor
 import com.senioradguard.agent.GeminiClassifier
 import com.senioradguard.agent.StubClassifier
+import com.senioradguard.detector.IllegalDomainRepository
 import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.guard.InstallGuard
 import com.senioradguard.logger.AdEventLogger
@@ -24,6 +25,16 @@ import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.AdMarkStyle
 import com.senioradguard.overlay.OverlayManager
 import com.senioradguard.region.AdRegionScanner
+import com.senioradguard.url.AdLink
+import com.senioradguard.url.GeminiUrlRiskClassifier
+import com.senioradguard.url.HeuristicUrlRiskClassifier
+import com.senioradguard.url.LinkHarvester
+import com.senioradguard.url.RiskLevel
+import com.senioradguard.url.UrlParser
+import com.senioradguard.url.UrlRiskClassifier
+import com.senioradguard.url.UrlRiskGuard
+import com.senioradguard.url.UrlRiskPipeline
+import com.senioradguard.url.UrlRiskVerdict
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -68,6 +79,11 @@ internal class SightingLog(private val capacity: Int = 128) {
  *   Layer 1  공식 광고 라벨 감지  → 비차단 테두리 (AdBorderOverlay)
  *   Layer 2  LLM 판별            → 캐시 표시는 즉시, 새 판별은 유휴 때만
  *   Layer 3  설치 유도 감지       → 차단 경고 (InstallGuard)
+ *   Layer 4  광고 링크 위험도      → 불법 목록·LLM 추론 (UrlRiskGuard)
+ *
+ * Layer 1·2가 "이게 광고인가"를 보고, Layer 4는 "그 광고가 데려가는 곳이 위험한가"를
+ * 본다. 어르신에게 실제로 피해를 입히는 것은 광고 그 자체가 아니라 광고가 데려가는
+ * 곳이라, 광고를 정확히 찾는 것만으로는 절반밖에 못 지킨다.
  *
  * ## 테두리는 스캔을 기다리지 않는다 — 두 개의 속도
  * 트리 순회는 아무리 조여도 150~250ms가 걸린다. 여기에 스로틀이 얹히면 광고가
@@ -182,6 +198,35 @@ class AdGuardAccessibilityService : AccessibilityService() {
         )
     }
 
+    // ── Layer 4 — 광고 링크 위험도 ──────────────────────────────
+
+    private val urlPipeline by lazy {
+        // Layer 2와 같은 규칙이다. 키가 없으면 규칙 기반 대역으로 물러나므로 키를
+        // 아직 안 받은 팀원도 Layer 4 전 구간을 실기기에서 돌려볼 수 있다.
+        val key = BuildConfig.GEMINI_API_KEY
+        val classifier: UrlRiskClassifier =
+            if (key.isNotBlank()) GeminiUrlRiskClassifier(key) else HeuristicUrlRiskClassifier()
+        Log.i(TAG, "layer4 판별기=${classifier.source}")
+
+        val db = AppDatabase.getInstance(this)
+        UrlRiskPipeline(
+            illegalDao = db.illegalDomainDao(),
+            riskDao = db.urlRiskDao(),
+            classifier = classifier
+        )
+    }
+
+    private val urlGuard by lazy {
+        UrlRiskGuard(
+            pipeline = urlPipeline,
+            onVerdict = ::onUrlVerdict,
+            // AI 토글이 꺼져 있어도 불법 목록 조회와 규칙 판정은 그대로 돈다.
+            // 화면 텍스트가 나가는 Layer 2와 달리 여기서 외부로 나가는 것은 URL뿐이지만,
+            // 그것도 사용자가 켜야만 나가도록 같은 토글에 묶는다.
+            allowClassify = ::isAiEnabled
+        )
+    }
+
     // ──────────────────────────────────────────────────────────
     // 스캔 주기 관리 — 전부 메인 스레드에서만 만진다
     // ──────────────────────────────────────────────────────────
@@ -263,6 +308,16 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // layoutParams 몇 개를 고치는 offsetBy가 전부다.
             notificationTimeout = 0
         }
+
+        // Layer 4의 불법 도메인 목록을 처음 한 번 채운다. 비어 있을 때만 넣으므로
+        // 서비스가 껐다 켜져도 원격에서 받아 둔 목록을 덮어쓰지 않는다.
+        scope.launch {
+            runCatching {
+                IllegalDomainRepository(this@AdGuardAccessibilityService).seedIfEmpty()
+            }.onSuccess { added ->
+                if (added > 0) Log.i(TAG, "layer4 불법 도메인 씨앗 ${added}건 적재")
+            }
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
@@ -283,6 +338,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
             val clickedText = event.contentDescription?.toString()
                 ?: event.text.joinToString(separator = " ")
             installGuard.onClick(clickedText, pkg)
+            onPossibleAdClick(event, clickedText)
             // 클릭만으로는 화면이 바뀌지 않아 Layer 1이 다시 스캔할 게 없다.
             // (화면이 바뀌면 CONTENT_CHANGED가 따로 온다)
             return
@@ -388,12 +444,21 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 다른 앱 화면에 이전 앱의 테두리가 남아 있으면 그게 오탐이다.
             truncatedHolds = 0
             emptySince = 0L
+            // 남은 클릭 기억이 다음 앱 화면으로 새면, 사용자가 직접 연 주소가
+            // 광고 착지로 오인된다.
+            urlGuard.reset()
             withContext(Dispatchers.Main) { apply(emptyList(), emptyList()) }
             return
         }
 
         // 트리 접근은 이 백그라운드 경로에서 끝낸다 (apply는 메인 스레드).
         lastSourceKey = runCatching { extractor.sourceKeyOf(root) }.getOrNull()
+
+        // Layer 4 — 착지 주소를 볼 일이 있을 때만 주소창을 읽는다. 노드 조회가 한 번
+        // 더 늘어나므로, 광고를 누른 적도 화면에 광고가 뜬 적도 없으면 건너뛴다.
+        if (urlGuard.wantsPageUrl()) {
+            runCatching { urlGuard.onPageChanged(LinkHarvester.currentPageUrl(root)) }
+        }
 
         val result = scanner.scan(root)
         if (result.truncated) {
@@ -445,6 +510,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
             }.getOrDefault(emptyList())
         } else {
             emptyList()
+        }
+
+        // 광고가 화면에 떠 있었다는 사실을 Layer 4에 알린다. 크롬이 웹 배너 터치에
+        // 클릭 이벤트를 주지 않아(실기기 확인), 이동 자체를 두 번째 신호로 쓴다.
+        if (stable.isNotEmpty() || guessed.isNotEmpty()) {
+            urlGuard.onAdsShown(lastSourceKey.orEmpty())
         }
 
         withContext(Dispatchers.Main) { apply(stable, guessed) }
@@ -626,6 +697,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
                         )
                     }
                 }
+
+                // Layer 4 — 표시된 광고 영역 안의 링크를 미리 훑는다. 여기서 캐시를
+                // 채워두면 사용자가 실제로 눌렀을 때 판별기를 부르지 않고 즉시 답이
+                // 나온다. 유휴 경로라 이 추가 순회의 비용이 감당된다.
+                harvestAdLinks(root, excluded + result.regions)
             } finally {
                 classifying.set(false)
             }
@@ -645,6 +721,90 @@ class AdGuardAccessibilityService : AccessibilityService() {
     /** 기본 OFF 옵트인. 화면 텍스트가 외부로 나가므로 사용자가 켜야만 동작한다. */
     private fun isAiEnabled(): Boolean =
         getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_AI_CLASSIFY, false)
+
+    // ──────────────────────────────────────────────────────────
+    // Layer 4 — 광고 링크 위험도
+    // ──────────────────────────────────────────────────────────
+
+    /**
+     * 광고로 표시한 영역 안이 눌렸는지 확인하고, 맞으면 Layer 4에 알린다.
+     *
+     * 광고 영역 밖의 클릭은 사용자가 보려던 것이므로 건드리지 않는다. 이 조건이
+     * 없으면 기사 링크를 누를 때마다 위험도 판별이 돌아 호출만 늘어난다.
+     *
+     * 클릭 노드에서 주소를 바로 읽을 수 있으면(크롬 extras) 이동을 기다리지 않고
+     * 그 자리에서 판별한다 — 경고가 이동보다 앞설 수 있는 유일한 경로다. 못 읽으면
+     * 기억만 남기고, 뒤이어 바뀌는 주소창을 [scanWork]가 넘겨준다.
+     */
+    private fun onPossibleAdClick(event: AccessibilityEvent, clickedText: String) {
+        val marked = confirmedRegions + aiRegions
+        if (marked.isEmpty()) return
+
+        val source = event.source ?: return
+        val bounds = Rect().also { source.getBoundsInScreen(it) }
+        if (bounds.isEmpty || marked.none { Rect.intersects(it, bounds) }) return
+
+        val page = lastSourceKey.orEmpty()
+        urlGuard.onAdClicked(clickedText, page)
+
+        val direct = LinkHarvester.urlOf(source) ?: return
+        val link = UrlParser.parse(direct, page, clickedText, isAdElement = true) ?: return
+        scope.launch { urlGuard.onAdLinksSeen(listOf(link)) }
+    }
+
+    /** 표시 중인 광고 영역 안의 링크를 모아 Layer 4로 넘긴다. 유휴 경로에서만 부른다. */
+    private suspend fun harvestAdLinks(root: AccessibilityNodeInfo, regions: List<Rect>) {
+        if (regions.isEmpty()) return
+        val page = runCatching { LinkHarvester.currentPageUrl(root) }.getOrNull()
+            ?: lastSourceKey.orEmpty()
+        val links = runCatching { LinkHarvester.harvest(root, regions, page) }
+            .getOrDefault(emptyList())
+        if (links.isNotEmpty()) urlGuard.onAdLinksSeen(links)
+    }
+
+    /**
+     * Layer 4 판정 결과를 사용자에게 전한다. 백그라운드에서 불린다.
+     *
+     * 등급마다 방식이 다르다. '위험'만 전체 화면 경고로 막아서고, '주의'는 짧은
+     * 안내로 그친다. 모든 등급에 경고를 띄우면 정상 광고 서버에까지 경고가 떠서
+     * 사용자가 경고 자체를 무시하게 된다 — 그러면 진짜 위험할 때도 안 읽는다.
+     */
+    private suspend fun onUrlVerdict(link: AdLink, verdict: UrlRiskVerdict) {
+        Log.i(
+            TAG,
+            "layer4 ${link.components.domain} ${verdict.level.name}(${verdict.score}) " +
+                "${verdict.category.name} 출처=${verdict.source}"
+        )
+        if (verdict.level == RiskLevel.LOW) return
+
+        AdEventLogger.logUrlRisk(
+            host = link.components.domain,
+            levelLabel = verdict.level.label,
+            categoryLabel = verdict.category.label
+        )
+
+        withContext(Dispatchers.Main) {
+            if (verdict.level == RiskLevel.HIGH) showRiskWarning(link, verdict)
+            else toast("주의: ${link.components.rootDomain} — ${verdict.category.label}")
+        }
+    }
+
+    private fun showRiskWarning(link: AdLink, verdict: UrlRiskVerdict) {
+        val pkg = rootInActiveWindow?.packageName?.toString() ?: return
+        val reasons = verdict.reasons.take(MAX_WARNING_REASONS).joinToString("\n") { "· $it" }
+
+        overlayManager.showWarning(
+            message = "위험할 수 있는 광고예요\n\n" +
+                "${link.components.rootDomain}\n${verdict.category.label}\n\n$reasons",
+            packageName = pkg,
+            onConfirm = {
+                AdEventLogger.logIgnored(pkg, "위험 링크 경고 무시 · ${link.components.domain}")
+            },
+            onBlock = { performGlobalAction(GLOBAL_ACTION_BACK) },
+            currentForegroundPackage = { rootInActiveWindow?.packageName?.toString() },
+            onForceHome = { performGlobalAction(GLOBAL_ACTION_HOME) }
+        )
+    }
 
     override fun onInterrupt() {
         apply(emptyList(), emptyList())
@@ -689,6 +849,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         /** 스크롤이 이만큼 멈춰 있어야 Layer 2 판별을 돌린다. */
         private const val LAYER2_IDLE_MS = 600L
+
+        /**
+         * Layer 4 경고창에 적을 근거 수. 두 줄이면 왜 위험한지는 전해지고,
+         * 그 이상은 어르신이 읽지 않는다.
+         */
+        private const val MAX_WARNING_REASONS = 2
 
         // ── "광고 모두 닫기"가 X 버튼을 찾을 때 쓰는 값들 ──
 

@@ -83,7 +83,11 @@ class OverlayManager(private val context: Context) {
     ): View {
         val root = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xDD000000.toInt()) // 반투명 검정 배경
+            // 거의 불투명한 검정. 예전에는 0xDD였는데, 실기기 확인(2026-08-14)에서
+            // 뒷 페이지 글자가 그대로 비쳐 경고 문구와 겹쳐 읽혔다. 경고를 읽지
+            // 못하면 경고가 아니다. 완전 불투명이 아닌 이유는 어느 화면 위에 뜬
+            // 경고인지가 가장자리로 보여야 사용자가 상황을 파악하기 때문이다.
+            setBackgroundColor(0xF7000000.toInt())
             setPadding(48, 60, 48, 60)
             gravity = Gravity.CENTER
         }

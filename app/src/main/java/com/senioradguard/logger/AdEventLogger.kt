@@ -28,6 +28,17 @@ object AdEventLogger {
         record(packageName, adText, action = "warned", layer = layer)
     }
 
+    /**
+     * Layer 4 — 광고가 데려가는 링크의 위험도를 판정했을 때.
+     *
+     * 남기는 것은 **호스트와 등급까지**다. 전체 URL에는 어르신을 식별할 수 있는
+     * 추적 파라미터가 붙어 있고, 어느 기사에서 눌렀는지까지 보호자에게 넘길 이유가
+     * 없다. 보호자가 알아야 할 것은 "어디로 데려가는 광고를 눌렀는가"다.
+     */
+    fun logUrlRisk(host: String, levelLabel: String, categoryLabel: String) {
+        record(host, "위험도 $levelLabel · $categoryLabel", action = "warned", layer = 4)
+    }
+
     /** Layer 3 — 스토어 강제 이동 감지. */
     fun logStoreRedirect(storePackage: String) {
         record(storePackage, "앱 설치 화면으로 이동", action = "warned", layer = 3)

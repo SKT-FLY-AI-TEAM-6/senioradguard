@@ -108,6 +108,26 @@ class UrlVerdictDaoTest {
     }
 
     @Test
+    fun 지문_연계로_판정을_찾는다() = runTest {
+        dao.upsert(verdict("https://a.com/"))
+        db.adFingerprintLinkDao().upsert(AdFingerprintLink("nate.com|abc", "https://a.com/", 1L))
+
+        val v = db.adFingerprintLinkDao().findLinkedVerdict("nate.com|abc", now = 0L)
+
+        assertNotNull(v)
+        assertEquals("HIGH", v!!.riskLevel)
+        assertNull(db.adFingerprintLinkDao().findLinkedVerdict("없는지문", now = 0L))
+    }
+
+    @Test
+    fun 만료된_판정은_지문으로도_나오지_않는다() = runTest {
+        dao.upsert(verdict("https://a.com/", validUntil = 1_000L))
+        db.adFingerprintLinkDao().upsert(AdFingerprintLink("fp", "https://a.com/", 1L))
+
+        assertNull(db.adFingerprintLinkDao().findLinkedVerdict("fp", now = 2_000L))
+    }
+
+    @Test
     fun 기존_DAO들도_계속_동작한다() = runTest {
         db.blacklistDao().insertAll(listOf(BlacklistDomain("doubleclick.net", 1L)))
         assertEquals(listOf("doubleclick.net"), db.blacklistDao().getAllDomains())

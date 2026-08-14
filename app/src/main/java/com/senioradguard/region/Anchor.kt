@@ -32,6 +32,28 @@ class Anchor private constructor(
             "${node.viewIdResourceName}|${node.className}"
     }
 
+    /**
+     * 카드 하위 트리의 텍스트를 모은다 — 지문(CardText 키) 재료다.
+     * 노드가 죽었거나 텍스트가 하나도 없으면 null.
+     * IPC가 노드 수만큼 발생하므로 영역이 새로 나타난 스캔에서만 부른다.
+     */
+    fun gatherText(maxNodes: Int = 40): List<String>? {
+        if (!node.refresh()) return null
+        val out = mutableListOf<String>()
+        var visited = 0
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 15 || visited >= maxNodes) return
+            visited++
+            n.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+            n.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+            for (i in 0 until n.childCount) {
+                walk(n.getChild(i) ?: continue, depth + 1)
+            }
+        }
+        walk(node, 0)
+        return out.takeIf { it.isNotEmpty() }
+    }
+
     /** 지금 좌표. 사라졌거나 **다른 요소로 바뀌었으면** null */
     fun bounds(): Rect? {
         if (!node.refresh()) return null

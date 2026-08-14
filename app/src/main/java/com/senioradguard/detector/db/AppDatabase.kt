@@ -6,8 +6,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [BlacklistDomain::class, AdVerdict::class, UrlVerdict::class],
-    version = 3,
+    entities = [BlacklistDomain::class, AdVerdict::class, UrlVerdict::class, AdFingerprintLink::class],
+    version = 4,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -17,6 +17,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun adVerdictDao(): AdVerdictDao
 
     abstract fun urlVerdictDao(): UrlVerdictDao
+
+    abstract fun adFingerprintLinkDao(): AdFingerprintLinkDao
 
     companion object {
         @Volatile

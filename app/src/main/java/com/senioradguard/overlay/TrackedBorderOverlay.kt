@@ -64,10 +64,23 @@ class TrackedBorderOverlay(private val context: Context) {
         const val JUMP_PX_PER_MS = 15f
         /** 알림음·진동 최소 간격 */
         const val ALERT_MIN_GAP_MS = 3000L
-        /** 저위험 "광고" 표시 색 (기획 3.1절: 파란 테두리 + 광고) */
-        const val AD_COLOR = "#2179FD"
         /** 배지 높이(dp). 테두리 밖 위쪽으로 올릴 거리 계산에 고정값이 필요하다 */
         const val BADGE_H = 34
+    }
+
+    /**
+     * 영역별 표시 스타일 — 기획 3.1절의 위험도 색·어휘.
+     * 색상만으로 구분하지 않는다는 원칙대로 배지 텍스트가 항상 함께 간다.
+     */
+    data class BorderStyle(val color: String, val badge: String) {
+        companion object {
+            /** 저위험·기본: 파란 테두리 + 광고 */
+            val AD = BorderStyle("#2179FD", "광고")
+            /** 중위험 연계 판정: 노란 테두리 + 주의 */
+            val CAUTION = BorderStyle("#F9A825", "주의")
+            /** 고위험 연계 판정: 빨간 테두리 + 위험 */
+            val DANGER = BorderStyle("#E53935", "위험")
+        }
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -90,6 +103,7 @@ class TrackedBorderOverlay(private val context: Context) {
 
     @Volatile private var shownRegions = emptyList<Rect>()
     @Volatile private var trackedAnchors = emptyList<Anchor?>()
+    private var shownStyles = emptyList<BorderStyle>()
     @Volatile private var trackTicks = 0
     @Volatile private var tracking = false
 
@@ -108,8 +122,19 @@ class TrackedBorderOverlay(private val context: Context) {
     fun regions(): List<Rect> = shownRegions
 
     /** 스캔 결과 반영 (메인 스레드) */
-    fun set(regions: List<Rect>, anchors: List<Anchor?>) {
+    fun set(
+        regions: List<Rect>,
+        anchors: List<Anchor?>,
+        styles: List<BorderStyle> = emptyList()
+    ) {
         trackedAnchors = if (anchors.size == regions.size) anchors else List(regions.size) { null }
+        val newStyles = if (styles.size == regions.size) styles else List(regions.size) { BorderStyle.AD }
+        // 스타일이 바뀌었으면(연계 판정이 새로 붙음) 좌표가 같아도 다시 그려야 한다
+        val restyle = newStyles != shownStyles
+        shownStyles = newStyles
+        if (restyle && regions == shownRegions && regions.isNotEmpty()) {
+            showBorders(regions)
+        }
         setAdRegions(regions)
     }
 
@@ -349,7 +374,8 @@ class TrackedBorderOverlay(private val context: Context) {
         // 개수가 같으면 뷰를 재사용하고 자리만 바꾼다 (다 지웠다 그리면 그게 깜빡임이다)
         while (group.childCount > regions.size) group.removeViewAt(group.childCount - 1)
         while (group.childCount < regions.size) {
-            group.addView(buildBorderView(), FrameLayout.LayoutParams(0, 0))
+            val style = shownStyles.getOrElse(group.childCount) { BorderStyle.AD }
+            group.addView(buildBorderView(style), FrameLayout.LayoutParams(0, 0))
         }
         layoutBorders(regions)
     }
@@ -364,7 +390,14 @@ class TrackedBorderOverlay(private val context: Context) {
         val loc = IntArray(2).also { group.getLocationOnScreen(it) }
         val win = Rect(loc[0], loc[1], loc[0] + group.width, loc[1] + group.height)
         for (i in regions.indices) {
-            val v = group.getChildAt(i) as? FrameLayout ?: continue
+            var v = group.getChildAt(i) as? FrameLayout ?: continue
+            // 연계 판정이 붙어 스타일이 바뀐 칸은 그 칸만 새로 만든다
+            val style = shownStyles.getOrElse(i) { BorderStyle.AD }
+            if (v.tag != style) {
+                group.removeViewAt(i)
+                v = buildBorderView(style)
+                group.addView(v, i, FrameLayout.LayoutParams(0, 0))
+            }
             val c = Rect(regions[i])
             // 창 밖 조각은 감춘다. 하한을 낮게 둬야 320x50 인라인 배너를 놓치지 않는다
             if (!c.intersect(win) || c.height() < dp(20)) {
@@ -392,16 +425,16 @@ class TrackedBorderOverlay(private val context: Context) {
         }
     }
 
-    private fun buildBorderView(): FrameLayout {
-        // 배지는 "광고" 한 낱말짜리 알약 하나. 위험도 어휘(RiskLevel.badgeText)와 같은 말이다.
+    private fun buildBorderView(style: BorderStyle): FrameLayout {
+        // 배지는 한 낱말짜리 알약 하나 — 위험도 어휘(광고/주의/위험)와 같은 말이다.
         val badge = TextView(context).apply {
-            text = "광고"
+            text = style.badge
             setTextColor(Color.WHITE)
             textSize = 15f
             gravity = Gravity.CENTER
             setPadding(dp(12), 0, dp(12), 0)
             background = GradientDrawable().apply {
-                setColor(Color.parseColor(AD_COLOR))
+                setColor(Color.parseColor(style.color))
                 // 아래 두 귀퉁이는 각지게 — 테두리 윗변에 얹혀 앉은 한 덩어리로 읽힌다
                 cornerRadii = floatArrayOf(
                     dp(10).toFloat(), dp(10).toFloat(), dp(10).toFloat(), dp(10).toFloat(),
@@ -410,8 +443,9 @@ class TrackedBorderOverlay(private val context: Context) {
             }
         }
         return FrameLayout(context).apply {
+            tag = style
             background = GradientDrawable().apply {
-                setStroke(dp(6), Color.parseColor(AD_COLOR))
+                setStroke(dp(6), Color.parseColor(style.color))
                 setColor(Color.TRANSPARENT)
             }
             clipChildren = false

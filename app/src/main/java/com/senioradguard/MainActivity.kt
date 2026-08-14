@@ -36,7 +36,9 @@ import androidx.compose.ui.unit.sp
 import com.senioradguard.service.AdGuardAccessibilityService
 import com.senioradguard.ui.BatteryOptimizationGuide
 import com.senioradguard.ui.ServiceStatus
-import com.senioradguard.detector.BlacklistUpdateWorker
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import com.senioradguard.detector.BlacklistSeeder
 import com.senioradguard.remote.FirebaseRepo
 import com.senioradguard.risk.ProtectionLevel
 import com.senioradguard.remote.Role
@@ -57,9 +59,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        // 차단 목록 갱신. 예전에는 "받아만 두고 읽는 코드가 없다"는 이유로 꺼뒀는데,
-        // 이제 UrlGuard가 소비하므로 다시 켠다. 주기는 월 1회로 늦췄다.
-        BlacklistUpdateWorker.schedule(applicationContext)
+        // TODO Phase 3 — 원격 갱신 워커는 계속 꺼둔다.
+        // 14만 개를 받아 파싱하고 DB를 통째로 갈아끼우는 작업이라 배터리를 눈에 띄게
+        // 쓰고, 그게 제조사 절전에 이 앱이 얼어붙는 원인이기도 했다. 초기 목록은
+        // assets/blacklist.txt를 첫 실행에 넣는 것으로 대신한다(BlacklistSeeder).
+        // BlacklistUpdateWorker.schedule(applicationContext)
+        lifecycleScope.launch { BlacklistSeeder.seedIfNeeded(applicationContext) }
 
         // 역할을 아직 안 골랐으면 선택 화면으로, 보호자면 대시보드로 넘긴다.
         // 이 화면(어르신 모드)은 접근성 서비스 상태를 다루므로 보호자에게는 의미가 없다.

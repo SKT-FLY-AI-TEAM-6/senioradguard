@@ -276,7 +276,10 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 AccessibilityEvent.TYPE_VIEW_SCROLLED or
                 AccessibilityEvent.TYPE_VIEW_CLICKED
             // 시스템 단계에서 걸러 우리 프로세스를 아예 깨우지 않는다.
-            packageNames = (targetApps + storePackages).toTypedArray()
+            // 삼성 인터넷은 광고 감지 대상이 아니지만(웹 콘텐츠를 트리에 안 내놓는다)
+            // 주소창은 읽히므로 도메인 대조를 위해 이벤트만 받는다.
+            packageNames = (targetApps + storePackages + UrlGuard.URL_BAR_IDS.keys)
+                .toTypedArray()
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
@@ -320,6 +323,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 페이지가 새로 떴다. 광고를 나중에 끼워 넣는 사이트를 위해 재스캔을 예약해 둔다.
             handler.removeCallbacks(lazyRescan)
             for (d in LAZY_RESCAN_MS) handler.postDelayed(lazyRescan, d)
+
+            // 주소가 바뀌었을 때만 대조한다. 같은 페이지 안에서도 이 이벤트는 여러 번 온다.
+            rootInActiveWindow?.let { root ->
+                val host = urlGuard.hostOf(root)
+                if (host != null) scope.launch { checkHost(host) }
+            }
         }
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
@@ -423,7 +432,6 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         // 트리 접근은 이 백그라운드 경로에서 끝낸다 (apply는 메인 스레드).
         lastSourceKey = runCatching { extractor.sourceKeyOf(root) }.getOrNull()
-        checkHost(lastSourceKey)
 
         val ocrRegions = readImageAds()
 

@@ -82,17 +82,52 @@ families/{familyId}/
    - 어르신: 코드 입력 → families/{familyId}/members에 등록
    - SetupActivity에서 모드 선택 시 연동
 
-### Phase 2-B: URL 분석 모듈 활성화
+### Phase 2-B: 브라우저 도메인 대조
 
-3. **DomainMatcher 연결**
-   - `AdGuardAccessibilityService.kt` Layer 3 클릭 감지 지점에서 URL 추출
-   - `DomainMatcher.isDangerous(url)` 호출
-   - 위험 도메인이면 오버레이 표시 + 이벤트 기록
+#### 목적
+사칭 문자나 광고 링크로 사기 사이트 접속 시 즉시 경고 + 이전 화면 복귀 유도.
+사전 차단 아님. 접속 직후 경고.
 
-4. **BlacklistUpdateWorker 재활성화**
-   - `schedule()` 주석 해제
-   - 다운로드 주기를 주 1회 → 월 1회로 변경 (배터리 절약)
-   - 백그라운드 다운로드 완료 후 Room DB 갱신
+#### 트리거
+TYPE_WINDOW_STATE_CHANGED 이벤트에서 브라우저 패키지 감지 시 주소창 URL 읽기
+
+#### 지원 브라우저
+- Chrome: `com.android.chrome:id/url_bar`
+- Samsung Internet: `com.sec.android.app.sbrowser:id/location_bar_edit_text`
+
+#### 흐름
+```
+브라우저 주소창 URL 읽기
+        ↓
+Uri.parse()로 도메인 추출
+        ↓
+Room DB blacklist_domains 테이블 대조
+        ↓
+히트 → 고위험 오버레이 + "안전하게 돌아가기" 버튼
+미히트 → 통과
+```
+
+#### Room DB
+```kotlin
+@Entity(tableName = "blacklist_domains")
+data class BlacklistDomain(
+    @PrimaryKey val domain: String,
+    val addedAt: Long
+)
+```
+도메인 대조는 서픽스 매칭으로 구현 (sub.example.com → example.com도 히트)
+
+#### 초기 데이터
+`assets/blacklist.txt`에 초기 도메인 목록 포함. 앱 첫 실행 시 Room DB에 삽입.
+
+#### 하지 말 것
+- `extractUrl()` 광고 노드 URL 추출 구현하지 마라 (실효성 없음)
+- `AdDetector.kt` 활성화하지 마라
+- `BlacklistUpdateWorker` 재활성화하지 마라 (배터리 이슈, Phase 3로 미룸)
+
+#### 범위
+"알려진 피싱·사기 도메인 접속 직후 경고"까지만. 사전 차단, DBE, DBD 자동 설치는
+범위 밖. APK 설치 차단은 기존 Layer 3가 담당.
 
 ### Phase 2-C: OCR 추가
 

@@ -187,6 +187,27 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private val adClickTracker = AdClickTracker()
 
     /**
+     * 광고를 누른 뒤 "어디로 가는지" 지켜보는 창이 열린 시각.
+     *
+     * 화면이 바뀌는 순간 한 번만 보면 놓친다. 크롬은 WINDOW_STATE_CHANGED를
+     * 보낼 때 주소창을 아직 옛 주소로 두고 있고, 광고는 대개 중간 도메인을
+     * 한두 번 거쳐 최종 목적지에 닿는다. 클릭 플래그가 유효했던 순간부터
+     * 잠시 동안 여러 번 확인한다.
+     */
+    private var redirectWatchUntil = 0L
+
+    /**
+     * 마지막으로 검사한 주소. 브라우저 안에서 주소가 바뀌었는지 판단하는 데 쓴다.
+     *
+     * **크롬 안에서 페이지가 바뀌는 것은 TYPE_WINDOW_STATE_CHANGED를 만들지 않는다.**
+     * 창(액티비티)이 그대로이기 때문이다. 그 이벤트는 앱이 바뀔 때만 온다 — 광고를
+     * 눌러 쿠팡 "앱"이 열리면 오지만, 크롬이 쿠팡 "사이트"로 이동하면 오지 않는다.
+     * 그래서 스캔 경로에서 주소 변화를 함께 본다.
+     */
+    @Volatile
+    private var lastCheckedHost: String? = null
+
+    /**
      * 글자 없는 광고 이미지를 화면에서 읽는다. API 30부터만 가능하다 —
      * takeScreenshot이 그때 생겼고, 그 아래에서는 OCR 없이 동작한다.
      */
@@ -353,20 +374,19 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 return
             }
 
-            // 기능 1 — 광고를 눌러 쇼핑 앱으로 튕겨 나갔다.
-            if (RedirectRules.isRedirectPackage(pkg)) {
-                warnRedirect(pkg)
-                return
+            // 기능 1 — 광고를 눌렀다면 잠시 목적지를 지켜본다.
+            if (adClickTracker.consumePendingClick()) {
+                redirectWatchUntil = SystemClock.uptimeMillis() + REDIRECT_WATCH_MS
+                Log.i(TAG, "광고 클릭 후 이동 감시 시작")
+            }
+            checkRedirect(pkg)
+            for (d in REDIRECT_RECHECK_MS) {
+                handler.postDelayed({ checkRedirect(currentPackage()) }, d)
             }
 
             rootInActiveWindow?.let { root ->
-                val host = urlGuard.hostOf(root)
-                // 기능 1 — 브라우저 안에서 쇼핑몰로 이동한 경우.
-                if (RedirectRules.isRedirectHost(host)) {
-                    warnRedirect(host!!)
-                    return
-                }
                 // 기능 2 — 악성 도메인 대조. 주소가 바뀌었을 때만 본다.
+                val host = urlGuard.hostOf(root)
                 if (host != null) scope.launch { checkHost(host) }
             }
         }
@@ -472,6 +492,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         // 트리 접근은 이 백그라운드 경로에서 끝낸다 (apply는 메인 스레드).
         lastSourceKey = runCatching { extractor.sourceKeyOf(root) }.getOrNull()
+        onHostSeen(lastSourceKey)
 
         val ocrRegions = readImageAds()
 
@@ -812,6 +833,51 @@ class AdGuardAccessibilityService : AccessibilityService() {
         protectionLevel().usesAi &&
             getSharedPreferences("settings", MODE_PRIVATE).getBoolean(PREF_AI_CLASSIFY, false)
 
+    private fun currentPackage(): String? = rootInActiveWindow?.packageName?.toString()
+
+    /**
+     * 스캔이 읽은 주소가 직전과 다르면 화면이 바뀐 것으로 본다.
+     *
+     * 브라우저 안의 이동은 창 전환 이벤트를 만들지 않으므로, 주소가 바뀌었다는
+     * 사실 자체가 유일한 신호다.
+     */
+    private fun onHostSeen(host: String?) {
+        if (host == null || host == lastCheckedHost) return
+        lastCheckedHost = host
+        Log.i(TAG, "주소 변경 감지: $host")
+
+        handler.post {
+            // 광고를 눌렀다면 감시 창을 연다 (앱 전환과 같은 취급).
+            if (adClickTracker.consumePendingClick()) {
+                redirectWatchUntil = SystemClock.uptimeMillis() + REDIRECT_WATCH_MS
+                Log.i(TAG, "광고 클릭 후 이동 감시 시작")
+            }
+            checkRedirect(currentPackage())
+        }
+        scope.launch { checkHost(host) }
+    }
+
+    /**
+     * 감시 창이 열려 있는 동안 목적지가 쇼핑몰인지 본다.
+     *
+     * 창이 닫혀 있으면(= 광고를 누른 적이 없으면) 아무것도 하지 않는다.
+     */
+    private fun checkRedirect(pkg: String?) {
+        if (SystemClock.uptimeMillis() > redirectWatchUntil) return
+
+        if (RedirectRules.isRedirectPackage(pkg)) {
+            redirectWatchUntil = 0
+            warnRedirect(pkg!!)
+            return
+        }
+        val host = rootInActiveWindow?.let { urlGuard.hostOf(it) }
+        Log.i(TAG, "이동 감시: pkg=$pkg host=$host")
+        if (RedirectRules.isRedirectHost(host)) {
+            redirectWatchUntil = 0
+            warnRedirect(host!!)
+        }
+    }
+
     /**
      * 기능 1 — 광고를 눌러 쇼핑몰로 넘어왔다고 알린다.
      *
@@ -819,9 +885,6 @@ class AdGuardAccessibilityService : AccessibilityService() {
      * 모르고 끌려왔을 수 있다는 사실**을 알리는 것이 목적이다. 계속 보겠다면 둔다.
      */
     private fun warnRedirect(key: String) {
-        // 광고를 눌러서 온 게 아니면 아무 말도 하지 않는다. 플래그는 한 번 쓰면
-        // 사라지므로 같은 클릭으로 두 번 뜨지 않는다.
-        if (!adClickTracker.consumePendingClick()) return
         val name = RedirectRules.displayName(key)
         Log.i(TAG, "광고 경유 이동 감지: $key")
 
@@ -947,6 +1010,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         /** 두 스캔 사이 위치가 이 이내면 "안 움직였다"로 본다 */
         private const val PIN_TOLERANCE_PX = 12
+
+        /**
+         * 광고를 누른 뒤 목적지를 지켜보는 시간. 광고는 중간 도메인을 한두 번
+         * 거치고, 느린 회선에서는 최종 페이지까지 몇 초가 걸린다.
+         */
+        private const val REDIRECT_WATCH_MS = 8_000L
+
+        /** 감시 창 안에서 다시 확인할 시각. 주소창이 늦게 갱신되는 것을 메운다. */
+        private val REDIRECT_RECHECK_MS = longArrayOf(500, 1500, 3000, 5000, 7000)
 
         /** 스크롤 경로에서 도는 Layer 2 후보 추출의 시간 상한 */
         private const val SCROLL_EXTRACT_BUDGET_MS = 150L

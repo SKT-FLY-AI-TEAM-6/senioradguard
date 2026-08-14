@@ -10,12 +10,13 @@ import com.senioradguard.BuildConfig
 import com.senioradguard.risk.RiskAssessment
 
 /**
- * Claude API 그림자 판정 — **개발 전용 비교 실험**.
+ * Claude API 판정 — 키가 있으면 **주 LLM 엔진**, 없으면 온디바이스 폴백.
  *
- * 기획 원칙은 "외부 LLM API·자체 서버 미사용"이다. 이 클래스는 그 원칙의
- * 예외가 아니라 근거 수집 장치다: 제품 판정(가림막·DB·표시)은 언제나
- * 온디바이스 LLM이 하고, 여기서는 같은 프롬프트를 Claude에도 보내
- * 속도·판정을 나란히 로그로만 남긴다. 결과는 어디에도 반영되지 않는다.
+ * 2026-08-14 팀 결정: 온디바이스 추론이 15~19초로 발표·데모에 못 쓰는 속도라
+ * Haiku(실측 2.1초)를 주 엔진으로 쓴다. 원 기획의 "외부 LLM API 미사용"은
+ * 온디바이스 실측(완료)과 함께 로드맵으로 유지 — OnDeviceLlm이 그 증거이자
+ * 키 없는 환경의 폴백이다. 안전핀 구조(규칙-저위험만 검토, 상향 전용)는
+ * 엔진과 무관하게 동일하다.
  *
  * local.properties에 CLAUDE_API_KEY가 없으면 [isAvailable]이 false라
  * 요청이 한 건도 나가지 않는다.
@@ -42,7 +43,9 @@ object ClaudeApiJudge {
     class Result(
         /** 상향 판정 (중·고위험) — 저위험 동의·형식 위반이면 null */
         val assessment: RiskAssessment.Assessed?,
-        val elapsedMs: Long
+        val elapsedMs: Long,
+        /** 응답 원문 — "저위험 동의"와 "형식 위반/무응답"을 구분하는 데 쓴다 */
+        val raw: String
     )
 
     /**
@@ -76,7 +79,7 @@ object ClaudeApiJudge {
                 "Claude API 추론 — ${ms}ms (stop=${response.stopReason()}): " +
                     text.replace('\n', ' ').take(140)
             )
-            Result(LlmRiskJudge.parse(text), ms)
+            Result(LlmRiskJudge.parse(text), ms, text)
         }.onFailure { Log.w(TAG, "Claude API 호출 실패", it) }.getOrNull()
     }
 }

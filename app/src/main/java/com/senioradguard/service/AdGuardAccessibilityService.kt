@@ -43,7 +43,6 @@ import com.senioradguard.risk.RiskAssessment
 import com.senioradguard.risk.RiskLevel
 import com.senioradguard.risk.UrlNormalizer
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -1166,40 +1165,29 @@ class AdGuardAccessibilityService : AccessibilityService() {
         val text = LlmRiskJudge.sanitize(page.html ?: return)
         if (text.length < 40) return   // 판단할 내용 자체가 없다
 
-        // 개발용 그림자 비교 — 키가 있을 때만 같은 프롬프트를 Claude API에 병렬로
-        // 보내 속도·판정을 나란히 잰다. 제품 판정에는 절대 반영하지 않는다.
-        val claudeShadow = if (ClaudeApiJudge.isAvailable()) {
-            scope.async(Dispatchers.IO) { ClaudeApiJudge.judge(page.finalUrl, text) }
-        } else null
-
-        val onDeviceStarted = SystemClock.uptimeMillis()
-        val response = withTimeoutOrNull(LLM_TIMEOUT_MS) {
-            onDeviceLlm.generate(LlmRiskJudge.buildPrompt(page.finalUrl, text))
+        // 엔진 선택 — 키가 있으면 Claude(Haiku, 실측 2.1초)가 주 엔진이고,
+        // 없으면 온디바이스(실측 15~19초)로 폴백한다. 어느 쪽이든 역할은 같다:
+        // 규칙-저위험 페이지의 2차 검토, 상향 전용.
+        val raised: RiskAssessment.Assessed?
+        val agreedLow: Boolean
+        if (ClaudeApiJudge.isAvailable()) {
+            val claude = withTimeoutOrNull(LLM_TIMEOUT_MS) {
+                withContext(Dispatchers.IO) { ClaudeApiJudge.judge(page.finalUrl, text) }
+            } ?: return
+            raised = claude.assessment
+            agreedLow = "저위험" in claude.raw
+        } else {
+            val response = withTimeoutOrNull(LLM_TIMEOUT_MS) {
+                onDeviceLlm.generate(LlmRiskJudge.buildPrompt(page.finalUrl, text))
+            } ?: return
+            raised = LlmRiskJudge.parse(response)
+            agreedLow = "저위험" in response
         }
-        val onDeviceMs = SystemClock.uptimeMillis() - onDeviceStarted
-
-        claudeShadow?.let { shadow ->
-            scope.launch {
-                val claude = shadow.await() ?: return@launch
-                val onDeviceVerdict = response
-                    ?.let { LlmRiskJudge.parse(it)?.level?.name ?: "저위험 동의" }
-                    ?: "실패/타임아웃"
-                val claudeVerdict = claude.assessment?.level?.name ?: "저위험 동의"
-                Log.i(
-                    TAG,
-                    "속도 비교 — 온디바이스 ${onDeviceMs}ms($onDeviceVerdict) " +
-                        "vs Claude API ${claude.elapsedMs}ms($claudeVerdict)"
-                )
-            }
-        }
-
-        if (response == null) return
-        val raised = LlmRiskJudge.parse(response)
 
         if (raised == null) {
             // 상향 없음. 명시적 저위험 동의는 흔적을 남긴다 — AI가 재검토했다는
             // 사실이 사용자(와 DB 뷰어)에게 보여야 신뢰가 생긴다.
-            if ("저위험" in response) {
+            if (agreedLow) {
                 Log.i(TAG, "LLM 동의 — $normalized 저위험 유지")
                 runCatching {
                     urlVerdictDao.upsert(

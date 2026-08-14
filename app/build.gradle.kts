@@ -101,6 +101,11 @@ dependencies {
     // 코루틴
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
 
+    // 온디바이스 LLM (4c) — MediaPipe LLM Inference. 모델 파일은 APK에 넣지 않고
+    // 개발 중에는 adb push로 /data/local/tmp/guardian_llm.task 에 둔다 (~1.6GB).
+    // 모델이 없으면 규칙 기반 판정만 동작한다 (OnDeviceLlm.isAvailable 참고).
+    implementation("com.google.mediapipe:tasks-genai:0.10.35")
+
     // Room (블랙리스트 로컬 DB)
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)

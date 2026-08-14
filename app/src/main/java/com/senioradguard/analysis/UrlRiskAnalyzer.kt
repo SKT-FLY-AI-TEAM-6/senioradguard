@@ -29,7 +29,9 @@ interface UrlRiskAnalyzer {
 
 class AnalyzedPage(
     val finalUrl: String,
-    val assessment: RiskAssessment.Assessed
+    val assessment: RiskAssessment.Assessed,
+    /** 최종 페이지 본문. 규칙이 저위험이라 한 경우 온디바이스 LLM의 2차 판단 입력이 된다. */
+    val html: String? = null
 )
 
 /**
@@ -49,7 +51,8 @@ class RuleBasedUrlAnalyzer : UrlRiskAnalyzer {
         val page = PageFetcher.fetch(rawUrl) ?: return@withContext null
         AnalyzedPage(
             finalUrl = page.finalUrl,
-            assessment = UrlRiskRules.assess(page.finalUrl, page.hops, page.contentType, page.html)
+            assessment = UrlRiskRules.assess(page.finalUrl, page.hops, page.contentType, page.html),
+            html = page.html
         )
     }
 }

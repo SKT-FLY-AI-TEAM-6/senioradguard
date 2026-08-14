@@ -20,6 +20,9 @@ import com.senioradguard.agent.GeminiClassifier
 import com.senioradguard.agent.StubClassifier
 import com.senioradguard.analysis.AdEntryDetector
 import com.senioradguard.analysis.AdvertiserMark
+import com.senioradguard.analysis.AnalyzedPage
+import com.senioradguard.analysis.LlmRiskJudge
+import com.senioradguard.analysis.OnDeviceLlm
 import com.senioradguard.analysis.RuleBasedUrlAnalyzer
 import com.senioradguard.analysis.UrlRiskAnalyzer
 import com.senioradguard.analysis.UrlRiskRules
@@ -192,8 +195,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     private val fingerprintDao by lazy { AppDatabase.getInstance(this).adFingerprintLinkDao() }
 
-    /** 격리 분석기. 이 인터페이스가 온디바이스 LLM(4c)의 교체점이다. */
+    /** 격리 분석기 — 규칙 기반 1차 판정 (빠르고, LLM이 있어도 안전핀으로 남는다) */
     private val analyzer: UrlRiskAnalyzer = RuleBasedUrlAnalyzer()
+
+    /**
+     * 온디바이스 LLM(4c). 모델 파일이 있을 때만 동작하며, 규칙이 저위험이라
+     * 한 페이지의 **상향 판단**만 맡는다 — 내리는 경로는 없다.
+     */
+    private val onDeviceLlm by lazy { OnDeviceLlm(this) }
 
     // ── 지문 연계 (4b-④) — 재등장 광고를 클릭 전에 알아본다 ──
 
@@ -1129,6 +1138,66 @@ class AdGuardAccessibilityService : AccessibilityService() {
             linkFingerprints(fpKeys, normalized)
             Log.i(TAG, "분석 완료 — $normalized ${a.level} : ${a.reason} (최종=${page.finalUrl})")
             withContext(Dispatchers.Main) { finishShield(normalized, a) }
+
+            // 규칙이 저위험이라 한 페이지만 온디바이스 LLM이 2차로 본다 (상향 전용).
+            // 가림막은 이미 규칙 결과로 끝났고, 이건 백그라운드에서 돌아
+            // 다음 만남(캐시·지문)과 지각 개입에 반영된다.
+            if (a.level == RiskLevel.LOW && page.html != null && onDeviceLlm.isAvailable()) {
+                scope.launch { escalateWithLlm(normalized, page, fpKeys) }
+            }
+        }
+    }
+
+    /**
+     * 온디바이스 LLM 2차 판단 — 규칙이 못 잡는 내용 기반 사기(가짜 후기·과장
+     * 치료 효과)를 잡는다. 중위험·고위험으로 판단될 때만 판정을 덮어쓰고,
+     * 고위험인데 사용자가 아직 그 페이지에 있으면 늦게라도 복귀시킨다.
+     */
+    private suspend fun escalateWithLlm(
+        normalized: String,
+        page: AnalyzedPage,
+        fpKeys: List<String>
+    ) {
+        val text = LlmRiskJudge.sanitize(page.html ?: return)
+        if (text.length < 40) return   // 판단할 내용 자체가 없다
+        val raised = withTimeoutOrNull(LLM_TIMEOUT_MS) {
+            LlmRiskJudge.parse(
+                onDeviceLlm.generate(LlmRiskJudge.buildPrompt(page.finalUrl, text))
+            )
+        } ?: return
+
+        Log.i(TAG, "LLM 상향 — $normalized ${raised.level} : ${raised.reason}")
+        runCatching {
+            urlVerdictDao.upsert(
+                UrlVerdict(
+                    normalizedUrl = normalized,
+                    riskLevel = raised.level.name,
+                    reason = "AI 판단: ${raised.reason}",
+                    finalUrl = page.finalUrl,
+                    analyzedAt = System.currentTimeMillis(),
+                    validUntil = System.currentTimeMillis() + UrlRiskRules.validityMs(raised.level)
+                )
+            )
+        }
+        linkFingerprints(fpKeys, normalized)
+
+        // 지각 개입 — 판단이 끝났을 때 사용자가 아직 그 페이지를 보고 있으면
+        // 고위험은 늦게라도 빼낸다. 피해는 입력·승인 순간에 나므로 아직 유효하다.
+        if (raised.level == RiskLevel.HIGH) {
+            withContext(Dispatchers.Main) {
+                val hereHost = readUrlBar()?.let { UrlNormalizer.hostOf(it) }
+                if (hereHost != null && hereHost == UrlNormalizer.hostOf(page.finalUrl) &&
+                    !shieldActive
+                ) {
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    shieldActive = true
+                    shieldOverlay.show(
+                        "⚠️", "위험한 곳이었어요",
+                        "${raised.reason}\n안전한 곳으로 돌려보냈어요"
+                    )
+                    handler.postDelayed(dismissShieldRunnable, RESULT_SHOW_MS)
+                }
+            }
         }
     }
 
@@ -1335,6 +1404,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         /** 격리 분석(네트워크 수집 + 규칙 판정)의 시간 상한 */
         private const val ANALYZE_TIMEOUT_MS = 3_000L
+
+        /**
+         * LLM 2차 판단의 시간 상한. 첫 호출은 모델 로드(수 초~수십 초)를
+         * 포함하므로 넉넉히 둔다 — 백그라운드라 사용자를 기다리게 하지 않는다.
+         */
+        private const val LLM_TIMEOUT_MS = 60_000L
 
         /**
          * 선택 대기 중 사용자가 화면을 떠났는지 확인하는 주기. 선택 화면은

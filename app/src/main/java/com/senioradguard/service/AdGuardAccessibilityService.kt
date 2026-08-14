@@ -644,7 +644,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 fpCandidate = gathered
                 val misses = gathered.count { it.isEmpty() }
                 if (gathered.isNotEmpty() && misses > 0) {
-                    Log.i(TAG, "지문 수집 미완 — $misses/${gathered.size} (출처=$src)")
+                    // 진단: 첫 실패 앵커의 상태를 함께 남긴다 (원인 특정용)
+                    val firstMiss = gathered.indexOfFirst { it.isEmpty() }
+                    val probe = stableAnchors.getOrNull(firstMiss)
+                        ?.let { runCatching { it.probe() }.getOrNull() } ?: "anchor=null"
+                    Log.i(TAG, "지문 수집 미완 — $misses/${gathered.size} (출처=$src, $probe)")
                 }
                 gathered
             }

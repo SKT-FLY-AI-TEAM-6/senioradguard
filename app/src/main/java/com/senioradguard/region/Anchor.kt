@@ -39,30 +39,51 @@ class Anchor private constructor(
      */
     fun gatherText(maxNodes: Int = 120): List<String>? {
         if (!node.refresh()) return null
-        val texts = mutableListOf<String>()
-        val descs = mutableListOf<String>()
-        var visited = 0
-        fun walk(n: AccessibilityNodeInfo, depth: Int) {
-            // iframe 광고(쿠팡 파트너스·구글 디스플레이)는 래퍼→iframe→html→body로
-            // 중첩이 깊어 depth 15·노드 40으로는 텍스트에 닿기 전에 끝났다
-            // (실측: 연합뉴스TV에서 지문 수집 미완 2/2 반복 → 초록 표시 불가)
-            if (depth > 25 || visited >= maxNodes) return
-            visited++
-            n.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { texts.add(it) }
-            n.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { descs.add(it) }
-            for (i in 0 until n.childCount) {
-                walk(n.getChild(i) ?: continue, depth + 1)
+        var start: AccessibilityNodeInfo = node
+        var lift = 0
+        while (true) {
+            val texts = mutableListOf<String>()
+            val descs = mutableListOf<String>()
+            var visited = 0
+            fun walk(n: AccessibilityNodeInfo, depth: Int) {
+                // iframe 광고는 래퍼→iframe→html→body로 중첩이 깊어 depth 15·
+                // 노드 40으로는 텍스트에 닿기 전에 끝났다 (실측: 연합뉴스TV)
+                if (depth > 25 || visited >= maxNodes) return
+                visited++
+                n.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { texts.add(it) }
+                n.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                    ?.let { descs.add(it) }
+                for (i in 0 until n.childCount) {
+                    walk(n.getChild(i) ?: continue, depth + 1)
+                }
             }
+            walk(start, 0)
+            // 텍스트 노드가 있으면 그것만 쓴다. 이미지 설명(contentDescription)은
+            // 소재 로테이션마다 바뀌어 문구가 같은 광고의 지문을 흔든다
+            // (실측: 문구는 같고 이미지만 바뀐 광고가 다른 지문이 돼 연계를 놓쳤다).
+            // 이미지 전용 광고만 설명으로 폴백한다.
+            when {
+                texts.isNotEmpty() -> return texts
+                descs.isNotEmpty() -> return descs
+            }
+            // 앵커가 문구 없는 라벨 leaf일 수 있다(실측: children=0 TextView) —
+            // 카드 쪽으로 최대 두 단계 올라가 다시 모은다. 스크롤 컨테이너(피드)
+            // 까지 오르면 기사 문구가 지문에 섞이므로 그 전에 멈춘다.
+            if (lift >= 2) return null
+            val parent = start.parent ?: return null
+            if (parent.isScrollable) return null
+            start = parent
+            lift++
         }
-        walk(node, 0)
-        // 텍스트 노드가 있으면 그것만 쓴다. 이미지 설명(contentDescription)은
-        // 소재 로테이션마다 바뀌어 문구가 같은 광고의 지문을 흔든다
-        // (실측: 문구는 같고 이미지만 바뀐 광고가 다른 지문이 돼 연계를 놓쳤다).
-        // 이미지 전용 광고만 설명으로 폴백한다.
-        return when {
-            texts.isNotEmpty() -> texts
-            descs.isNotEmpty() -> descs
-            else -> null
+    }
+
+    /** 지문 수집 실패 진단용 — refresh 성공 여부·직계 자식 수·클래스를 알려준다 */
+    fun probe(): String {
+        val ok = node.refresh()
+        return if (ok) {
+            "refresh=true children=${node.childCount} class=${node.className}"
+        } else {
+            "refresh=false"
         }
     }
 

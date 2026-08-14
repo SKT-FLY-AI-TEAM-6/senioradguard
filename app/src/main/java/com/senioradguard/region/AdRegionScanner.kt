@@ -34,6 +34,13 @@ class AdRegionScanner {
         const val MAX_REGIONS = 5
 
         /**
+         * 페이지 주소 다수결 표본으로 삼을 서로 다른 호스트의 상한 (ad_claude_fable 이식).
+         * 크롬은 현재 페이지 주소를 어느 노드에도 실어 주지 않고 주소창은 스크롤로
+         * 사라지므로, 최상위 문서(iframe 밖) 링크들이 가리키는 호스트의 다수결로 역산한다.
+         */
+        const val HOST_SAMPLE_LIMIT = 24
+
+        /**
          * 조상을 거슬러 올라가는 횟수 상한. `.parent` 하나가 IPC 한 번이라, 상한이
          * 없으면 깊은 웹 문서에서 라벨 하나당 수십 번의 왕복이 생긴다. 예산을 조상
          * 탐색이 전부 써버리면 정작 형제 노드에 있는 광고를 못 본다.
@@ -59,7 +66,11 @@ class AdRegionScanner {
         /** 예산이 모자라 도중에 끊겼는가 — 끊긴 결과로는 영역을 갱신하면 안 된다 */
         val truncated: Boolean,
         val visited: Int,
-        val elapsedMs: Long
+        val elapsedMs: Long,
+        /** 링크 다수결로 역산한 현재 페이지 호스트 (강제 이동 안내용, 웹이 아니면 null) */
+        val pageHost: String? = null,
+        /** 이번 스캔에서 웹 문서 뿌리를 봤는가 */
+        val sawWeb: Boolean = false
     )
 
     /** 영역과 그 근거 노드 한 쌍 (내부용) */
@@ -81,17 +92,21 @@ class AdRegionScanner {
     private var visited = 0
     private var deadline = 0L
     private var truncated = false
+    private val hostCounts = HashMap<String, Int>()
+    private var sawWeb = false
 
     fun scan(root: AccessibilityNodeInfo): Result {
         val started = SystemClock.uptimeMillis()
         visited = 0
         truncated = false
+        hostCounts.clear()
+        sawWeb = false
         deadline = started + TIME_BUDGET_MS
 
         val screen = Rect().also { root.getBoundsInScreen(it) }
         inBrowser = root.packageName?.toString() in browsers
         val found = mutableListOf<Resolved>()
-        collectAdRegions(root, 0, screen, found)
+        collectAdRegions(root, 0, screen, found, inNestedDoc = false)
         // 전체 화면 광고가 하나라도 있으면 전체 테두리 하나만 표시
         found.firstOrNull { it.rect == screen }?.let { full -> found.retainAll(listOf(full)) }
 
@@ -100,7 +115,9 @@ class AdRegionScanner {
             anchors = found.map { it.anchor },
             truncated = truncated,
             visited = visited,
-            elapsedMs = SystemClock.uptimeMillis() - started
+            elapsedMs = SystemClock.uptimeMillis() - started,
+            pageHost = hostCounts.maxByOrNull { it.value }?.key,
+            sawWeb = sawWeb
         )
     }
 
@@ -121,12 +138,34 @@ class AdRegionScanner {
         node: AccessibilityNodeInfo,
         depth: Int,
         screen: Rect,
-        out: MutableList<Resolved>
+        out: MutableList<Resolved>,
+        inNestedDoc: Boolean
     ) {
         // 인스타그램 릴스는 광고 라벨이 30단계보다 깊이 있어 여유 있게 잡는다
         if (depth > MAX_DEPTH || out.size >= MAX_REGIONS) return
         if (!budgetLeft()) return
         visited++
+
+        // ── 페이지 호스트 다수결 (ad_claude_fable 이식) ──
+        // iframe 안은 남의 문서(광고망 링크가 다수라 표를 오염시킨다) — 최상위 문서
+        // 링크만 센다. 화면 밖 링크도 표본이 된다 (주소 추정에는 가시성이 무관).
+        var childNested = inNestedDoc
+        if (inBrowser) {
+            val role = WebNode.role(node)
+            if (!sawWeb &&
+                (node.className?.toString() == WebNode.WEB_HOST_CLASS || role == "rootWebArea")
+            ) {
+                sawWeb = true
+            }
+            if (!inNestedDoc && role?.lowercase() == "link") {
+                WebNode.targetHost(node)?.let { h ->
+                    if (hostCounts.size < HOST_SAMPLE_LIMIT || hostCounts.containsKey(h)) {
+                        hostCounts.merge(h, 1, Int::plus)
+                    }
+                }
+            }
+            if (role == "iframe" || role == "iframePresentational") childNested = true
+        }
 
         // 화면 밖 요소는 릴스 페이저가 좌표를 어긋나게, 크롬이 높이 0으로 접어서 알려주므로
         // 실제로 화면에 크기를 차지할 때만 광고로 인정한다 (안 그러면 가짜 영역이 한도를 채운다)
@@ -149,7 +188,7 @@ class AdRegionScanner {
             }
         }
         for (i in 0 until node.childCount) {
-            collectAdRegions(node.getChild(i) ?: continue, depth + 1, screen, out)
+            collectAdRegions(node.getChild(i) ?: continue, depth + 1, screen, out, childNested)
             if (out.size >= MAX_REGIONS || truncated) return
         }
     }

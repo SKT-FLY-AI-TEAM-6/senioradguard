@@ -31,8 +31,10 @@ import com.senioradguard.detector.db.AdFingerprintLink
 import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.detector.db.UrlVerdict
 import com.senioradguard.guard.InstallGuard
+import com.senioradguard.guard.NavigationGuard
 import com.senioradguard.logger.AdEventLogger
 import com.senioradguard.overlay.AdBorderOverlay
+import com.senioradguard.overlay.BackPromptOverlay
 import com.senioradguard.overlay.AdMarkStyle
 import com.senioradguard.overlay.OverlayManager
 import com.senioradguard.overlay.ShieldOverlay
@@ -285,6 +287,21 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     /** 선택 대기의 기준 화면(패키지) — 여기를 떠나면 가림막을 걷는다 */
     private var choiceScreenPkg: String? = null
+
+    /**
+     * 강제 이동 감시 (ad_claude_fable NavigationGuard 이식). 광고 신호가 없는
+     * 사이트 강제 이동(팝업·리다이렉트)에도 "뒤로 가기" 안내를 준다 — 가림막은
+     * 광고 확신이 있을 때만 뜨므로 이쪽이 나머지 구멍을 메운다. 가림막이 뜬
+     * 이동은 가림막이 우선이고, 끝날 때 안내도 함께 걷는다(dismissShieldNow).
+     */
+    private val navGuard = NavigationGuard()
+    private val backPrompt by lazy { BackPromptOverlay(this) }
+
+    /** 스캔 스레드가 쓰고 apply(메인)가 읽는다 */
+    @Volatile
+    private var navShowBack = false
+
+    private val navRecheck = Runnable { requestScan() }
 
     /**
      * 선택 버튼(안전하게 돌아가기 / 그냥 볼게요)을 띄우고 사용자 결정을
@@ -558,6 +575,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // 다른 앱 화면에 이전 앱의 테두리가 남아 있으면 그게 오탐이다.
             truncatedHolds = 0
             emptySince = 0L
+            navGuard.reset()
+            navShowBack = false
             withContext(Dispatchers.Main) { apply(emptyList(), emptyList(), emptyList(), emptyList(), emptyList(), false) }
             return
         }
@@ -569,6 +588,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
         if (result.truncated) {
             Log.d(TAG, "scan truncated: visited=${result.visited} ${result.elapsedMs}ms")
         }
+
+        // 강제 이동 감시 — 벽시계가 아니라 부팅 이후 경과 시간(원본 주석 참고)
+        navShowBack = navGuard.update(
+            root.packageName?.toString() ?: "?",
+            result.pageHost,
+            result.sawWeb,
+            SystemClock.uptimeMillis()
+        )
 
         // 예산이 모자라 도중에 끊긴 결과로는 영역을 갱신하지 않고 직전 영역을 유지한다.
         // 부분적으로만 훑은 화면에서 영역을 갱신하면 그 자체가 오탐이 되기 때문이다.
@@ -907,6 +934,44 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // prevChromeHost를 유지한다. 스크롤하면 크롬이 주소창을 접는데, 그때 끊어
         // 버리면 기사 중간·하단 광고(대부분 스크롤 후 클릭)의 랜딩 이동을 통째로
         // 놓친다 — "특정 사이트에서만 된다"는 리포트의 실제 원인.
+
+        // ── 강제 이동 복귀 안내 (ad_claude_fable 이식) ──
+        // 가림막이 떠 있으면 그쪽이 우선이다 (판정 + 자체 복귀 버튼 보유).
+        if (navShowBack && !shieldActive) {
+            backPrompt.show(
+                onStay = {
+                    navGuard.dismiss()
+                    backPrompt.hide()
+                },
+                onBack = {
+                    val leaves = navGuard.leavesApp
+                    navGuard.dismiss()
+                    backPrompt.hide()
+                    if (leaves) leaveApp(3) else performGlobalAction(GLOBAL_ACTION_BACK)
+                }
+            )
+            // 화면이 멈춰 있으면 이벤트가 없어 다음 스캔이 안 돈다 — 안내가 떠 있는
+            // 동안만 스스로 깨워 12초 만료를 확인한다 (원본과 같은 장치).
+            handler.removeCallbacks(navRecheck)
+            handler.postDelayed(navRecheck, 1_000)
+        } else {
+            backPrompt.hide()
+        }
+    }
+
+    /**
+     * 앱에서 벗어날 때까지 뒤로 가기를 누른다 — "한 번 더 누르면 종료"인 앱은
+     * 한 번으로 안 나가진다. 화면의 앱이 그대로일 때만 다시 누른다 (원본 이식).
+     */
+    private fun leaveApp(tries: Int) {
+        val before = rootInActiveWindow?.packageName?.toString()
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        if (tries <= 1) return
+        handler.postDelayed({
+            if (before != null && rootInActiveWindow?.packageName?.toString() == before) {
+                leaveApp(tries - 1)
+            }
+        }, 700)
     }
 
     private fun List<Rect>.shiftedBy(dy: Int): List<Rect> =
@@ -1528,6 +1593,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
         shieldOverlay.dismiss()
         shieldActive = false
         shieldAwaitingChoice = false
+        // 가림막이 다룬 이동에 강제 이동 안내가 겹으로 뜨지 않게 한다 —
+        // 판정과 복귀 선택지는 가림막이 이미 줬다.
+        navGuard.dismiss()
     }
 
     override fun onInterrupt() {

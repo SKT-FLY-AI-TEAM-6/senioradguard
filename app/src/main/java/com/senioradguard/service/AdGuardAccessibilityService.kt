@@ -22,6 +22,7 @@ import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.guard.AdClickTracker
 import com.senioradguard.guard.InstallGuard
 import com.senioradguard.guard.InstallSourceGuard
+import com.senioradguard.guard.RedirectChainTracker
 import com.senioradguard.guard.RedirectRules
 import com.senioradguard.logger.AdEventLogger
 import com.senioradguard.ocr.OcrScanner
@@ -185,6 +186,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
      * 어르신이 스스로 쿠팡을 켠 경우까지 경고하면 멀쩡한 행동을 방해하게 된다.
      */
     private val adClickTracker = AdClickTracker()
+
+    /**
+     * 주소가 바뀐 흔적으로 "광고를 거쳐 왔는가"를 본다.
+     *
+     * 클릭 이벤트만으로는 웹 광고를 잡을 수 없다 — 크롬은 웹 광고를 눌러도
+     * TYPE_VIEW_CLICKED를 보내지 않는다(실기기 확인). 네이티브 앱에서는 클릭
+     * 이벤트가 오므로 둘을 함께 쓴다.
+     */
+    private val chainTracker = RedirectChainTracker()
 
     /**
      * 광고를 누른 뒤 "어디로 가는지" 지켜보는 창이 열린 시각.
@@ -846,11 +856,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
         lastCheckedHost = host
         Log.i(TAG, "주소 변경 감지: $host")
 
+        // 광고를 거쳐 왔다는 증거는 둘 중 하나면 된다.
+        //   - 광고 노드를 눌렀다 (네이티브 앱에서 오는 신호)
+        //   - 중계 도메인을 스쳐 지나왔다 (웹에서 유일하게 남는 흔적)
+        val viaChain = chainTracker.onHost(host)
+
         handler.post {
-            // 광고를 눌렀다면 감시 창을 연다 (앱 전환과 같은 취급).
-            if (adClickTracker.consumePendingClick()) {
+            if (adClickTracker.consumePendingClick() || viaChain) {
                 redirectWatchUntil = SystemClock.uptimeMillis() + REDIRECT_WATCH_MS
-                Log.i(TAG, "광고 클릭 후 이동 감시 시작")
+                Log.i(TAG, "광고 경유 판단 — 이동 감시 시작 (중계=$viaChain)")
             }
             checkRedirect(currentPackage())
         }

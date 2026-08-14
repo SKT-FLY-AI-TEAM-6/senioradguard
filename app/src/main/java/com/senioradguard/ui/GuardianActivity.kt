@@ -10,7 +10,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -25,7 +24,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -37,12 +35,10 @@ import androidx.compose.ui.unit.sp
 import com.senioradguard.remote.FamilyEvent
 import com.senioradguard.remote.FamilyRepo
 import com.senioradguard.remote.GoogleAuth
-import com.senioradguard.remote.InviteCode
 import com.senioradguard.ui.theme.SeniorAdGuardTheme
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlinx.coroutines.launch
 
 /**
  * 보호자 모드 화면. 가족을 만들고 어르신의 차단 내역을 본다.
@@ -68,12 +64,9 @@ class GuardianActivity : ComponentActivity() {
 @Composable
 private fun GuardianScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
 
     var familyId by remember { mutableStateOf(FamilyRepo.savedFamilyId(context)) }
-    var inviteCode by remember { mutableStateOf<String?>(null) }
-    var busy by remember { mutableStateOf(false) }
-    var message by remember { mutableStateOf<String?>(null) }
+    val inviteCode = remember { FamilyRepo.savedInviteCode(context) }
     var events by remember { mutableStateOf<List<FamilyEvent>>(emptyList()) }
 
     DisposableEffect(familyId) {
@@ -107,75 +100,43 @@ private fun GuardianScreen(modifier: Modifier = Modifier) {
             ) { Text("모드 바꾸기", fontSize = 14.sp) }
         }
 
-        message?.let { Notice(it) }
-
         if (familyId == null) {
             Notice(
-                "가족을 만들면 6자리 코드가 나옵니다.\n" +
-                    "그 코드를 어르신 폰에 입력하면 연결됩니다."
+                "아직 가족을 만들지 않았습니다.\n" +
+                    "'모드 바꾸기'를 눌러 보호자 모드를 다시 고르면 만들 수 있어요."
             )
-            Button(
-                onClick = {
-                    busy = true
-                    message = null
-                    scope.launch {
-                        // 로그인은 여기서 처음 묻는다. 가족은 사람 단위라 계정이 있어야
-                        // 기기를 바꿔도 연결이 유지된다.
-                        val uid = if (GoogleAuth.isSignedIn) FamilyRepo.uid()
-                        else GoogleAuth.signIn(context)
+            return@Column
+        }
 
-                        if (uid == null) {
-                            message = "구글 로그인에 실패했습니다.\n" +
-                                "Firebase 콘솔에서 Google 로그인과 SHA-1 등록이 필요합니다."
-                        } else {
-                            val code = InviteCode.generate()
-                            val created = FamilyRepo.createFamily(context, code)
-                            if (created == null) {
-                                message = "가족을 만들지 못했습니다. 네트워크를 확인해주세요."
-                            } else {
-                                familyId = created
-                                inviteCode = code
-                            }
-                        }
-                        busy = false
-                    }
-                },
-                enabled = !busy,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(60.dp)
-            ) { Text(if (busy) "만드는 중…" else "가족 만들기", fontSize = 20.sp) }
-        } else {
-            inviteCode?.let { code ->
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD))
+        inviteCode?.let { code ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Text("어르신에게 불러주세요", fontSize = 16.sp, color = Color(0xFF555555))
-                        Text(
-                            code,
-                            fontSize = 40.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace
-                        )
-                    }
+                    Text("어르신에게 불러주세요", fontSize = 16.sp, color = Color(0xFF555555))
+                    Text(
+                        code,
+                        fontSize = 40.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
                 }
             }
+        }
 
-            LabeledRow("기록된 내역", "${events.size}건")
+        LabeledRow("기록된 내역", "${events.size}건")
 
-            if (events.isEmpty()) {
-                Notice("아직 기록이 없습니다.\n어르신 폰에서 광고가 감지되면 여기에 바로 나타납니다.")
-            } else {
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    items(events, key = { it.eventId }) { EventCard(it) }
-                }
+        if (events.isEmpty()) {
+            Notice("아직 기록이 없습니다.\n어르신 폰에서 광고가 감지되면 여기에 바로 나타납니다.")
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(events, key = { it.eventId }) { EventCard(it) }
             }
         }
     }

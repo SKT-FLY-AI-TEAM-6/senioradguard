@@ -55,6 +55,7 @@ object FamilyRepo {
     private const val PREFS = "adguard_prefs"
     private const val KEY_FAMILY = "family_id"
     private const val KEY_ROLE = "role"
+    private const val KEY_INVITE = "invite_code"
 
     private var db: FirebaseFirestore? = null
 
@@ -85,8 +86,12 @@ object FamilyRepo {
     fun savedFamilyId(context: Context): String? =
         prefs(context).getString(KEY_FAMILY, null)
 
+    /** 이 기기가 만든 가족의 초대 코드. 보호자만 값이 있다. */
+    fun savedInviteCode(context: Context): String? =
+        prefs(context).getString(KEY_INVITE, null)
+
     fun clearLocal(context: Context) {
-        prefs(context).edit().remove(KEY_ROLE).remove(KEY_FAMILY).apply()
+        prefs(context).edit().remove(KEY_ROLE).remove(KEY_FAMILY).remove(KEY_INVITE).apply()
     }
 
     private fun prefs(context: Context) =
@@ -117,6 +122,9 @@ object FamilyRepo {
                 .await()
 
             save(context, Role.GUARDIAN, familyId)
+            // 코드를 기억해 둔다. 보호자가 나중에 다시 불러줘야 할 때
+            // 화면에서 확인할 수 있어야 한다.
+            prefs(context).edit().putString(KEY_INVITE, code).apply()
             familyId
         }.getOrElse {
             Log.e(TAG, "가족 생성 실패: ${it.message}")

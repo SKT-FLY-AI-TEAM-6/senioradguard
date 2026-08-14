@@ -188,7 +188,7 @@ private fun HomeScreen(
 
         // 어떤 상태든 아래 두 가지는 항상 보여준다. 이게 없으면 UI만으로는
         // 보호자를 연결할 수도, 역할을 바꿔볼 수도 없다.
-        FamilyJoinCard()
+        FamilyStatusCard()
         ChangeRoleButton()
     }
 }
@@ -256,20 +256,16 @@ private fun ProtectionLevelCard() {
 }
 
 /**
- * 보호자가 불러준 6자리 코드를 넣어 가족에 들어간다.
+ * 보호자와 연결됐는지만 보여준다.
  *
- * 이 화면에서 처음으로 로그인을 묻는다. 앱을 켜자마자 계정을 요구하면 무엇을
- * 하는 앱인지도 모르는 채 로그인부터 하게 된다. 연결을 실제로 원하는 시점에
- * 묻고, 연결하지 않아도 광고 감지는 그대로 돈다.
+ * 연결 자체는 처음 역할을 고를 때(SetupActivity) 한다. 여기서 또 코드를 넣게
+ * 하면 같은 일을 두 곳에서 하게 되고, 어느 쪽이 진짜인지 헷갈린다. 다시 연결하려면
+ * "모드 바꾸기"로 처음 화면으로 돌아가면 된다.
  */
 @Composable
-private fun FamilyJoinCard() {
+private fun FamilyStatusCard() {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var familyId by remember { mutableStateOf(FamilyRepo.savedFamilyId(context)) }
-    var input by remember { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
-    var message by remember { mutableStateOf<String?>(null) }
+    val connected = remember { FamilyRepo.savedFamilyId(context) != null }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -279,51 +275,18 @@ private fun FamilyJoinCard() {
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            if (familyId != null) {
-                Text("보호자와 연결됨", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                Text("광고를 발견하면 보호자에게 알려드립니다.", fontSize = 16.sp)
-                return@Column
-            }
-
-            Text("보호자 연결", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            Text("보호자가 불러준 6자리 숫자를 넣어주세요.", fontSize = 16.sp)
-
-            OutlinedTextField(
-                value = input,
-                onValueChange = { input = InviteCode.normalize(it).take(InviteCode.LENGTH) },
-                label = { Text("연결 숫자 6자리") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                modifier = Modifier.fillMaxWidth()
+            Text(
+                if (connected) "보호자와 연결됨" else "보호자와 연결 안 됨",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold
             )
-            message?.let { Text(it, fontSize = 15.sp, color = Color(0xFFC62828)) }
-
-            Button(
-                onClick = {
-                    busy = true
-                    message = null
-                    scope.launch {
-                        val uid = if (GoogleAuth.isSignedIn) FamilyRepo.uid()
-                        else GoogleAuth.signIn(context)
-
-                        when {
-                            uid == null ->
-                                message = "구글 로그인에 실패했습니다."
-                            !FamilyRepo.joinFamily(context, input) ->
-                                message = "그런 숫자를 가진 가족이 없습니다. 다시 확인해주세요."
-                            else ->
-                                familyId = FamilyRepo.savedFamilyId(context)
-                        }
-                        busy = false
-                    }
-                },
-                enabled = !busy && InviteCode.isValid(input),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(60.dp)
-            ) { Text(if (busy) "연결 중…" else "연결하기", fontSize = 20.sp) }
+            Text(
+                if (connected) "광고를 발견하면 보호자에게 알려드립니다."
+                else "'모드 바꾸기'를 눌러 보호자와 연결할 수 있어요.",
+                fontSize = 16.sp
+            )
         }
     }
 }

@@ -33,6 +33,11 @@ if (hasGoogleServices) {
 // 배포 전에는 반드시 우리 서버를 거치는 구현으로 바꿔야 한다 (AdClassifier가 교체점).
 val geminiApiKey: String = localProperties.getProperty("GEMINI_API_KEY", "")
 
+// 온디바이스 LLM vs Claude API 속도·품질 비교 실험용 키 (개발 전용 그림자 경로).
+// 비어 있으면 비교 코드는 완전히 잠들고, 제품 판정은 항상 온디바이스가 한다 —
+// 기획 원칙(외부 LLM API 미사용)은 유지된다. ClaudeApiJudge 참고.
+val claudeApiKey: String = localProperties.getProperty("CLAUDE_API_KEY", "")
+
 android {
     namespace = "com.senioradguard"
     compileSdk {
@@ -49,6 +54,7 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
+        buildConfigField("String", "CLAUDE_API_KEY", "\"$claudeApiKey\"")
         buildConfigField("Boolean", "HAS_FIREBASE", "$hasGoogleServices")
     }
 
@@ -71,6 +77,18 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+    packaging {
+        // anthropic-java의 전이 의존성(httpclient5 등)이 같은 경로의 라이선스
+        // 메타파일을 여럿 갖고 있어 병합이 실패한다 — 실행에 불필요하므로 제외.
+        resources {
+            excludes += setOf(
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+                "META-INF/INDEX.LIST"
+            )
+        }
     }
 }
 
@@ -105,6 +123,10 @@ dependencies {
     // 개발 중에는 adb push로 /data/local/tmp/guardian_llm.task 에 둔다 (~1.6GB).
     // 모델이 없으면 규칙 기반 판정만 동작한다 (OnDeviceLlm.isAvailable 참고).
     implementation("com.google.mediapipe:tasks-genai:0.10.35")
+
+    // Claude API — 온디바이스 LLM과의 속도·품질 비교 실험 전용 (ClaudeApiJudge).
+    // CLAUDE_API_KEY가 비어 있으면 어떤 요청도 나가지 않는다.
+    implementation("com.anthropic:anthropic-java:2.34.0")
 
     // Room (블랙리스트 로컬 DB)
     implementation(libs.androidx.room.runtime)

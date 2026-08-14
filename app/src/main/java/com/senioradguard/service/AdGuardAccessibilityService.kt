@@ -218,6 +218,17 @@ class AdGuardAccessibilityService : AccessibilityService() {
      */
     private var fpHeights: List<Int> = emptyList()
 
+    /** 직전 스캔에서 모은 지문 후보. 두 번 연속 같아야 [fpFrozen]으로 확정한다 */
+    private var fpCandidate: List<List<String>> = emptyList()
+
+    /**
+     * 지문이 확정됐는가. 페이지 로드 중 첫 수집은 텍스트가 일부만 담기기도
+     * 해서, 그대로 굳히면 같은 광고가 될 때도 안 될 때도 있는 간헐 실패가
+     * 된다 (사용자 실사용 리포트). 두 번 연속 같은 결과가 나올 때까지
+     * 스캔마다 다시 모은다.
+     */
+    private var fpFrozen = false
+
     /** 마지막으로 광고가 떠 있던 화면의 지문 키들. 이동 후에는 이게 "출발 페이지의 광고"다 */
     @Volatile
     private var lastAdFpKeys: List<List<String>> = emptyList()
@@ -546,24 +557,33 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // 같은 화면에서 광고가 같은 수로 교체되는 드문 경우는 지문이 한 스캔
         // 늦게 갱신될 수 있는데, 지문은 표시·연계 보조라 치명적이지 않다.
         val src = lastSourceKey ?: "unknown"
+        // 주소창이 접혀 출처가 패키지명으로 떨어진 스캔에서는 지문을 만들지 않는다.
+        // 같은 광고가 m.news.nate.com|해시 와 com.android.chrome|해시 두 지문을
+        // 오가면 연계가 될 때도 안 될 때도 있는 간헐 실패가 된다 (실사용 리포트).
+        val srcReliable = '.' in src && src !in targetApps
         // 높이가 20% 넘게 달라진 영역이 있으면 그때 모은 지문은 못 믿는다
         val heightsStable = stable.size == fpHeights.size && stable.indices.all { i ->
             val h = stable[i].height()
             fpHeights[i] > 0 && kotlin.math.abs(h - fpHeights[i]) <= h / 5
         }
-        val fpKeys: List<List<String>> =
-            if (src == fpSourceKey && stable.size == confirmedFpKeys.size &&
+        val fpKeys: List<List<String>> = when {
+            !srcReliable ->
+                if (stable.size == confirmedFpKeys.size) confirmedFpKeys
+                else stable.map { emptyList() }
+
+            fpFrozen && src == fpSourceKey && stable.size == confirmedFpKeys.size &&
                 confirmedFpKeys.isNotEmpty() && heightsStable &&
-                // 빈 키가 하나라도 있으면 재수집한다 — 페이지 로드 직후 첫 스캔은
-                // 광고 텍스트가 아직 안 채워져 수집이 비기도 한다 (실측).
-                // 실패를 재사용 조건에 넣으면 그 실패가 영영 굳는다.
-                confirmedFpKeys.none { it.isEmpty() }
-            ) {
-                confirmedFpKeys
-            } else {
+                confirmedFpKeys.none { it.isEmpty() } -> confirmedFpKeys
+
+            else -> {
+                if (src != fpSourceKey || stable.size != confirmedFpKeys.size || !heightsStable) {
+                    // 페이지·광고 구성이 바뀌었다 — 확정을 풀고 처음부터 다시 모은다
+                    fpFrozen = false
+                    fpCandidate = emptyList()
+                }
                 fpSourceKey = src
                 fpHeights = stable.map { it.height() }
-                stableAnchors.map { a ->
+                val gathered = stableAnchors.map { a ->
                     val texts = runCatching { a?.gatherText() }.getOrNull()
                     if (texts == null) {
                         emptyList()
@@ -575,13 +595,19 @@ class AdGuardAccessibilityService : AccessibilityService() {
                         if (adv.isNotEmpty()) keys += CardText.cacheKey("adv|$src", adv)
                         keys
                     }
-                }.also { list ->
-                    val misses = list.count { it.isEmpty() }
-                    if (list.isNotEmpty() && misses > 0) {
-                        Log.i(TAG, "지문 수집 미완 — $misses/${list.size} (출처=$src)")
-                    }
                 }
+                // 두 번 연속 같은 결과가 나와야 확정한다 — 로드 중 일부만 담긴
+                // 수집이 굳는 것을 막는다
+                fpFrozen = gathered.isNotEmpty() && gathered == fpCandidate &&
+                    gathered.none { it.isEmpty() }
+                fpCandidate = gathered
+                val misses = gathered.count { it.isEmpty() }
+                if (gathered.isNotEmpty() && misses > 0) {
+                    Log.i(TAG, "지문 수집 미완 — $misses/${gathered.size} (출처=$src)")
+                }
+                gathered
             }
+        }
 
         // 연계된 판정이 있으면 클릭 전에 최종 등급(주의/위험/확인)으로 표시한다.
         // 카드 전체 지문 → 광고주 지문 순서로 조회한다.

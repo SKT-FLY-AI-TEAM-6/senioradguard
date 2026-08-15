@@ -109,6 +109,10 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     testImplementation(libs.kotlinx.coroutines.test)
+    // serp 단위 테스트 전용. android.jar의 org.json은 전부 예외를 던지는 껍데기라
+    // 응답 파싱을 JVM에서 검증하려면 진짜 구현이 클래스패스에 있어야 한다.
+    // APK에는 들어가지 않는다 — 기기에는 플랫폼 org.json이 이미 있다.
+    testImplementation("org.json:json:20250107")
 
     // Firebase — 보호자 모드 실시간 동기화 (google-services.json이 있을 때만 실제 동작)
     implementation(platform(libs.firebase.bom))

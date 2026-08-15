@@ -27,15 +27,23 @@ import com.senioradguard.analysis.OnDeviceLlm
 import com.senioradguard.analysis.RuleBasedUrlAnalyzer
 import com.senioradguard.analysis.UrlRiskAnalyzer
 import com.senioradguard.analysis.UrlRiskRules
+import com.guradian.serp.SerpFeature
+import com.senioradguard.detector.BlacklistHardSignal
+import com.senioradguard.detector.BlacklistSeeder
+import com.senioradguard.detector.UrlGuard
 import com.senioradguard.detector.db.AdFingerprintLink
 import com.senioradguard.detector.db.AppDatabase
 import com.senioradguard.detector.db.UrlVerdict
 import com.senioradguard.guard.InstallGuard
+import com.senioradguard.guard.InstallSourceGuard
 import com.senioradguard.guard.NavigationGuard
+import com.senioradguard.guard.RelayTransitTracker
 import com.senioradguard.logger.AdEventLogger
+import com.senioradguard.logger.GuardianEventLogger
 import com.senioradguard.overlay.AdBorderOverlay
 import com.senioradguard.overlay.BackPromptOverlay
 import com.senioradguard.overlay.AdMarkStyle
+import com.senioradguard.overlay.GuardAlertOverlay
 import com.senioradguard.overlay.OverlayManager
 import com.senioradguard.overlay.ShieldOverlay
 import com.senioradguard.overlay.TrackedBorderOverlay
@@ -46,6 +54,7 @@ import com.senioradguard.risk.RiskLevel
 import com.senioradguard.risk.UrlNormalizer
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -184,6 +193,58 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    // ──────────────────────────────────────────────────────────
+    // 신규 기능 상태 (merge/guardian-all) — 얹을 것 1·2·3.
+    // phase4 로직은 건드리지 않고 이 상태들과 신규 분기·함수만 추가한다.
+    // ──────────────────────────────────────────────────────────
+
+    /**
+     * 얹을 것 3 — 검색 결과 위험도. 자립 패키지(com.guradian.serp)의 단일 입구.
+     * 최고 위험(HIGH) 판정이 새 호스트에서 나올 때만 원격 승격한다 —
+     * 호스트·검색어는 기기 밖으로 나가지 않는다.
+     */
+    private val serp by lazy {
+        SerpFeature(
+            this, scope, BuildConfig.GEMINI_API_KEY,
+            onHighRisk = { GuardianEventLogger.logSearchRiskDetected() }
+        )
+    }
+
+    /** 얹을 것 1 — 주소창 도메인을 14만 건 차단 목록과 대조한다. */
+    private val urlGuard by lazy { UrlGuard(this) }
+
+    /**
+     * 얹을 것 2 — DBD 설치 차단. phase4 [installGuard](광고→Play스토어 흐름)와
+     * 트리거가 완전히 다르고 상태를 공유하지 않는다.
+     */
+    private val installSourceGuard = InstallSourceGuard()
+
+    /**
+     * 중계 경유 추적 (phase6 이식). 클릭 이벤트가 없는 웹 광고 이동이 남기는
+     * 유일한 흔적(스쳐 지나간 제3의 도메인)을 본다. 결말 UX는 phase4의
+     * 가림막·복귀 바가 담당하므로 이쪽은 판단 재료만 만든다.
+     */
+    private val relayTracker = RelayTransitTracker()
+
+    /** 버튼 하나짜리 전체화면 경고 — 고위험 확정(차단 도메인·DBD 설치)에만 쓴다. */
+    private val guardAlert by lazy { GuardAlertOverlay(this) }
+
+    /**
+     * 설치 확인 화면 직전에 떠 있던 앱. 신규 분기 ①이 갱신하고 ③이 설치 출처
+     * 판정에 쓴다. 인스톨러 자신은 갱신에서 제외해야 "직전" 값이 살아남는다.
+     */
+    @Volatile
+    private var foregroundBeforeInstaller: String? = null
+
+    /** 이미 경고한 차단 도메인 — 같은 페이지에 머무는 동안 반복 경고를 막는다. */
+    private val warnedBlockedHosts = SightingLog()
+
+    /** 주소창 확인 스로틀 — 이벤트마다 루트 IPC를 부르면 부담이 된다. */
+    private var lastHostWatchAt = 0L
+
+    /** 마지막으로 대조한 브라우저 호스트 — 같은 호스트는 다시 보지 않는다. */
+    private var lastWatchedHost: String? = null
 
     // ──────────────────────────────────────────────────────────
     // 광고발 진입 감지 + 가림막 (4b-①②)
@@ -426,7 +487,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
                 AccessibilityEvent.TYPE_VIEW_SCROLLED or
                 AccessibilityEvent.TYPE_VIEW_CLICKED
             // 시스템 단계에서 걸러 우리 프로세스를 아예 깨우지 않는다.
-            packageNames = (targetApps + storePackages).toTypedArray()
+            // 신규 기능(merge/guardian-all)이 "화면이 떴다"를 알아야 하는
+            // 패키지들을 더한다 — 광고 스캔 대상이 늘어나는 것은 아니다
+            // (scanWork의 targetApps 검사는 그대로다).
+            packageNames = (
+                targetApps + storePackages +
+                    SerpFeature.PACKAGES +                  // 구글 앱 — 검색 결과 위험도
+                    UrlGuard.URL_BAR_IDS.keys +             // 삼성 인터넷 — 주소창 대조만
+                    InstallSourceGuard.INSTALLER_PACKAGES   // 시스템 인스톨러 — DBD 감지
+                ).toTypedArray()
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
@@ -441,11 +510,54 @@ class AdGuardAccessibilityService : AccessibilityService() {
             // layoutParams 몇 개를 고치는 offsetBy가 전부다.
             notificationTimeout = 0
         }
+
+        // 블랙리스트 첫 시드 (14만 건). 최초 1회만 실제로 돌고 이후에는
+        // 플래그만 읽고 바로 돌아온다 — BlacklistSeeder 주석 참고.
+        scope.launch { BlacklistSeeder.seedIfNeeded(this@AdGuardAccessibilityService) }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val pkg = event.packageName?.toString() ?: return
 
+        // ──────────────────────────────────────────────────────
+        // 신규 분기 ①~③·⑦ (merge/guardian-all). 기존 phase4 로직(아래 ④~⑧)은
+        // 내용을 바꾸지 않고 순서 그대로 둔다.
+        // ──────────────────────────────────────────────────────
+
+        // ① 포그라운드 갱신 — 설치 확인 화면 "직전"에 떠 있던 앱이 곧 설치
+        //    출처다. 인스톨러 자신은 제외해야 직전 값이 덮이지 않는다.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            !installSourceGuard.isInstallerScreen(pkg)
+        ) {
+            foregroundBeforeInstaller = pkg
+        }
+
+        // ② 검색 결과 위험도 — targetApps 필터보다 앞이어야 구글 앱 이벤트가
+        //    닿는다. HIGH 위험 오버레이(가림막·전체화면 경고)가 떠 있는 동안은
+        //    배지를 억제한다 — 경고 위에 배지까지 겹치면 어느 것도 읽히지 않는다.
+        if (shieldActive || guardAlert.isShowing) serp.hide() else serp.onEvent(event, pkg)
+
+        // ③ DBD 설치 차단 — 설치 확인 화면이 스토어를 거치지 않고 떴다.
+        //    광고→Play스토어 정상 흐름(아래 ④ InstallGuard)과 완전히 별개다.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            installSourceGuard.isInstallerScreen(pkg)
+        ) {
+            warnDirectDownloadInstall()
+            return
+        }
+
+        // ⑦ 악성 도메인 대조 + 중계 경유 추적 — 삼성 인터넷은 targetApps에
+        //    없어 아래 ⑤ 필터보다 앞에서 처리해야 한다 (주소창은 읽힌다).
+        //    크롬의 같은 탭 이동은 창 전환 이벤트를 만들지 않으므로
+        //    CONTENT_CHANGED에서도 (스로틀을 걸고) 주소창을 본다.
+        if (pkg in UrlGuard.URL_BAR_IDS.keys &&
+            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)
+        ) {
+            watchBrowserHost()
+        }
+
+        // ④ Play스토어 화면 → 기존 phase4 InstallGuard 그대로 [무변경]
         // ── Layer 3: 설치 유도 감지 ──
         // 스토어는 targetApps가 아니므로 아래 필터보다 먼저 처리해야 한다.
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
@@ -1618,12 +1730,145 @@ class AdGuardAccessibilityService : AccessibilityService() {
         navGuard.dismiss()
     }
 
+    // ──────────────────────────────────────────────────────────
+    // 신규 기능 구현 (merge/guardian-all) — 아래 함수는 전부 추가 코드다
+    // ──────────────────────────────────────────────────────────
+
+    /**
+     * ⑦ 브라우저 주소창을 읽어 (a) 중계 경유를 추적하고 (b) 차단 목록과 대조한다.
+     *
+     * **한 번의 이동은 한 번만 소모한다(락).** 같은 이동을 phase4의
+     * AdEntryDetector 경로(클릭 대기·가림막)가 이미 다루고 있으면 —
+     * 가림막이 떠 있거나 클릭 대기가 유효하면 — 중계 추적의 반응은 버린다.
+     * 반대 방향은 저절로 성립한다: 이쪽은 가림막 경로의 상태를 일절 건드리지
+     * 않으므로 phase4 판정이 이중으로 발동할 일이 없다.
+     */
+    private fun watchBrowserHost() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastHostWatchAt < HOST_WATCH_INTERVAL_MS) return
+        lastHostWatchAt = now
+
+        val root = rootInActiveWindow ?: return
+        val host = urlGuard.hostOf(root) ?: return
+        if (host == lastWatchedHost) return
+        lastWatchedHost = host
+
+        val viaRelay = relayTracker.onHost(host)
+        val consumedByEntryDetector = shieldActive || entryDetector.hasFreshPending()
+        if (viaRelay && !consumedByEntryDetector) {
+            // phase6의 warnRedirect 팝업은 가져오지 않았다 — 광고발 이동의 결말
+            // UX는 phase4의 가림막·복귀 바가 담당한다. 여기서는 흔적만 남기고,
+            // 도착지가 위험한지는 아래 차단 목록 대조가 가린다.
+            Log.i(TAG, "중계 경유 도착: $host")
+        }
+
+        // 검색 결과 화면이면 대조를 건너뛴다 — serp 배지가 결과 칸 단위로
+        // 같은 위험을 이미 알리고 있어, 전체화면 경고까지 겹치면 소음이 된다.
+        if (serp.isSerpScreen) return
+        scope.launch { checkBlockedHost(host) }
+    }
+
+    /**
+     * 얹을 것 1 — 지금 페이지의 도메인이 차단 목록에 있는지 본다.
+     *
+     * 링크를 누르는 순간이 아니라 **도착한 뒤**에 확인한다 — 접근성 트리에는
+     * href가 없어 누르기 전에 알 방법이 없다 ([UrlGuard] 주석). 페이지는 이미
+     * 열렸지만 개인정보를 넣거나 앱을 받기 전에 멈춰 세울 수 있다.
+     */
+    private suspend fun checkBlockedHost(host: String) {
+        if (!urlGuard.isBlocked(host)) return
+        if (!warnedBlockedHosts.shouldReport(host, layer = 3)) return
+
+        // 스쳐 지나가는 중계는 사용자가 "보고 있는" 페이지가 아니다. 광고망
+        // 도메인은 대개 차단 목록에도 있어, 그대로 두면 광고를 누를 때마다
+        // 경고가 뜬다 (phase6 실측: appier.net을 0.4초 지나가며 경고).
+        // 잠깐 기다렸다가 아직도 그 주소에 있을 때만 알린다.
+        delay(SETTLE_BEFORE_WARN_MS)
+        val stillThere = withContext(Dispatchers.Main) {
+            rootInActiveWindow?.let { urlGuard.hostOf(it) }
+        }
+        if (stillThere != host) {
+            Log.i(TAG, "차단 도메인이었으나 지나감: $host → $stillThere")
+            return
+        }
+
+        // 하드 신호(등급 하한) 등록 — HIGH 판정을 URL 캐시에 미리 적어 둔다.
+        // phase4의 판정 흐름(resolveFromStore)은 캐시를 항상 먼저 보고 히트하면
+        // 거기서 끝나므로 이 URL은 격리 분석·LLM까지 내려가지 않고, LLM 경로는
+        // 설계상 상향 전용이라 어떤 판정도 이 등급을 내리지 못한다
+        // ([BlacklistHardSignal] 참고).
+        val hard = BlacklistHardSignal.assessment()
+        val entry = "https://$host"
+        UrlNormalizer.normalize(entry)?.let { normalized ->
+            val now = System.currentTimeMillis()
+            runCatching {
+                urlVerdictDao.upsert(
+                    UrlVerdict(
+                        normalizedUrl = normalized,
+                        riskLevel = hard.level.name,
+                        reason = hard.reason,
+                        finalUrl = entry,
+                        analyzedAt = now,
+                        validUntil = now + UrlRiskRules.validityMs(hard.level)
+                    )
+                )
+            }
+        }
+
+        Log.i(TAG, "차단 도메인 감지: $host")
+        // 원격에는 사실만 남긴다 — 도메인명·URL은 싣지 않는다.
+        GuardianEventLogger.logDomainBlocked()
+
+        withContext(Dispatchers.Main) {
+            // HIGH 위험 오버레이가 항상 우선 — 배지·가림막은 걷는다.
+            serp.hide()
+            if (shieldActive) dismissShieldNow()
+            guardAlert.show(
+                "⚠️", "위험한 사이트예요",
+                "알려진 사기·피싱 사이트 목록에 있는 곳이에요.\n" +
+                    "개인정보나 돈을 입력하지 마세요.",
+                "안전하게 돌아가기"
+            ) { performGlobalAction(GLOBAL_ACTION_BACK) }
+        }
+    }
+
+    /**
+     * 얹을 것 2 — 스토어를 거치지 않은 APK 설치 확인 화면(DBD)에 끼어든다.
+     *
+     * 시스템 설치 버튼은 누를 수도 가릴 수도 없다(FLAG_SECURE, Play 정책).
+     * 전체화면 경고를 덮어 "이게 무슨 화면인지" 알리고 돌아갈 길 하나를 주는
+     * 것까지가 우리 몫이다. "그래도 설치" 버튼은 두지 않는다.
+     */
+    private fun warnDirectDownloadInstall() {
+        val source = foregroundBeforeInstaller
+        if (!installSourceGuard.isDirectDownloadInstall(source)) return
+        if (guardAlert.isShowing) return
+        Log.i(TAG, "DBD 설치 화면 감지 — 직전 화면=${source ?: "-"}")
+
+        // 원격에는 사실만 남긴다 — 무엇을 설치하려 했는지는 싣지 않는다.
+        GuardianEventLogger.logApkInstallWarning()
+
+        // HIGH 위험 오버레이가 항상 우선 — 배지·가림막은 걷는다.
+        serp.hide()
+        if (shieldActive) dismissShieldNow()
+        guardAlert.show(
+            "⚠️", "앱을 설치하려고 해요",
+            "플레이스토어가 아닌 곳에서 받은 앱이에요.\n" +
+                "모르는 앱이면 설치하지 마세요.",
+            "설치 취소하고 돌아가기"
+        ) { performGlobalAction(GLOBAL_ACTION_BACK) }
+    }
+
     override fun onInterrupt() {
+        serp.stop()
+        guardAlert.dismiss()
         apply(emptyList(), emptyList(), emptyList(), emptyList(), emptyList(), false)
     }
 
     override fun onDestroy() {
         isConnected = false
+        serp.stop()
+        guardAlert.dismiss()
         handler.removeCallbacksAndMessages(null)
         scope.cancel()
         borderOverlay.dismissAll()
@@ -1738,6 +1983,20 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         /** "광고 모두 닫기" 동안 광고 클릭 판별을 멈추는 시간 */
         private const val CLOSE_SUPPRESS_MS = 1_500L
+
+        // ── 신규 기능(merge/guardian-all)이 쓰는 값들 ──
+
+        /**
+         * 주소창 대조(⑦)의 최소 간격. CONTENT_CHANGED는 스크롤·로딩 중 초당
+         * 수십 번 오는데, 매번 루트를 읽으면 그 자체가 IPC 부담이다.
+         */
+        private const val HOST_WATCH_INTERVAL_MS = 500L
+
+        /**
+         * 차단 도메인을 발견해도 이만큼 기다렸다 아직 그 주소일 때만 경고한다.
+         * 스쳐 지나가는 광고망 중계에 경고하지 않기 위해서다 (phase6 값 그대로).
+         */
+        private const val SETTLE_BEFORE_WARN_MS = 1_500L
 
         /** "settings" prefs — AI 광고 판별 옵트인 키. MainActivity 토글과 공유한다. */
         const val PREF_AI_CLASSIFY = "ai_classify"

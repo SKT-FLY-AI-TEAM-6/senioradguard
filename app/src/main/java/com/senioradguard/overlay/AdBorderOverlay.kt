@@ -98,6 +98,13 @@ class AdBorderOverlay(private val context: Context) {
     /** 마지막으로 알림음·진동을 울린 시각 */
     private var lastAlertAt = 0L
 
+    /**
+     * 광고별로 관측된 온전한 높이 (스타일+가로 위치가 키). 접근성 좌표는 화면
+     * 밖으로 나간 부분이 잘린 채 오므로, 얼마나 가려졌는지 재려면 안 잘렸던
+     * 순간의 높이가 필요하다.
+     */
+    private val fullHeights = mutableMapOf<String, Int>()
+
     /** 자식 뷰 하나의 생김새. 이게 같으면 뷰를 그대로 재사용한다. */
     private data class Spec(val style: AdMarkStyle, val withBadge: Boolean)
 
@@ -111,6 +118,7 @@ class AdBorderOverlay(private val context: Context) {
         shown[style] = regions
 
         if (shown.values.all { it.isEmpty() }) {
+            fullHeights.clear()
             removeOverlay()
             removeCloseBar()
             return
@@ -158,6 +166,12 @@ class AdBorderOverlay(private val context: Context) {
             val lp = view.layoutParams as FrameLayout.LayoutParams
             lp.topMargin += dy
             view.layoutParams = lp
+            // 스크롤로 1/3 넘게 창 밖으로 밀려난 테두리는 다음 스캔을 기다리지 않고
+            // 즉시 감춘다 — 잘린 채 따라다니는 테두리가 스크롤 중 혼선의 원인이다.
+            // 실측 재배치(draw)가 다시 보일지 말지를 최종 결정한다.
+            val visibleH = minOf(lp.topMargin + lp.height, root.height) - maxOf(lp.topMargin, 0)
+            view.visibility =
+                if (visibleH * 3 < minOf(lp.height, root.height) * 2) View.GONE else View.VISIBLE
         }
     }
 
@@ -165,6 +179,7 @@ class AdBorderOverlay(private val context: Context) {
 
     fun dismissAll() {
         shown.clear()
+        fullHeights.clear()
         removeOverlay()
         removeCloseBar()
     }
@@ -275,8 +290,21 @@ class AdBorderOverlay(private val context: Context) {
         for (style in AdMarkStyle.values()) {
             for (r in shown[style].orEmpty()) {
                 val c = Rect(r)
-                // 창 밖·너무 얇은 조각은 생략
-                if (!c.intersect(win) || c.height() < minHeight) continue
+                // 광고의 "원래 키"를 기억해 둔다 — 접근성 좌표는 화면 밖 부분이 잘린
+                // 채 오므로 잘린 높이만으로는 얼마나 가려졌는지 알 수 없다.
+                val key = "${style.name}@${r.left},${r.width()}"
+                val fullH = if (r.top > win.top && r.bottom < win.bottom) {
+                    fullHeights[key] = r.height()
+                    r.height()
+                } else {
+                    maxOf(fullHeights[key] ?: 0, r.height())
+                }.coerceAtMost(win.height())
+
+                // 창 밖·너무 얇은 조각은 생략. 광고가 1/3 넘게 화면 밖으로 나갔으면
+                // 테두리도 걷는다 — 잘린 광고의 테두리는 스크롤 중 혼란만 준다.
+                if (!c.intersect(win) || c.height() < minHeight || c.height() * 3 < fullH * 2) {
+                    continue
+                }
 
                 val spec = Spec(style, c.height() >= badgeMinHeight)
                 var view = root.getChildAt(i)
@@ -285,6 +313,8 @@ class AdBorderOverlay(private val context: Context) {
                     view = buildBorderView(spec).apply { tag = spec }
                     root.addView(view, i, FrameLayout.LayoutParams(c.width(), c.height()))
                 }
+                // offsetBy가 스크롤 중 감춰 둔 뷰일 수 있다 — 실측 재배치는 되살린다
+                view.visibility = View.VISIBLE
 
                 val lp = view.layoutParams as FrameLayout.LayoutParams
                 val left = c.left - win.left

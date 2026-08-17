@@ -2,6 +2,10 @@ package com.senioradguard.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
@@ -25,6 +29,7 @@ import com.senioradguard.analysis.ClaudeApiJudge
 import com.senioradguard.analysis.LlmRiskJudge
 import com.senioradguard.analysis.OnDeviceLlm
 import com.senioradguard.analysis.RuleBasedUrlAnalyzer
+import com.senioradguard.analysis.ShieldReason
 import com.senioradguard.analysis.UrlRiskAnalyzer
 import com.senioradguard.analysis.UrlRiskRules
 import com.guradian.serp.SerpFeature
@@ -41,6 +46,7 @@ import com.senioradguard.guard.RelayTransitTracker
 import com.senioradguard.logger.AdEventLogger
 import com.senioradguard.logger.GuardianEventLogger
 import com.senioradguard.overlay.AdBorderOverlay
+import com.senioradguard.overlay.AdCoverOverlay
 import com.senioradguard.overlay.BackPromptOverlay
 import com.senioradguard.overlay.AdMarkStyle
 import com.senioradguard.overlay.GuardAlertOverlay
@@ -163,6 +169,16 @@ class AdGuardAccessibilityService : AccessibilityService() {
     // ("token null is not valid") — 광고를 감지하는 순간마다 앱이 크래시한다.
     private val borderOverlay by lazy {
         AdBorderOverlay(this).apply { onCloseAllAds = ::closeAllAds }
+    }
+
+    /** 닫기 버튼이 없는 광고를 가리는 창 — [closeAllAds]가 쓴다 */
+    private val adCover by lazy { AdCoverOverlay(this) }
+
+    /** 화면이 꺼졌다 — 커버가 잠금화면·홈 위에 남지 않게 즉시 걷는다 */
+    private val screenOffReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            adCover.hide()
+        }
     }
 
     /**
@@ -333,6 +349,16 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     /** 가림막을 띄운 이동의 출발 호스트 — 주소창이 여기로 돌아오면 딥링크 이탈이다 */
     private var shieldCameFrom: String? = null
+
+    /**
+     * 복귀 바의 "뒤로 가기"가 되돌아가야 할 곳 — 광고를 누르기 전에 읽던 사이트.
+     * 전체 호스트(m.news.nate.com)일 수도, 중계 추적이 준 eTLD+1(nate.com)일 수도
+     * 있어 비교는 접미사로 한다 ([atReturnTarget]).
+     */
+    private var returnTargetSite: String? = null
+
+    /** 복귀 반복의 마감 시각. 0이면 복귀 중이 아니다 */
+    private var returnDeadline = 0L
 
     /** 사전 표시 로그 중복 억제용 — 직전에 기록한 건수 */
     private var lastPreWarnedLogged = -1
@@ -511,6 +537,17 @@ class AdGuardAccessibilityService : AccessibilityService() {
             notificationTimeout = 0
         }
 
+        // 화면이 꺼지면 커버를 즉시 걷는다.
+        //
+        // **접근성 이벤트만으로는 이 순간을 알 수 없다.** 화면이 꺼지고 잠금화면·
+        // 홈으로 나가는 경로는 우리 packageNames에 없어서 이벤트가 아예 오지
+        // 않는다. 그래서 커버가 홈 화면 위에 그대로 남았다(실사용 리포트) —
+        // 그냥 남는 것도 아니고 터치를 삼키는 창이라 더 나쁘다. SerpFeature가
+        // 배지에서 같은 구멍을 같은 방식으로 메운다.
+        runCatching {
+            registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+        }
+
         // 블랙리스트 첫 시드 (14만 건). 최초 1회만 실제로 돌고 이후에는
         // 플래그만 읽고 바로 돌아온다 — BlacklistSeeder 주석 참고.
         scope.launch { BlacklistSeeder.seedIfNeeded(this@AdGuardAccessibilityService) }
@@ -580,6 +617,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
         }
 
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            // 화면이 바뀌었다 — 이전 화면의 광고를 덮던 커버는 여기서 무의미하다
+            adCover.hide()
             // 페이지가 새로 떴다. 광고를 나중에 끼워 넣는 사이트를 위해 재스캔을 예약해 둔다.
             handler.removeCallbacks(lazyRescan)
             for (d in LAZY_RESCAN_MS) handler.postDelayed(lazyRescan, d)
@@ -603,6 +642,15 @@ class AdGuardAccessibilityService : AccessibilityService() {
         }
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            // 커버는 좌표를 추적하지 않는다. 화면이 구르면 광고도 함께 밀려 올라가므로
+            // 붙잡을 이유가 없고, 그대로 두면 엉뚱한 본문을 덮는다.
+            //
+            // **스크롤 양을 보고 판단하면 안 된다.** 크롬 WebView가 보내는 스크롤
+            // 이벤트는 deltaY가 전부 -1(UNDEFINED)이라 scrollDeltaY가 0으로 버린다.
+            // 처음엔 dy != 0일 때만 걷게 했더니 웹에서는 아무리 스크롤해도 커버가
+            // 남았다 — 스크롤이 일어났다는 사실 자체로 충분하다.
+            if (adCover.isShowing) adCover.hide()
+
             val dy = scrollDeltaY(event)
             if (dy != 0) {
                 // AI 점선은 스캔을 기다리지 않고 바로 민다 (확정 테두리는 아래
@@ -700,6 +748,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
             emptySince = 0L
             navGuard.reset()
             navShowBack = false
+            // 커버는 그 앱의 광고 위에 있던 것이다. 다른 앱·홈으로 나갔으면
+            // 덮을 대상이 없고, 남으면 엉뚱한 화면에서 터치를 삼킨다.
+            withContext(Dispatchers.Main) { adCover.hide() }
             withContext(Dispatchers.Main) { apply(emptyList(), emptyList(), emptyList(), emptyList(), emptyList(), false) }
             return
         }
@@ -754,10 +805,13 @@ class AdGuardAccessibilityService : AccessibilityService() {
             }
         }
 
-        // 닫기 막대는 실제로 닫을 수 있는 광고가 있을 때만 띄운다 — 눌러도 "닫기
-        // 버튼이 없어요"만 나오는 막대는 어르신에게 소음이다. 전면 광고는 뒤로
-        // 가기가 곧 닫기이므로 그 자체로 닫을 수 있는 광고다.
-        val closable = runCatching { hasClosableAd(root, stable) }.getOrDefault(false)
+        // 광고가 보이면 닫기 막대를 띄운다.
+        //
+        // 예전에는 스캔마다 트리를 한 번 더 훑어 X가 실재하는지 확인하고, 없으면
+        // 막대를 감췄다 — 눌러도 "닫기 버튼이 없어요"만 나오는 막대가 소음이라서다.
+        // 이제 X가 없으면 가리기로 처리하므로 누르면 **항상** 광고가 사라진다.
+        // 그 확인 순회는 존재 이유가 사라졌고, 없애면 스캔이 그만큼 빨라진다.
+        val closable = stable.isNotEmpty()
 
         // ── 지문 (4b-④) — 출처·개수가 그대로면 다시 모으지 않는다.
         // 같은 화면에서 광고가 같은 수로 교체되는 드문 경우는 지문이 한 스캔
@@ -839,7 +893,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // 캐시만 보는 Layer 2. 판별기를 부르지 않으므로 화면이 바뀔 때마다 돌려도 되고,
         // 그래야 점선이 카드를 따라다닌다. 다만 이건 이번 프레임의 **두 번째** 트리
         // 순회라 상한을 걸어 확정 테두리의 추종을 방해하지 않게 한다. 새 판별은 유휴 때만.
-        val guessed = if (isAiEnabled()) {
+        // 검색 결과 화면에서는 돌리지 않는다 — serp 배지가 결과 칸 단위로 이미
+        // 표시 중인데 그 위에 "광고 같아요" 점선까지 겹치면 어느 것도 안 읽힌다.
+        val guessed = if (isAiEnabled() && !serp.isSerpScreen) {
             runCatching {
                 pipeline.run(
                     extractor.extract(root, stable, budgetMs = SCROLL_EXTRACT_BUDGET_MS),
@@ -863,73 +919,51 @@ class AdGuardAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 닫을 수 있는 광고가 있는가 — 닫기 버튼이 실재하거나 전면 광고(뒤로 가기로
-     * 닫힘)일 때. 스캔마다 도는 추가 순회이므로 예산으로 막는다. 예산이 끝나면
-     * 못 찾은 것으로 치는데, 막대를 안 띄울 뿐이라 조용히 실패해도 위험하지 않다.
+     * X 탐색 범위 — 감지 영역보다 약간 넓게 잡는다. 광고의 X는 모서리에 딱 붙어
+     * 있어 감지 영역이 몇 px만 좁게 잡혀도 경계 밖으로 밀려나 못 찾는다.
      */
-    private fun hasClosableAd(root: AccessibilityNodeInfo, regions: List<Rect>): Boolean {
-        if (regions.isEmpty()) return false
-        val screen = Rect().also { root.getBoundsInScreen(it) }
-        if (regions.any { it.height() >= screen.height() * FULLSCREEN_RATIO }) return true
-        val budget = CloseBudget()
-        return regions.any { findCloseButton(root, it, 0, budget) != null }
-    }
-
-    /** 닫기 버튼 탐색의 예산. 본 스캔보다 작게 잡는다 — 컨트롤은 광고 영역 안에만 있다. */
-    private class CloseBudget {
-        private val deadline = SystemClock.uptimeMillis() + CLOSE_TIME_BUDGET_MS
-        private var visited = 0
-
-        fun take(): Boolean {
-            if (visited >= CLOSE_NODE_BUDGET || SystemClock.uptimeMillis() > deadline) return false
-            visited++
-            return true
-        }
+    private fun closeSearchArea(region: Rect): Rect = Rect(region).apply {
+        val slop = (CLOSE_REGION_SLOP_DP * resources.displayMetrics.density).toInt()
+        inset(-slop, -slop)
     }
 
     /**
-     * "광고 모두 닫기" — 표시 중인 각 광고 영역에서 닫기(X) 버튼을 찾아 누른다.
+     * "광고 모두 닫기" — 닫을 수 있으면 X를 대신 누르고, 없으면 **가린다.**
      *
      * 사용자가 직접 누른 버튼에 대한 응답이다. 앱이 알아서 광고를 없애는 게 아니라,
      * 작은 X를 찾아 누르기 어려운 사람을 대신해 그 동작을 수행한다.
      *
-     * **못 찾았다고 뒤로 가기를 하면 안 된다.** 처음엔 그렇게 만들었는데, 웹 배너
-     * 광고는 접근성 트리에 X가 거의 없어서 사실상 매번 폴백이 걸렸고, 결과적으로
-     * 광고가 아니라 사용자가 보던 페이지가 닫혔다. 읽던 것을 잃는 쪽이 광고 몇 개
-     * 남는 것보다 훨씬 나쁘다.
+     * **뒤로 가기는 쓰지 않는다.** 처음엔 X를 못 찾으면 뒤로 갔는데, 실기기에서
+     * 접근성 트리를 떠 보니 웹 배너 광고에는 닫기 노드가 아예 없었다(네이트 뉴스에서
+     * 닫기 후보 0개). 그래서 사실상 매번 폴백이 걸렸고 광고가 아니라 사용자가 보던
+     * 페이지가 닫혔다 — "광고 모두 닫기를 했더니 웹 자체가 꺼졌다"는 실사용 리포트의
+     * 정체다. 전면 광고 판정으로 범위를 좁혀 봐도 오판 한 번의 대가가 읽던 것을
+     * 통째로 잃는 것이라 균형이 맞지 않는다.
      *
-     * 뒤로 가기는 **전면 광고일 때만** 쓴다. 화면을 통째로 덮은 광고는 뒤로 가기가
-     * 광고 자체를 닫는 동작이라 페이지를 잃지 않는다.
+     * 대신 [AdCoverOverlay]로 그 자리를 덮는다. 광고는 눈앞에서 사라지고 페이지는
+     * 그대로 남으며, 커버를 탭하면 되돌릴 수 있다.
      */
     private fun closeAllAds() {
         // 우리가 대신 누르는 X는 광고 영역 안에 있어 클릭 이벤트가 광고 클릭처럼
         // 보인다. 잠깐 판별을 멈춰 가림막이 헛뜨는 것을 막는다.
         suppressAdClickUntil = SystemClock.uptimeMillis() + CLOSE_SUPPRESS_MS
         val root = rootInActiveWindow ?: return
-        val screen = Rect().also { root.getBoundsInScreen(it) }
         val targets = confirmedRegions + aiRegions
 
         var closed = 0
-        var fullScreenAd = false
+        val uncovered = mutableListOf<Rect>()
 
         for (region in targets) {
-            val x = findCloseButton(root, region, 0)
-            if (x != null && x.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                closed++
-                continue
-            }
-            // 화면 대부분을 덮었으면 전면 광고로 본다 (AdRegionScanner가 그런 광고를
-            // 화면 전체 영역으로 접어서 돌려준다)
-            if (region.height() >= screen.height() * FULLSCREEN_RATIO) fullScreenAd = true
+            val x = findCloseButton(root, closeSearchArea(region), 0)
+            if (x != null && x.performAction(AccessibilityNodeInfo.ACTION_CLICK)) closed++
+            else uncovered.add(region)
         }
 
-        Log.i(TAG, "광고 모두 닫기: 영역 ${targets.size}개 중 $closed 개 닫음, 전면광고=$fullScreenAd")
+        Log.i(TAG, "광고 모두 닫기: 영역 ${targets.size}개 중 $closed 개 닫고 ${uncovered.size}개 가림")
 
-        when {
-            closed > 0 -> Unit                       // 닫았으면 그걸로 끝
-            fullScreenAd -> performGlobalAction(GLOBAL_ACTION_BACK)
-            else -> toast("이 광고는 닫기 버튼이 없어요")
-        }
+        if (uncovered.isNotEmpty()) adCover.cover(uncovered)
+        // 광고를 다 처리했으니 막대는 걷는다 — 남아 있으면 눌러도 할 일이 없다
+        borderOverlay.hideCloseBar()
     }
 
     private fun toast(message: String) {
@@ -946,26 +980,36 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun findCloseButton(
         node: AccessibilityNodeInfo,
         region: Rect,
-        depth: Int,
-        budget: CloseBudget? = null
+        depth: Int
     ): AccessibilityNodeInfo? {
         if (depth > CLOSE_SEARCH_DEPTH) return null
-        // 스캔 경로에서만 예산을 건다. 사용자가 버튼을 직접 눌렀을 때(closeAllAds)는
-        // 상한 없이 끝까지 찾는다 — 그 순간만큼은 찾는 것이 최우선이다.
-        if (budget != null && !budget.take()) return null
 
         val bounds = Rect().also { node.getBoundsInScreen(it) }
-        // 이 가지가 광고 영역과 아예 겹치지 않으면 더 볼 필요가 없다
-        if (!Rect.intersects(bounds, region)) return null
+        // 이 가지가 광고 영역과 아예 겹치지 않으면 더 볼 필요가 없다.
+        // 단 좌표가 **빈** 노드에서는 가지를 치지 않는다 — 크롬 웹 트리의 중간
+        // 컨테이너는 좌표를 안 채우는 일이 흔한데, 여기서 잘라내면 그 안의 X를
+        // 영영 못 찾는다 (광고 하나짜리 화면에서 닫기가 실패하던 원인).
+        if (!bounds.isEmpty && !Rect.intersects(bounds, region)) return null
 
-        if (node.isClickable && node.isVisibleToUser && isCloseSized(bounds) && looksLikeClose(node)) {
+        if (node.isClickable && node.isVisibleToUser && isCloseSized(bounds) &&
+            !isBrowserChrome(node) && looksLikeClose(node)
+        ) {
             return node
         }
         for (i in 0 until node.childCount) {
-            findCloseButton(node.getChild(i) ?: continue, region, depth + 1, budget)?.let { return it }
+            findCloseButton(node.getChild(i) ?: continue, region, depth + 1)?.let { return it }
         }
         return null
     }
+
+    /**
+     * 브라우저 자신의 UI인가. 탐색 범위를 광고 영역보다 넓게 잡기 때문에(모서리에
+     * 붙은 X를 놓치지 않으려고) 화면 위쪽 광고에서는 크롬 툴바가 사정거리에 든다.
+     * 거기엔 탭 닫기처럼 이름이 "close"인 버튼이 있어, 그걸 누르면 광고가 아니라
+     * 탭이 닫힌다 — 절대 후보가 되면 안 되는 노드들이다.
+     */
+    private fun isBrowserChrome(node: AccessibilityNodeInfo): Boolean =
+        node.viewIdResourceName?.startsWith("$CHROME:id/") == true
 
     /** 닫기 버튼은 작다. 큰 노드는 광고 본체이므로 누르면 안 된다. */
     private fun isCloseSized(b: Rect): Boolean {
@@ -1011,8 +1055,12 @@ class AdGuardAccessibilityService : AccessibilityService() {
         val shifted = confirmed.shiftedBy(dy)
         trackedBorders.set(shifted, anchors, styles)
         borderOverlay.show(AdMarkStyle.AI_GUESS, guessed.shiftedBy(dy))
-        // 닫기 막대는 닫을 수 있는 광고가 있을 때만
-        if (closable) borderOverlay.showCloseBar() else borderOverlay.hideCloseBar()
+        // 닫기 막대는 닫을 수 있는 광고가 있을 때만. 복귀 바(그냥 두기/뒤로 가기)가
+        // 떠 있는 동안은 띄우지 않는다 — 안내 두 개가 동시에 뜨면 어느 쪽도 안 읽힌다.
+        // 이미 가린 광고 위에서도 띄우지 않는다 — 눌러도 할 일이 없다.
+        val backPromptUp = backPromptSticky || (navShowBack && !shieldActive)
+        if (closable && !backPromptUp && !adCover.isShowing) borderOverlay.showCloseBar()
+        else borderOverlay.hideCloseBar()
 
         confirmedRegions = shifted
         confirmedAnchors = anchors
@@ -1085,15 +1133,28 @@ class AdGuardAccessibilityService : AccessibilityService() {
     /**
      * 앱에서 벗어날 때까지 뒤로 가기를 누른다 — "한 번 더 누르면 종료"인 앱은
      * 한 번으로 안 나가진다. 화면의 앱이 그대로일 때만 다시 누른다 (원본 이식).
+     *
+     * **브라우저 안에서는 패키지가 안 바뀐다.** 랜딩 → 기사 복귀도 패키지는 그대로
+     * 크롬이라, 패키지만 보고 다시 누르면 기사를 지나쳐 크롬 자체가 꺼진다 —
+     * "뒤로 가기를 눌렀더니 완전히 꺼졌다"는 실사용 리포트의 원인. 크롬에서는
+     * 호스트가 바뀌었으면(이미 빠져나왔으면) 멈추고, 호스트를 못 읽으면(애매하면)
+     * 더 누르지 않는다 — 광고 페이지에 남는 것보다 보던 화면을 잃는 쪽이 나쁘다.
      */
     private fun leaveApp(tries: Int) {
-        val before = rootInActiveWindow?.packageName?.toString()
+        val beforePkg = rootInActiveWindow?.packageName?.toString()
+        val beforeHost =
+            if (beforePkg == CHROME) readUrlBar()?.let { UrlNormalizer.hostOf(it) } else null
         performGlobalAction(GLOBAL_ACTION_BACK)
         if (tries <= 1) return
         handler.postDelayed({
-            if (before != null && rootInActiveWindow?.packageName?.toString() == before) {
-                leaveApp(tries - 1)
+            if (beforePkg == null ||
+                rootInActiveWindow?.packageName?.toString() != beforePkg
+            ) return@postDelayed
+            if (beforePkg == CHROME) {
+                val nowHost = readUrlBar()?.let { UrlNormalizer.hostOf(it) }
+                if (nowHost == null || nowHost != beforeHost) return@postDelayed
             }
+            leaveApp(tries - 1)
         }, 700)
     }
 
@@ -1124,6 +1185,8 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     private val runLayer2 = Runnable {
         if (!isAiEnabled()) return@Runnable
+        // 검색 결과 화면은 serp 배지 담당이다 — 점선까지 겹치면 안 읽힌다 (스캔 경로와 동일)
+        if (serp.isSerpScreen) return@Runnable
         if (!classifying.compareAndSet(false, true)) return@Runnable
 
         val generation = screenGeneration
@@ -1207,9 +1270,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         if (ads.any { Rect.intersects(it, bounds) }) {
             entryDetector.recordAdClick()
-            // 클릭된 광고가 확정 영역 중 어느 것인지 알면 지문을 정확히 특정할 수 있다
+            // 클릭된 광고가 확정 영역 중 어느 것인지 알면 지문을 정확히 특정할 수 있다.
+            // 스캔이 아직 지문을 못 모은 광고라면(페이지가 뜨자마자 누른 경우) 지금
+            // 이 자리에서라도 모은다 — 지문이 없으면 판정이 광고에 연계되지 않아
+            // 다음에 초록 체크(광고 ✓)가 영영 안 뜬다 (실사용 리포트).
             val idx = confirmedRegions.indexOfFirst { Rect.intersects(it, bounds) }
-            pendingFpKeys = if (idx >= 0) confirmedFpKeys.getOrNull(idx).orEmpty() else emptyList()
+            pendingFpKeys =
+                if (idx >= 0) confirmedFpKeys.getOrNull(idx).orEmpty().ifEmpty { gatherFpNow(idx) }
+                else emptyList()
             preClickUrl = readUrlBar()
             navPollsLeft = NAV_POLL_COUNT
             handler.removeCallbacks(navPoll)
@@ -1218,6 +1286,24 @@ class AdGuardAccessibilityService : AccessibilityService() {
         } else {
             entryDetector.recordNonAdClick()
         }
+    }
+
+    /**
+     * 클릭 순간의 지문 보강 수집 — 스캔의 지문이 아직 비어 있는 광고를 눌렀을 때.
+     * 노드 몇 개 읽기(IPC)라 메인 스레드여도 부담이 없다 (readUrlBar와 같은 급).
+     * 출처가 패키지명으로 떨어진 상태(주소창 접힘)면 스캔 경로와 같은 이유로
+     * 만들지 않는다 — 출처가 다른 지문은 연계가 간헐적으로 깨진다.
+     */
+    private fun gatherFpNow(idx: Int): List<String> {
+        val src = lastSourceKey ?: return emptyList()
+        if ('.' !in src || src in targetApps) return emptyList()
+        val texts = runCatching { confirmedAnchors.getOrNull(idx)?.gatherText() }.getOrNull()
+            ?: return emptyList()
+        val keys = mutableListOf(CardText.cacheKey(src, texts))
+        val adv = AdvertiserMark.advertiserLines(texts)
+        if (adv.isNotEmpty()) keys += CardText.cacheKey("adv|$src", adv)
+        Log.i(TAG, "클릭 시점 지문 보강 수집 — ${keys.size}건 (출처=$src)")
+        return keys
     }
 
     /**
@@ -1251,7 +1337,16 @@ class AdGuardAccessibilityService : AccessibilityService() {
      * 페이지 이동이 감지됐다. 광고발이면 가림막을 띄우고 판정을 시작하고,
      * 아니면 아무것도 하지 않는다.
      */
-    private fun onNavigationDetected(urlShown: String?, cameFromHost: String? = null) {
+    private fun onNavigationDetected(
+        urlShown: String?,
+        cameFromHost: String? = null,
+        /**
+         * 이미 다른 경로가 광고발이라고 확정한 사유. 중계 경유 추적처럼
+         * [entryDetector]가 보지 못하는 증거를 가진 호출자가 넘긴다 —
+         * 그 경우 재판정하지 않고 이 사유를 그대로 쓴다.
+         */
+        forcedReason: ShieldReason? = null
+    ) {
         if (shieldActive) return
         val host = urlShown?.let { UrlNormalizer.hostOf(it) }
         // 경유지에서 광고 출발 페이지로 "돌아온" 이동은 광고 진입이 아니다 —
@@ -1263,7 +1358,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
             return
         }
         // rawUrl은 정규화 전 원문이어야 한다 — 광고 클릭 파라미터가 판별 근거다
-        val reason = entryDetector.reasonForNavigation(host, urlShown, cameFromHost) ?: return
+        val reason = forcedReason
+            ?: entryDetector.reasonForNavigation(host, urlShown, cameFromHost)
+            ?: return
 
         handler.removeCallbacks(navPoll)
         shieldActive = true
@@ -1274,6 +1371,9 @@ class AdGuardAccessibilityService : AccessibilityService() {
         shieldEntryUrl = urlShown
         shieldCameFrom = cameFromHost
         shieldDeepLinked = false
+        // 복귀 목표 — 광고를 누르기 전에 읽던 곳. 중계 경유로 잡은 이동은 출발
+        // 호스트를 넘겨받지 못하므로(중계 추적이 eTLD+1로 기억한다) 그 값을 쓴다.
+        returnTargetSite = cameFromHost ?: relayTracker.originBeforeRelay
 
         // 이번 진입의 광고 지문 — 판정이 나오면 연계 저장한다.
         // 클릭 좌표로 특정된 것이 최우선이고, 없으면(웹 광고는 클릭 이벤트가 없다)
@@ -1603,6 +1703,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
     private fun finishShield(url: String, assessment: RiskAssessment.Assessed) {
         if (!shieldActive || shieldResolved) return
         shieldResolved = true
+        Log.i(TAG, "가림막 결말 — ${assessment.level} 딥링크=$shieldDeepLinked url=$url")
         handler.removeCallbacks(shieldTimeout)
         handler.removeCallbacks(urlSettle)
         when (assessment.level) {
@@ -1636,28 +1737,104 @@ class AdGuardAccessibilityService : AccessibilityService() {
                     // 12초간 준다. 갑자기 옮겨진 어르신에게 필요한 건 판정 화면이
                     // 아니라 복귀 버튼이다.
                     dismissShieldNow()
-                    backPromptSticky = true
-                    backPrompt.show(
-                        onStay = {
-                            handler.removeCallbacks(backPromptTimeout)
-                            backPromptSticky = false
-                            backPrompt.hide()
-                        },
-                        onBack = {
-                            handler.removeCallbacks(backPromptTimeout)
-                            backPromptSticky = false
-                            backPrompt.hide()
-                            leaveApp(3)
-                        }
-                    )
-                    handler.removeCallbacks(backPromptTimeout)
-                    handler.postDelayed(backPromptTimeout, BACK_PROMPT_MS)
+                    showEscapePrompt { returnToOrigin() }
                 } else {
                     shieldOverlay.update("✅", "확인했어요", assessment.reason)
                     handler.postDelayed(dismissShieldRunnable, OK_SHOW_MS)
+                    // 안전해도 광고가 데려온 화면이다 — 쿠팡 같은 쇼핑몰에 뚝 떨어진
+                    // 어르신에게 돌아갈 길이 없다는 리포트가 있었다. 확인 표시가
+                    // 걷힌 직후 12초간 복귀 바를 남긴다. 같은 탭 이동이므로 뒤로
+                    // 가기 한 번이면 출발 페이지다.
+                    handler.postDelayed({ showEscapePrompt { returnToOrigin() } }, OK_SHOW_MS)
                 }
             }
         }
+    }
+
+    /**
+     * 광고발 이동이 끝난 뒤 12초간 "그냥 두기 / 뒤로 가기" 복귀 바를 남긴다.
+     * 닫기 막대는 함께 걷는다 — 두 안내가 동시에 뜨면 어느 쪽도 안 읽힌다
+     * (실사용 리포트: 복귀 바와 "광고 모두 닫기"가 같이 떠 있었다).
+     */
+    /**
+     * 광고를 누르기 전에 읽던 곳으로 되돌린다 — **횟수가 아니라 시간으로.**
+     *
+     * 예전에는 뒤로 가기를 한 번(또는 앱을 벗어날 때까지 세 번) 눌렀다. 그런데
+     * 광고 이동은 경로 길이가 제각각이다. 실측(쿠팡 배너)은
+     * `m.news.nate.com → api.ootoo.co.kr → login.coupang.com`으로 중계가 하나
+     * 끼어, 한 번 누르면 사용자가 본 적도 없는 중계 페이지에 떨어진다. 경로가
+     * 몇 단계인지는 미리 알 수 없고 광고마다 다르므로 **횟수로는 맞출 수 없다.**
+     *
+     * 그래서 목적지로 판정한다: 출발 사이트에 닿을 때까지 [RETURN_STEP_MS]마다
+     * 한 번씩 누르고, [RETURN_MAX_MS] 안에 못 닿으면 포기한다. 두 가지 안전장치를
+     * 함께 둔다 — 주소가 더 이상 바뀌지 않으면(히스토리 끝) 즉시 멈추고, 시간
+     * 예산이 있어 어떤 경우에도 무한히 누르지 않는다. 뒤로 가기를 과하게 누르면
+     * 브라우저 자체가 꺼지므로 이 두 장치가 없으면 안 된다.
+     *
+     * 출발지를 모르면(target null) 예전처럼 한 번만 누른다 — 모르면서 반복하는
+     * 것이 가장 위험하다.
+     */
+    private fun returnToOrigin() {
+        val target = returnTargetSite
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        if (target == null) {
+            Log.i(TAG, "복귀 — 출발지 미상, 뒤로 가기 1회")
+            return
+        }
+        returnDeadline = SystemClock.uptimeMillis() + RETURN_MAX_MS
+        Log.i(TAG, "복귀 시작 — 목표=$target (최대 ${RETURN_MAX_MS}ms)")
+        handler.postDelayed({ returnStep(target, hostNow()) }, RETURN_STEP_MS)
+    }
+
+    private fun returnStep(target: String, lastHost: String?) {
+        if (atReturnTarget(target)) {
+            Log.i(TAG, "복귀 완료 — $target")
+            return
+        }
+        if (SystemClock.uptimeMillis() > returnDeadline) {
+            Log.i(TAG, "복귀 중단 — 시간 초과 (현재=${hostNow() ?: "-"})")
+            return
+        }
+        val here = hostNow()
+        // 눌렀는데 주소가 그대로다 = 뒤로 갈 곳이 없다. 더 누르면 브라우저가 꺼진다.
+        if (here != null && here == lastHost) {
+            Log.i(TAG, "복귀 중단 — 더 돌아갈 곳 없음 ($here)")
+            return
+        }
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        handler.postDelayed({ returnStep(target, here) }, RETURN_STEP_MS)
+    }
+
+    private fun hostNow(): String? = readUrlBar()?.let { UrlNormalizer.hostOf(it) }
+
+    /**
+     * 지금 출발 사이트에 있는가. 목표가 전체 호스트일 수도(m.news.nate.com)
+     * eTLD+1일 수도(nate.com) 있어 양방향 접미사로 본다.
+     */
+    private fun atReturnTarget(target: String): Boolean {
+        val host = hostNow() ?: return false
+        return host == target || host.endsWith(".$target") || target.endsWith(".$host")
+    }
+
+    private fun showEscapePrompt(onBackAction: () -> Unit) {
+        Log.i(TAG, "복귀 바 표시 — 12초")
+        borderOverlay.hideCloseBar()
+        backPromptSticky = true
+        backPrompt.show(
+            onStay = {
+                handler.removeCallbacks(backPromptTimeout)
+                backPromptSticky = false
+                backPrompt.hide()
+            },
+            onBack = {
+                handler.removeCallbacks(backPromptTimeout)
+                backPromptSticky = false
+                backPrompt.hide()
+                onBackAction()
+            }
+        )
+        handler.removeCallbacks(backPromptTimeout)
+        handler.postDelayed(backPromptTimeout, BACK_PROMPT_MS)
     }
 
     /**
@@ -1756,10 +1933,22 @@ class AdGuardAccessibilityService : AccessibilityService() {
         val viaRelay = relayTracker.onHost(host)
         val consumedByEntryDetector = shieldActive || entryDetector.hasFreshPending()
         if (viaRelay && !consumedByEntryDetector) {
-            // phase6의 warnRedirect 팝업은 가져오지 않았다 — 광고발 이동의 결말
-            // UX는 phase4의 가림막·복귀 바가 담당한다. 여기서는 흔적만 남기고,
-            // 도착지가 위험한지는 아래 차단 목록 대조가 가린다.
             Log.i(TAG, "중계 경유 도착: $host")
+            // 이 신호를 가림막으로 넘긴다.
+            //
+            // 예전에는 로그만 남겼다 — "결말 UX는 phase4의 가림막이 담당한다"는
+            // 분담이었는데, 정작 그 가림막이 이 경우엔 뜨지 않았다. phase4의 세
+            // 근거(클릭 좌표·리다이렉터 목록·URL 파라미터)가 모두 빗나가는 광고가
+            // 있기 때문이다. 실측(쿠팡 배너): `m.news.nate.com → api.ootoo.co.kr
+            // (0.2초) → login.coupang.com` — 중계 도메인이 목록에 없고, 도착 URL에
+            // 광고 파라미터가 없으며, 크롬이 웹 광고에 클릭 이벤트를 안 만든다.
+            // 그래서 쿠팡으로 끌려가도 복귀 바가 안 떴다.
+            //
+            // 중계 추적은 도메인 목록이 아니라 "0.2초만 머문 제3의 도메인"이라는
+            // 흔적으로 판단하므로 처음 보는 광고망도 잡는다. 출발 호스트는 넘기지
+            // 않는다 — 중계 추적이 기억하는 값은 eTLD+1(nate.com)이라 주소창에서
+            // 읽는 호스트(m.news.nate.com)와 형태가 달라 비교가 어긋난다.
+            onNavigationDetected(readUrlBar(), forcedReason = ShieldReason.AD_RELAY)
         }
 
         // 검색 결과 화면이면 대조를 건너뛴다 — serp 배지가 결과 칸 단위로
@@ -1861,17 +2050,20 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() {
         serp.stop()
+        adCover.hide()
         guardAlert.dismiss()
         apply(emptyList(), emptyList(), emptyList(), emptyList(), emptyList(), false)
     }
 
     override fun onDestroy() {
         isConnected = false
+        runCatching { unregisterReceiver(screenOffReceiver) }
         serp.stop()
         guardAlert.dismiss()
         handler.removeCallbacksAndMessages(null)
         scope.cancel()
         borderOverlay.dismissAll()
+        adCover.hide()
         trackedBorders.destroy()
         overlayManager.dismiss()
         shieldOverlay.dismiss()
@@ -1914,12 +2106,11 @@ class AdGuardAccessibilityService : AccessibilityService() {
         /** 광고 영역 안에서 닫기 버튼을 찾아 내려가는 최대 깊이 */
         private const val CLOSE_SEARCH_DEPTH = 25
 
-        /** 스캔 경로의 닫기 버튼 탐색 예산 (본 스캔보다 작게 — 컨트롤은 광고 안에만 있다) */
-        private const val CLOSE_NODE_BUDGET = 2000
-        private const val CLOSE_TIME_BUDGET_MS = 120L
-
         /** 이보다 큰 것은 닫기 버튼이 아니라 광고 자체일 가능성이 높다 (dp). */
         private const val CLOSE_MAX_DP = 72
+
+        /** X 탐색 시 감지 영역을 사방으로 넓혀 주는 여유 (dp) — closeSearchArea 참고 */
+        private const val CLOSE_REGION_SLOP_DP = 24
 
         /**
          * 이 비율 이상 화면을 덮으면 전면 광고로 보고 뒤로 가기를 허용한다.
@@ -1961,6 +2152,14 @@ class AdGuardAccessibilityService : AccessibilityService() {
 
         /** 딥링크 복귀 바(그냥 두기/뒤로 가기)의 표시 시간 — 원본 PROMPT_MS와 동일 */
         private const val BACK_PROMPT_MS = 12_000L
+
+        /**
+         * 복귀(뒤로 가기 반복)의 시간 예산과 간격 — [returnToOrigin] 참고.
+         * 간격은 페이지가 실제로 넘어갈 시간을 줘야 한다. 너무 짧으면 아직 옛
+         * 주소를 읽고 "아직 안 왔다"며 한 번 더 눌러 목적지를 지나쳐 버린다.
+         */
+        private const val RETURN_MAX_MS = 4_000L
+        private const val RETURN_STEP_MS = 700L
 
         /**
          * 선택 대기 중 사용자가 화면을 떠났는지 확인하는 주기. 선택 화면은

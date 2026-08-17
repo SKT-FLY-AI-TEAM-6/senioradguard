@@ -117,6 +117,11 @@ class TrackedBorderOverlay(private val context: Context) {
     private var changedAt = LongArray(0)
     /** 영역별 세로 속도 (px/ms) */
     private var velocity = FloatArray(0)
+    /**
+     * 영역별로 관측된 광고의 온전한 높이. 접근성 좌표는 화면 밖으로 나간 부분이
+     * 잘린 채 오므로, "얼마나 가려졌는가"를 재려면 안 잘렸던 순간의 높이가 필요하다.
+     */
+    private var fullHeights = IntArray(0)
     private var animating = false
     /** 좌표를 못 읽기 시작한 시각 (추적 스레드에서만) */
     private var lostAt = 0L
@@ -404,9 +409,23 @@ class TrackedBorderOverlay(private val context: Context) {
                 v = buildBorderView(style)
                 group.addView(v, i, FrameLayout.LayoutParams(0, 0))
             }
-            val c = Rect(regions[i])
-            // 창 밖 조각은 감춘다. 하한을 낮게 둬야 320x50 인라인 배너를 놓치지 않는다
-            if (!c.intersect(win) || c.height() < dp(20)) {
+            val r = regions[i]
+            // 광고의 "원래 키"를 기억해 둔다. 접근성 좌표는 화면 밖 부분이 잘린 채
+            // 온다(실기기 확인: 크롬 웹 노드) — 잘린 높이만 봐서는 얼마나 가려졌는지
+            // 알 수 없다. 창 가장자리에 안 닿은(=안 잘린) 순간의 높이가 진짜 키다.
+            if (fullHeights.size != regions.size) fullHeights = IntArray(regions.size)
+            if (r.top > win.top && r.bottom < win.bottom) fullHeights[i] = r.height()
+            else fullHeights[i] = kotlin.math.max(fullHeights[i], r.height())
+
+            val c = Rect(r)
+            // 창 밖 조각은 감춘다. 하한을 낮게 둬야 320x50 인라인 배너를 놓치지 않는다.
+            // 광고가 1/3 넘게 화면 밖으로 밀려났으면 테두리도 걷는다 — 반쯤 잘린
+            // 광고에 테두리가 계속 붙어 있으면 스크롤 중에 혼란만 준다 (실사용
+            // 리포트). 화면보다 큰 광고는 창 높이를 기준으로 잰다.
+            val fullH = kotlin.math.min(
+                kotlin.math.max(fullHeights[i], r.height()), win.height()
+            )
+            if (!c.intersect(win) || c.height() < dp(20) || c.height() * 3 < fullH * 2) {
                 v.visibility = View.GONE
                 continue
             }

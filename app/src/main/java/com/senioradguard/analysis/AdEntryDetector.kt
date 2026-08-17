@@ -9,7 +9,18 @@ enum class ShieldReason {
     AD_REDIRECTOR,
 
     /** 도착 URL에 광고 클릭 추적 파라미터(gclid 등)가 붙어 있음 */
-    AD_LANDING
+    AD_LANDING,
+
+    /**
+     * 스쳐 지나간 제3의 도메인(중계)을 거쳐 도착 — [com.senioradguard.guard.RelayTransitTracker] 판정.
+     *
+     * 위 세 가지가 못 잡는 구멍을 메운다. 실측(쿠팡 배너, 네이트 뉴스):
+     * `m.news.nate.com → api.ootoo.co.kr(0.2초) → login.coupang.com`에서
+     * 중계 도메인이 우리 목록에 없고, 도착 URL에 광고 파라미터도 없으며,
+     * 크롬이 웹 광고에 클릭 이벤트를 만들지 않아 **셋 다 빗나갔다.** 중계 추적은
+     * 도메인 목록이 아니라 "머문 시간"으로 판단하므로 처음 보는 광고망도 잡는다.
+     */
+    AD_RELAY
 }
 
 /**

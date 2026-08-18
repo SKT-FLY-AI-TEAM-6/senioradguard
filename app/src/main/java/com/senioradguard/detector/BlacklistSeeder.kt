@@ -30,9 +30,21 @@ object BlacklistSeeder {
     suspend fun seedIfNeeded(context: Context) = withContext(Dispatchers.IO) {
         val app = context.applicationContext
         val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        if (prefs.getBoolean(KEY_SEEDED, false)) return@withContext
+        val db = AppDatabase.getInstance(app)
 
-        val dao = AppDatabase.getInstance(app).blacklistDao()
+        // 플래그만 믿으면 안 된다 — Room의 destructive migration(버전 변경 시
+        // 전체 테이블 삭제)이 돌면 DB는 비는데 prefs 플래그는 살아남아서,
+        // "시드됐다고 믿는 빈 목록"으로 모든 대조가 조용히 통과된다
+        // (실기기에서 v5 빌드 → v4 빌드 덮어 설치로 실제 발생). 행 수를
+        // 함께 확인해 표시와 실체가 어긋나면 다시 시드한다.
+        val rows = runCatching {
+            db.query("SELECT COUNT(*) FROM blacklist_domains", null).use { c ->
+                if (c.moveToFirst()) c.getLong(0) else 0L
+            }
+        }.getOrDefault(0L)
+        if (prefs.getBoolean(KEY_SEEDED, false) && rows > 0) return@withContext
+
+        val dao = db.blacklistDao()
         val now = System.currentTimeMillis()
 
         val inserted = runCatching {

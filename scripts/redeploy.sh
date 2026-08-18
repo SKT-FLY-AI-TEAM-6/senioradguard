@@ -19,7 +19,10 @@ else
   exit 1
 fi
 
-SERVICE="com.senioradguard/com.senioradguard.service.AdGuardAccessibilityService"
+# debug 빌드는 applicationIdSuffix ".rg"가 붙는다 (스튜디오 라인과 나란히 설치용).
+# 컴포넌트 표기는 "설치 패키지ID/클래스 전체 이름" — 클래스 쪽은 namespace 그대로다.
+PKG="com.senioradguard.rg"
+SERVICE="$PKG/com.senioradguard.service.AdGuardAccessibilityService"
 
 ./gradlew installDebug
 
@@ -34,7 +37,7 @@ esac
 
 "$ADB" shell settings put secure enabled_accessibility_services "$MERGED"
 "$ADB" shell settings put secure accessibility_enabled 1
-"$ADB" shell appops set com.senioradguard SYSTEM_ALERT_WINDOW allow
-"$ADB" shell am start -n com.senioradguard/.MainActivity
+"$ADB" shell appops set "$PKG" SYSTEM_ALERT_WINDOW allow
+"$ADB" shell am start -n "$PKG/com.senioradguard.MainActivity"
 
 echo "재배포 완료 — 접근성 서비스: $MERGED"

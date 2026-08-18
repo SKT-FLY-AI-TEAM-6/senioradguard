@@ -20,8 +20,8 @@ $env:PYTHONIOENCODING = "utf-8"
 
 $opened = $false
 while ($true) {
-    cmd /c "`"$adb`" exec-out run-as com.senioradguard cat databases/senior_ad_guard.db > `"$db`"" 2>$null
-    cmd /c "`"$adb`" exec-out run-as com.senioradguard cat databases/senior_ad_guard.db-wal > `"$db-wal`"" 2>$null
+    cmd /c "`"$adb`" exec-out run-as com.senioradguard.rg cat databases/senior_ad_guard.db > `"$db`"" 2>$null
+    cmd /c "`"$adb`" exec-out run-as com.senioradguard.rg cat databases/senior_ad_guard.db-wal > `"$db-wal`"" 2>$null
     Clear-Host
     if ((Get-Item $db -ErrorAction SilentlyContinue).Length -gt 0) {
         & $py $dumpPy $db $htmlOut

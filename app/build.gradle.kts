@@ -59,6 +59,12 @@ android {
     }
 
     buildTypes {
+        // 스튜디오 라인(com.senioradguard)과 한 기기에 나란히 설치하기 위한 접미사.
+        // 코드가 자기 패키지명을 전부 런타임 packageName으로 읽으므로 동작 차이는 없다.
+        // 접근성 서비스는 한 번에 한쪽만 켜고 테스트할 것 — 둘 다 켜면 오버레이·뒤로가기가 충돌한다.
+        debug {
+            applicationIdSuffix = ".rg"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(

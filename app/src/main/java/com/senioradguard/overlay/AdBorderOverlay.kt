@@ -339,13 +339,16 @@ class AdBorderOverlay(private val context: Context) {
             AdMarkStyle.CONFIRMED -> Color.parseColor("#FF5722")   // 주황
             AdMarkStyle.AI_GUESS -> Color.parseColor("#FFC107")    // 노랑
         }
+        // 추정에는 알약을 달지 않는다. "AI"라는 글자는 어르신에게 아무것도 설명하지
+        // 못하면서 확정 배지("AD 광고")와 같은 모양을 만들어 두 표시를 닮게 했다.
+        // 구분은 색과 실선/점선이 이미 하고 있고, 문구는 "광고의심" 한 마디면 된다.
         val badgeLabel = when (spec.style) {
             AdMarkStyle.CONFIRMED -> "AD"
-            AdMarkStyle.AI_GUESS -> "AI"
+            AdMarkStyle.AI_GUESS -> ""
         }
         val badgeText = when (spec.style) {
             AdMarkStyle.CONFIRMED -> "광고"
-            AdMarkStyle.AI_GUESS -> "광고 같아요"
+            AdMarkStyle.AI_GUESS -> "광고의심"
         }
 
         return FrameLayout(context).apply {
@@ -380,21 +383,25 @@ class AdBorderOverlay(private val context: Context) {
                 setColor(Color.argb(220, 20, 20, 20))
                 cornerRadius = dp(14).toFloat()
             }
-            addView(TextView(context).apply {
-                this.text = label
-                setTextColor(Color.WHITE)
-                textSize = 16f
-                setPadding(dp(10), dp(4), dp(10), dp(4))
-                background = GradientDrawable().apply {
-                    setColor(accent)
-                    cornerRadius = dp(10).toFloat()
-                }
-            })
+            // 알약은 라벨이 있을 때만. 빈 문자열로 달면 색만 있는 빈 조각이 남는다.
+            if (label.isNotEmpty()) {
+                addView(TextView(context).apply {
+                    this.text = label
+                    setTextColor(Color.WHITE)
+                    textSize = 16f
+                    setPadding(dp(10), dp(4), dp(10), dp(4))
+                    background = GradientDrawable().apply {
+                        setColor(accent)
+                        cornerRadius = dp(10).toFloat()
+                    }
+                })
+            }
             addView(TextView(context).apply {
                 this.text = text
                 setTextColor(Color.WHITE)
                 textSize = 16f
-                setPadding(dp(10), 0, 0, 0)
+                // 알약이 없으면 왼쪽 여백은 바깥 패딩 하나로 충분하다
+                setPadding(if (label.isEmpty()) 0 else dp(10), 0, 0, 0)
             })
         }
 

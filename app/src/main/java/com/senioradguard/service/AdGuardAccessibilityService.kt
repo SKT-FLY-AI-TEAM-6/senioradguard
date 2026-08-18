@@ -894,7 +894,7 @@ class AdGuardAccessibilityService : AccessibilityService() {
         // 그래야 점선이 카드를 따라다닌다. 다만 이건 이번 프레임의 **두 번째** 트리
         // 순회라 상한을 걸어 확정 테두리의 추종을 방해하지 않게 한다. 새 판별은 유휴 때만.
         // 검색 결과 화면에서는 돌리지 않는다 — serp 배지가 결과 칸 단위로 이미
-        // 표시 중인데 그 위에 "광고 같아요" 점선까지 겹치면 어느 것도 안 읽힌다.
+        // 표시 중인데 그 위에 "광고의심" 점선까지 겹치면 어느 것도 안 읽힌다.
         val guessed = if (isAiEnabled() && !serp.isSerpScreen) {
             runCatching {
                 pipeline.run(

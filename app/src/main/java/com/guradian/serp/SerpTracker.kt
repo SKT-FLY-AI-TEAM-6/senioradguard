@@ -55,9 +55,12 @@ class SerpTracker(
     private val overlay: SerpBadgeOverlay,
     private val scope: CoroutineScope,
     /**
-     * 최고 위험([RiskGrade.HIGH]) 판정이 새 호스트에서 나왔을 때 한 번 부른다.
-     * 호스트·URL은 넘기지 않는다 — 승격 이벤트에 어르신이 본 것을 싣지 않는다는
-     * 원격 기록 원칙(호출부 참고) 때문이다. 같은 호스트로는 다시 부르지 않는다.
+     * 최고 위험([RiskGrade.HIGH]) 판정이 **처음 보는 호스트에서 나온 판정 회차마다
+     * 한 번** 부른다. 한 화면에 위험 결과가 몇 개든 호출은 한 번이다 — 이 콜백은
+     * 호스트·URL을 넘기지 않으므로(승격 이벤트에 어르신이 본 것을 싣지 않는다는
+     * 원격 기록 원칙, 호출부 참고) 건수를 알려도 받는 쪽이 쓸 수 있는 정보가
+     * 늘지 않고 같은 알림만 여러 줄이 된다. 이미 승격한 호스트로는 다시 부르지
+     * 않는다.
      */
     private val onHighRisk: () -> Unit = {}
 ) {
@@ -328,7 +331,11 @@ class SerpTracker(
                 .filter { promotedHosts.add(it) }
             if (newlyHigh.isNotEmpty()) {
                 Log.i(SERP_TAG, "serp 최고위험 ${newlyHigh.size}건 — 원격 승격")
-                repeat(newlyHigh.size) { onHighRisk() }
+                // 몇 건이 나왔든 **한 번만** 부른다. 예전에는 건수만큼 불렀는데,
+                // 이 콜백은 호스트를 넘기지 않으므로(승격에 어르신이 본 것을 싣지
+                // 않는다는 원칙) 받는 쪽에서는 똑같은 알림이 여러 줄로 쌓일 뿐이다.
+                // 실측: 위험 결과 3개짜리 검색 한 번에 보호자 기록이 4줄 생겼다.
+                onHighRisk()
             }
 
             // 판정만 갱신하고 좌표는 건드리지 않는다. 응답이 늦게 왔더라도 그 사이
